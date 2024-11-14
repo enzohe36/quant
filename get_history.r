@@ -20,13 +20,12 @@ print(paste0(
 )
 
 symbol_list <- symbol_list[grepl(pattern, symbol_list)]
+symbol_list <- sample(symbol_list, 10) # For testing only
 print(paste0(
     format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
     " Matched ", length(symbol_list), " stock(s) to ", pattern, "."
   )
 )
-
-symbol_list <- sample(symbol_list, 10) # For testing only
 
 dir.create("data")
 
@@ -69,5 +68,3 @@ print(paste0(
     " wrote to data/."
   )
 )
-
-# ------------------------------------------------------------------------------

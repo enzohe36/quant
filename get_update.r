@@ -35,15 +35,15 @@ update <- function(df) {
     df <- rbind(df, data_update[data_update$symbol == df[1, 2], ])
   }
 
-  # Calculate time-normalized DX
-  df$dx <- tnormalize(
+  # Calculate modified DX
+  df$dx <- 1 - tnormalize(
     (ADX(df[, 3:5])[, 1] - ADX(df[, 3:5])[, 2]) /
       (ADX(df[, 3:5])[, 1] + ADX(df[, 3:5])[, 2]),
     t_dx
   )
 
-  # Calculate time-normalized CCI
-  df$cci <- tnormalize(CCI(df[, 3:5]), t_cci)
+  # Calculate modified CCI
+  df$cci <- 1 - tnormalize(CCI(df[, 3:5]), t_cci)
 
   # Calculate median return
   r <- foreach(
@@ -96,7 +96,7 @@ data_latest <- bind_rows(lapply(data_list, get_latest))
 # [1]   symbol date high low close volume dx cci r_med name
 # [11]  if1 if3 if5 if10
 data_latest <- data_latest[, c(2, 1, 10, 7, 8, 11:14)]
-data_latest$score <- (1 - data_latest$dx) + (1 - data_latest$cci) +
+data_latest$score <- data_latest$dx + data_latest$cci +
   rowSums(data_latest[, 6:9] > 0) / 4
 data_latest[, 4:10] <- round(data_latest[, 4:10], 2)
 data_latest <- data_latest[order(data_latest$score, decreasing = TRUE), ]
@@ -118,5 +118,3 @@ print(paste0(
 )
 
 #return(list(symbol_list, data_list, data_latest))
-
-# ------------------------------------------------------------------------------

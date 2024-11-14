@@ -1,9 +1,10 @@
 # python -m aktools
 # (Source this script)
 # get_history()
-# ll <- list_history() # symbol_list, data_list
+# ll <- load_history() # symbol_list, data_list
 # ll <- get_update(ll[[1]], ll[[2]]) # symbol_list, data_list, data_latest
 # query(ll[[3]])
+# query_plot(ll[[2]])
 
 library(jsonlite)
 library(RCurl)
@@ -25,6 +26,12 @@ normalize <- function(x) {
   )
 }
 
+normalize0 <- function(x) {
+  return(
+    (0 - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE))
+  )
+}
+
 tnormalize <- function(x, t) {
   df <- foreach(
     i = 0:(t - 1),
@@ -38,6 +45,8 @@ tnormalize <- function(x, t) {
     (x - apply(df, 1, min)) / (apply(df, 1, max) - apply(df, 1, min))
   )
 }
+
+# ------------------------------------------------------------------------------
 
 get_history <- function(pattern = "^(00|60)", t = 5) {
   # [1]   code name
@@ -54,13 +63,12 @@ get_history <- function(pattern = "^(00|60)", t = 5) {
   )
 
   symbol_list <- symbol_list[grepl(pattern, symbol_list)]
+  symbol_list <- sample(symbol_list, 10) # For testing only
   print(paste0(
       format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
       " Matched ", length(symbol_list), " stock(s) to ", pattern, "."
     )
   )
-
-  # symbol_list <- sample(symbol_list, 10) # For testing only
 
   dir.create("data")
 
@@ -105,7 +113,7 @@ get_history <- function(pattern = "^(00|60)", t = 5) {
   )
 }
 
-list_history <- function() {
+load_history <- function() {
   symbol_list <- readLines("symbol_list.txt")
 
   cl <- makeCluster(detectCores() - 1)
@@ -162,15 +170,15 @@ get_update <- function(
       df <- rbind(df, data_update[data_update$symbol == df[1, 2], ])
     }
 
-    # Calculate time-normalized DX
-    df$dx <- tnormalize(
+    # Calculate modified DX
+    df$dx <- 1 - tnormalize(
       (ADX(df[, 3:5])[, 1] - ADX(df[, 3:5])[, 2]) /
         (ADX(df[, 3:5])[, 1] + ADX(df[, 3:5])[, 2]),
       t_dx
     )
 
-    # Calculate time-normalized CCI
-    df$cci <- tnormalize(CCI(df[, 3:5]), t_cci)
+    # Calculate modified CCI
+    df$cci <- 1 - tnormalize(CCI(df[, 3:5]), t_cci)
 
     # Calculate median return
     r <- foreach(
@@ -223,7 +231,7 @@ get_update <- function(
   # [1]   symbol date high low close volume dx cci r_med name
   # [11]  if1 if3 if5 if10
   data_latest <- data_latest[, c(2, 1, 10, 7, 8, 11:14)]
-  data_latest$score <- (1 - data_latest$dx) + (1 - data_latest$cci) +
+  data_latest$score <- data_latest$dx + data_latest$cci +
     rowSums(data_latest[, 6:9] > 0) / 4
   data_latest[, 4:10] <- round(data_latest[, 4:10], 2)
   data_latest <- data_latest[order(data_latest$score, decreasing = TRUE), ]
@@ -270,4 +278,21 @@ query <- function(data_latest, query = readLines("query.txt")) {
       " wrote to ranking_query.txt"
     )
   )
+}
+
+query_plot <- function(data_list, query = readLines("query.txt")) {
+  for (symbol in query) {
+    data <- data_list[[symbol]]
+    data <- data[data$date > now(tzone = "Asia/Shanghai") - months(6), ]
+    data <- data[is.finite(data$r_med), ]
+    plot(
+      data$date, normalize(data$close),
+      type = "l", lwd = 2,
+      xlab = "", ylab = "", main = unique(data$symbol)
+    )
+    lines(data$date, normalize(data$r_med), col = "red")
+    abline(h = normalize0(data$r_med), col = "red")
+    lines(data$date, data$dx, col = "blue")
+    lines(data$date, data$cci, col = "green4")
+  }
 }

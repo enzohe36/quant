@@ -18,6 +18,12 @@ normalize <- function(x) {
   )
 }
 
+normalize0 <- function(x) {
+  return(
+    (0 - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE))
+  )
+}
+
 tnormalize <- function(x, t) {
   df <- foreach(
     i = 0:(t - 1),
