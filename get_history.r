@@ -35,7 +35,7 @@ symbol_list <- foreach(
   symbol = symbol_list,
   .combine = "c",
   .errorhandling = "remove",
-  .packages = c("jsonlite", "RCurl", "lubridate")
+  .packages = c("jsonlite", "RCurl", "tidyverse")
 ) %dopar% {
   # [1]   日期 股票代码 开盘 收盘 最高 最低 成交量 成交额 振幅 涨跌幅
   # [11]  涨跌额 换手率
@@ -61,6 +61,7 @@ symbol_list <- foreach(
   return(symbol)
 }
 unregister_dopar
+
 writeLines(symbol_list, "symbol_list.txt")
 print(paste0(
     format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),

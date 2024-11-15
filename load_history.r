@@ -20,6 +20,7 @@ data_list <- foreach(
   return(list)
 }
 unregister_dopar
+
 print(paste0(
     format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
     " Loaded ", length(data_list), " stock(s)."

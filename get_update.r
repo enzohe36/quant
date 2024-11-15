@@ -3,9 +3,9 @@ source("/Users/anzhouhe/Documents/quant/load_preset.r", encoding = "UTF-8")
 # Assign input values
 symbol_list <- symbol_list
 data_list <- data_list
-t_r <- 20
-t_dx <- 60
+t_adx <- 60
 t_cci <- 60
+t_r <- 20
 
 # ------------------------------------------------------------------------------
 
@@ -28,41 +28,49 @@ print(paste0(
   )
 )
 
-update <- function(df) {
-  if (df[nrow(df), 1] == data_update[1, 1]) {
-    df[nrow(df), ] <- data_update[data_update$symbol == df[1, 2], ]
+cl <- makeCluster(detectCores() - 1)
+registerDoParallel(cl)
+data_list <- foreach(
+  symbol = symbol_list,
+  .combine = append,
+  .export = c("tnormalize", "adx_alt"),
+  .packages = c("tidyverse", "TTR")
+) %dopar% {
+  data <- data_list[[symbol]]
+  if (data[nrow(data), 1] == data_update[1, 1]) {
+    data[nrow(data), ] <- data_update[data_update$symbol == data[1, 2], ]
   } else {
-    df <- rbind(df, data_update[data_update$symbol == df[1, 2], ])
+    data <- rbind(data, data_update[data_update$symbol == data[1, 2], ])
   }
 
-  # Calculate modified DX
-  df$dx <- 1 - tnormalize(
-    (ADX(df[, 3:5])[, 1] - ADX(df[, 3:5])[, 2]) /
-      (ADX(df[, 3:5])[, 1] + ADX(df[, 3:5])[, 2]),
-    t_dx
+  # Calculate predictor
+  dmi_mod <- 1 - tnormalize(
+    abs(adx_alt(data[, 3:5])[, 1] - adx_alt(data[, 3:5])[, 2]), t_adx
   )
+  cci_mod <- 1 - 2 * tnormalize(CCI(data[, 3:5]), t_cci)
+  data$x <- dmi_mod * cci_mod
 
-  # Calculate modified CCI
-  df$cci <- 1 - tnormalize(CCI(df[, 3:5]), t_cci)
-
-  # Calculate median return
-  r <- foreach(
-    i = 1:t_r,
-    .combine = cbind,
-    .packages = c("dplyr")
-  ) %dopar% {
-    return((lead(df$close, i) - df$close) / df$close)
+  # Calculate return
+  df <- data.frame(matrix(nrow = nrow(data), ncol = 0))
+  for (i in 1:t_r) {
+    df[, i] <- (lead(data$close, i) - data$close) / data$close
   }
-  df$r_med <- apply(r, 1, median)
+  data$r_max <- apply(df, 1, max)
+  data$r_min <- apply(df, 1, min)
 
-  return(df)
+  list <- list()
+  list[[symbol]] <- data
+  return(list)
 }
-data_list <- lapply(data_list, update)
+unregister_dopar
 
 fundflow_dict <- data.frame(
   indicator = c("今日", "3日", "5日", "10日"),
-  header = c("if1", "if3", "if5", "if10")
+  header = c("inflow1", "inflow3", "inflow5", "inflow10")
 )
+
+cl <- makeCluster(detectCores() - 1)
+registerDoParallel(cl)
 fundflow_list <- foreach(
   i = fundflow_dict[, 1],
   .packages = c("jsonlite", "RCurl")
@@ -87,19 +95,26 @@ fundflow_list <- foreach(
 
   return(fundflow)
 }
+unregister_dopar
+
 fundflow <- reduce(fundflow_list, full_join, by = join_by("symbol", "name"))
 fundflow[, 3:6] <- fundflow[, 3:6] / abs(fundflow[, 3])
 
-get_latest <- function(df) {merge(df[nrow(df), ], fundflow, by = "symbol")}
+get_latest <- function(df) merge(df[nrow(df), ], fundflow, by = "symbol")
 data_latest <- bind_rows(lapply(data_list, get_latest))
 
-# [1]   symbol date high low close volume dx cci r_med name
-# [11]  if1 if3 if5 if10
-data_latest <- data_latest[, c(2, 1, 10, 7, 8, 11:14)]
-data_latest$score <- data_latest$dx + data_latest$cci +
-  rowSums(data_latest[, 6:9] > 0) / 4
-data_latest[, 4:10] <- round(data_latest[, 4:10], 2)
+# [1]   symbol date high low close volume x r_max r_min name
+# [2]   inflow1 inflow3 inflow5 inflow10
+data_latest <- data_latest[, c(2, 1, 10, 7, 11:14)]
+weight_inflow <- function(x) {
+  return(
+    ifelse(x[1] > 0, 0.4, 0) + ifelse(x[2] > 0, 0.3, 0) +
+      ifelse(x[3] > 0, 0.2, 0) + ifelse(x[4] > 0, 0.1, 0)
+  )
+}
+data_latest$score <- data_latest$x + apply(data_latest[, 5:8], 1, weight_inflow)
 data_latest <- data_latest[order(data_latest$score, decreasing = TRUE), ]
+data_latest[, 4:9] <- format(round(data_latest[, 4:9], 2), nsmall = 2)
 cat(
   capture.output(print(data_latest, row.names = FALSE)),
   file = "ranking.txt",

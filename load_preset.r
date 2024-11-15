@@ -25,15 +25,32 @@ normalize0 <- function(x) {
 }
 
 tnormalize <- function(x, t) {
-  df <- foreach(
-    i = 0:(t - 1),
-    .combine = cbind,
-    .packages = c("dplyr")
-  ) %dopar% {
-    return(lag(x, i))
+  df <- data.frame(matrix(nrow = length(x), ncol = 0))
+  for (i in 1:t) {
+    df[, i] <- lag(x, i - 1)
   }
 
   return(
     (x - apply(df, 1, min)) / (apply(df, 1, max) - apply(df, 1, min))
   )
+}
+
+adx_alt <- function(hlc, n = 14, m = 6) {
+  h <- hlc[, 1]
+  l <- hlc[, 2]
+  c <- hlc[, 3]
+  tr <- runSum(
+    apply(cbind(h - l, abs(h - lag(c, 1)), abs(l - lag(c, 1))), 1, max), n
+  )
+  dh <- h - lag(h, 1)
+  dl <- lag(l, 1) - l
+  dmp <- runSum(ifelse(dh > 0 & dh > dl, dh, 0), n)
+  dmn <- runSum(ifelse(dl > 0 & dl > dh, dl, 0), n)
+  dip <- dmp / tr
+  din <- dmn / tr
+  adx <- SMA(abs(dip - din) / (dip + din), m)
+  adxr <- (adx + lag(adx, m)) / 2
+  out <- cbind(adx, adxr)
+  colnames(out) <- c("adx", "adxr")
+  return(out)
 }
