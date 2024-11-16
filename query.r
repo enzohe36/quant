@@ -1,20 +1,20 @@
-source("/Users/anzhouhe/Documents/quant/load_preset.r", encoding = "UTF-8")
+source("load_preset.r", encoding = "UTF-8")
 
-# Assign input values
+# Define parameters
 query <- readLines("query.txt")
-data_latest <- data_latest
+update <- update
 
 # ------------------------------------------------------------------------------
 
 cl <- makeCluster(detectCores() - 1)
 registerDoParallel(cl)
-data_query <- foreach(
+result <- foreach(
   symbol = query,
   .combine = rbind
 ) %dopar% {
-  return(data_latest[data_latest$symbol == symbol, ])
+  return(update[update$symbol == symbol, ])
 }
 unregister_dopar
 
-data_query <- data_query[order(data_query$score, decreasing = TRUE), ]
-print(data_query, row.names = FALSE)
+result <- result[order(result$score, decreasing = TRUE), ]
+print(result, row.names = FALSE)

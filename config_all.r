@@ -1,10 +1,11 @@
 # python -m aktools
 # (Source this script)
 # get_history()
-# ll <- load_history() # symbol_list, data_list
-# ll <- get_update(ll[[1]], ll[[2]]) # symbol_list, data_list, data_latest
+# dl <- load_history() # symbol_list, data_list
+# dl <- get_update(dl[[1]], dl[[2]]) # symbol_list, data_list, data_latest
 # query()
 # query_plot()
+# rl <- backtest(dl[[1]], dl[[2]])
 
 library(jsonlite)
 library(RCurl)
@@ -15,6 +16,7 @@ library(doParallel)
 
 options(warn = -1)
 
+# https://stackoverflow.com/a/25110203
 unregister_dopar <- function() {
   env <- foreach:::.foreachGlobals
   rm(list = ls(name = env), pos = env)
@@ -43,6 +45,7 @@ tnormalize <- function(x, t) {
   )
 }
 
+# http://www.cftsc.com/qushizhibiao/610.html
 adx_alt <- function(hlc, n = 14, m = 6) {
   h <- hlc[, 1]
   l <- hlc[, 2]
@@ -61,6 +64,18 @@ adx_alt <- function(hlc, n = 14, m = 6) {
   out <- cbind(adx, adxr)
   colnames(out) <- c("adx", "adxr")
   return(out)
+}
+
+pct_change <- function(x1, x2) {
+  return((x2 - x1) / x1)
+}
+
+# https://stackoverflow.com/a/19801108
+multiout <- function(x, ...) {
+  lapply(
+    seq_along(x),
+    function(i) c(x[[i]], lapply(list(...), function(y) y[[i]]))
+  )
 }
 
 # ------------------------------------------------------------------------------
@@ -160,25 +175,23 @@ load_history <- function() {
   return(list(symbol_list, data_list))
 }
 
-get_update <- function(
-  symbol_list, data_list, t_adx = 60, t_cci = 60, t_r = 20
-) {
+get_update <- function(symbol_list, data_list, t_adx = 60, t_cci = 60) {
   # [1]   序号 代码 名称 最新价 涨跌幅 涨跌额 成交量 成交额 振幅 最高
   # [11]  最低 今开 昨收 量比 换手率 市盈率-动态 市净率 总市值 流通市值 涨速
   # [21]  5分钟涨跌 60日涨跌幅 年初至今涨跌幅 date
-  data_update <- fromJSON(getForm(
+  update <- fromJSON(getForm(
       uri = "http://127.0.0.1:8080/api/public/stock_zh_a_spot_em",
       .encoding = "utf-8"
     )
   )
-  data_update <- mutate(data_update, date = date(now(tzone = "Asia/Shanghai")))
-  data_update <- data_update[, c(24, 2, 10, 11, 4, 7)]
-  colnames(data_update) <- c("date", "symbol", "high", "low", "close", "volume")
-  data_update <- data_update[data_update$symbol %in% symbol_list, ]
-  data_update <- na.omit(data_update)
+  update <- mutate(update, date = date(now(tzone = "Asia/Shanghai")))
+  update <- update[, c(24, 2, 10, 11, 4, 7)]
+  colnames(update) <- c("date", "symbol", "high", "low", "close", "volume")
+  update <- update[update$symbol %in% symbol_list, ]
+  update <- na.omit(update)
   print(paste0(
       format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
-      " Found update for ", nrow(data_update), " stock(s)."
+      " Found update for ", nrow(update), " stock(s)."
     )
   )
 
@@ -191,26 +204,18 @@ get_update <- function(
     .packages = c("tidyverse", "TTR")
   ) %dopar% {
     data <- data_list[[symbol]]
-    if (data[nrow(data), 1] == data_update[1, 1]) {
-      data[nrow(data), ] <- data_update[data_update$symbol == data[1, 2], ]
+    if (data[nrow(data), 1] == update[1, 1]) {
+      data[nrow(data), ] <- update[update$symbol == data[1, 2], ]
     } else {
-      data <- rbind(data, data_update[data_update$symbol == data[1, 2], ])
+      data <- rbind(data, update[update$symbol == data[1, 2], ])
     }
 
     # Calculate predictor
-    dmi_mod <- 1 - tnormalize(
+    x_dmi <- 1 - tnormalize(
       abs(adx_alt(data[, 3:5])[, 1] - adx_alt(data[, 3:5])[, 2]), t_adx
     )
-    cci_mod <- 1 - 2 * tnormalize(CCI(data[, 3:5]), t_cci)
-    data$x <- dmi_mod * cci_mod
-
-    # Calculate return
-    df <- data.frame(matrix(nrow = nrow(data), ncol = 0))
-    for (i in 1:t_r) {
-      df[, i] <- (lead(data$close, i) - data$close) / data$close
-    }
-    data$r_max <- apply(df, 1, max)
-    data$r_min <- apply(df, 1, min)
+    x_cci <- 1 - 2 * tnormalize(CCI(data[, 3:5]), t_cci)
+    data$x <- x_dmi * x_cci
 
     list <- list()
     list[[symbol]] <- data
@@ -225,7 +230,7 @@ get_update <- function(
 
   cl <- makeCluster(detectCores() - 1)
   registerDoParallel(cl)
-  fundflow_list <- foreach(
+  fundflow <- foreach(
     i = fundflow_dict[, 1],
     .packages = c("jsonlite", "RCurl")
   ) %dopar% {
@@ -251,75 +256,140 @@ get_update <- function(
   }
   unregister_dopar
 
-  fundflow <- reduce(fundflow_list, full_join, by = join_by("symbol", "name"))
+  fundflow <- reduce(fundflow, full_join, by = join_by("symbol", "name"))
   fundflow[, 3:6] <- fundflow[, 3:6] / abs(fundflow[, 3])
 
-  get_latest <- function(df) merge(df[nrow(df), ], fundflow, by = "symbol")
-  data_latest <- bind_rows(lapply(data_list, get_latest))
+  combine_update <- function(df) merge(df[nrow(df), ], fundflow, by = "symbol")
+  update <- bind_rows(lapply(data_list, combine_update))
 
-  # [1]   symbol date high low close volume x r_max r_min name
-  # [2]   inflow1 inflow3 inflow5 inflow10
-  data_latest <- data_latest[, c(2, 1, 10, 7, 11:14)]
-  weight_inflow <- function(x) {
+  # [1]   symbol date high low close volume x name inflow1 inflow3
+  # [11]  inflow5 inflow10
+  update <- update[, c(2, 1, 8, 7, 9:12)]
+  weigh_inflow <- function(x) {
     return(
       ifelse(x[1] > 0, 0.4, 0) + ifelse(x[2] > 0, 0.3, 0) +
         ifelse(x[3] > 0, 0.2, 0) + ifelse(x[4] > 0, 0.1, 0)
     )
   }
-  data_latest$score <- data_latest$x + apply(data_latest[, 5:8], 1, weight_inflow)
-  data_latest <- data_latest[order(data_latest$score, decreasing = TRUE), ]
-  data_latest[, 4:9] <- format(round(data_latest[, 4:9], 2), nsmall = 2)
+  update$score <- update$x + apply(update[, 5:8], 1, weigh_inflow)
+  update <- update[order(update$score, decreasing = TRUE), ]
+  update[, 4:9] <- format(round(update[, 4:9], 2), nsmall = 2)
   cat(
-    capture.output(print(data_latest, row.names = FALSE)),
+    capture.output(print(update, row.names = FALSE)),
     file = "ranking.txt",
     sep = "\n"
   )
   print(paste0(
       format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
-      " Ranked ", nrow(data_latest), " stock(s);",
+      " Ranked ", nrow(update), " stock(s);",
       " wrote to ranking.txt."
     )
   )
   print(paste0(
       format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
-      " 小优选股助手建议您购买 ", data_latest[1, 3], " 哦！"
+      " 小优选股助手建议您购买 ", update[1, 3], " 哦！"
     )
   )
 
-  return(list(symbol_list, data_list, data_latest))
+  return(list(symbol_list, data_list, update))
 }
 
-query <- function(query = readLines("query.txt"), data_latest = ll[[3]]) {
+query <- function(query = readLines("query.txt"), update = dl[[3]]) {
   cl <- makeCluster(detectCores() - 1)
   registerDoParallel(cl)
-  data_query <- foreach(
+  result <- foreach(
     symbol = query,
     .combine = rbind
   ) %dopar% {
-    return(data_latest[data_latest$symbol == symbol, ])
+    return(update[update$symbol == symbol, ])
   }
   unregister_dopar
 
-  data_query <- data_query[order(data_query$score, decreasing = TRUE), ]
-  print(data_query, row.names = FALSE)
+  result <- result[order(result$score, decreasing = TRUE), ]
+  print(result, row.names = FALSE)
 }
 
-query_plot <- function(query = readLines("query.txt"), data_list = ll[[2]]) {
+query_plot <- function(query = readLines("query.txt"), data_list = dl[[2]]) {
   for (symbol in query) {
     data <- data_list[[symbol]]
     data <- data[data$date > now(tzone = "Asia/Shanghai") - months(6), ]
-    data <- data[is.finite(data$r_max) & is.finite(data$r_min), ]
-    h <- max(max(data$r_max, na.rm = TRUE), max(data$r_min, na.rm = TRUE))
-    l <- min(min(data$r_max, na.rm = TRUE), min(data$r_min, na.rm = TRUE))
-    r_max <- 2 * (data$r_max - l) / (h - l) - 1
-    r_min <- 2 * (data$r_min - l) / (h - l) - 1
-    r_0 <- 2 * (0 - l) / (h - l) - 1
     plot(
-      data$date, data$x, type = "l", xlab = "", ylab = "",
-      main = unique(data$symbol), ylim = c(-1, 1)
+      data$date, 2 * normalize(data$close) - 1, type = "l",
+      xlab = "", ylab = "", main = unique(data$symbol), ylim = c(-1, 1)
     )
-    abline(h = r_0, col = "grey")
-    lines(data$date, r_max, col = "red")
-    lines(data$date, r_min, col = "blue")
+    abline(h = normalize0(data$close), col = "grey")
+    lines(data$date, data$x, col = "red")
   }
+}
+
+backtest <- function(
+  symbol_list, data_list,
+  x_b = 0.75, x_s = 0.5, r_thr = 0.01, t_min = 10, t_max = 40
+) {
+  cl <- makeCluster(detectCores() - 1)
+  registerDoParallel(cl)
+  out <- foreach(
+    symbol = symbol_list,
+    .combine = "multiout",
+    .export = "pct_change",
+    .multicombine = TRUE,
+    .init = list(list(), list())
+  ) %dopar% {
+    data <- data_list[[symbol]]
+    data <- na.omit(data)
+    s <- 1
+    r_list <- data.frame(matrix(nrow = 0, ncol = 4))
+    for (i in 1:nrow(data)) {
+      if (i < s) next
+      if (data[i, "x"] < x_b) next
+      for (j in i:nrow(data)) {
+        if (!(
+            data[j, "x"] <= x_s &
+            pct_change(data[i, "close"], data[j, "close"]) >= r_thr &
+            j - i >= t_min &
+            j - i <= t_max
+          )
+        ) next
+        s <- j
+        break
+      }
+      r <- pct_change(data[i, "close"], data[s, "close"])
+      r_list <- rbind(r_list, c(symbol, data[i, "date"], data[s, "date"], r))
+    }
+
+    r_list <- data.frame(
+      symbol = r_list[, 1],
+      buy = as.Date(as.numeric(r_list[, 2])),
+      sell = as.Date(as.numeric(r_list[, 3])),
+      r = as.numeric(r_list[, 4])
+    )
+
+    r_stats <- c(
+      symbol,
+      sum(r_list[, 4]) / as.numeric(data[nrow(data), 1] - data[1, 1]) * 365
+    )
+
+    return(list(r_stats, r_list))
+  }
+  unregister_dopar
+
+  r_stats <- data.frame(do.call(rbind, out[[1]]))
+  r_stats <- data.frame(symbol = r_stats[, 1], apy = as.numeric(r_stats[, 2]))
+
+  r_list <- out[[2]]
+  get_name <- function(df) {
+    unique(df[, 1])
+  }
+  names(r_list) <- do.call(c, lapply(out[[2]], get_name))
+  print(paste0(
+      "Backtested ", length(r_list), " stocks;",
+      " APY mean = ", round(mean(r_stats[, 2]), 2), ",",
+      " CV = ", round(sd(r_stats[, 2]), 2), "."
+    )
+  )
+
+  r_cat <- do.call(rbind, r_list)
+  hist <- hist(r_cat[r_cat[, 4] <= 1, 4], breaks = 100, probability = TRUE)
+
+  return(list(r_stats, r_list))
 }

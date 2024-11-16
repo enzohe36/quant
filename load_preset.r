@@ -7,6 +7,7 @@ library(doParallel)
 
 options(warn = -1)
 
+# https://stackoverflow.com/a/25110203
 unregister_dopar <- function() {
   env <- foreach:::.foreachGlobals
   rm(list = ls(name = env), pos = env)
@@ -35,6 +36,7 @@ tnormalize <- function(x, t) {
   )
 }
 
+# http://www.cftsc.com/qushizhibiao/610.html
 adx_alt <- function(hlc, n = 14, m = 6) {
   h <- hlc[, 1]
   l <- hlc[, 2]
@@ -53,4 +55,16 @@ adx_alt <- function(hlc, n = 14, m = 6) {
   out <- cbind(adx, adxr)
   colnames(out) <- c("adx", "adxr")
   return(out)
+}
+
+pct_change <- function(x1, x2) {
+  return((x2 - x1) / x1)
+}
+
+# https://stackoverflow.com/a/19801108
+multiout <- function(x, ...) {
+  lapply(
+    seq_along(x),
+    function(i) c(x[[i]], lapply(list(...), function(y) y[[i]]))
+  )
 }

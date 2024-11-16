@@ -1,6 +1,6 @@
-source("/Users/anzhouhe/Documents/quant/load_preset.r", encoding = "UTF-8")
+source("load_preset.r", encoding = "UTF-8")
 
-# Assign input values
+# Define parameters
 pattern <- "^(00|60)"
 t <- 5
 
