@@ -13,26 +13,26 @@ unregister_dopar <- function() {
   rm(list = ls(name = env), pos = env)
 }
 
-normalize <- function(x) {
+normalize <- function(v) {
   return(
-    (x - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE))
+    (v - min(v, na.rm = TRUE)) / (max(v, na.rm = TRUE) - min(v, na.rm = TRUE))
   )
 }
 
-normalize0 <- function(x) {
+normalize0 <- function(v) {
   return(
-    (0 - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE))
+    (0 - min(v, na.rm = TRUE)) / (max(v, na.rm = TRUE) - min(v, na.rm = TRUE))
   )
 }
 
-tnormalize <- function(x, t) {
-  df <- data.frame(matrix(nrow = length(x), ncol = 0))
+tnormalize <- function(v, t) {
+  df <- data.frame(matrix(nrow = length(v), ncol = 0))
   for (i in 1:t) {
-    df[, i] <- lag(x, i - 1)
+    df[, i] <- lag(v, i - 1)
   }
 
   return(
-    (x - apply(df, 1, min)) / (apply(df, 1, max) - apply(df, 1, min))
+    (v - apply(df, 1, min)) / (apply(df, 1, max) - apply(df, 1, min))
   )
 }
 
@@ -57,14 +57,14 @@ adx_alt <- function(hlc, n = 14, m = 6) {
   return(out)
 }
 
-pct_change <- function(x1, x2) {
-  return((x2 - x1) / x1)
+pct_change <- function(v1, v2) {
+  return((v2 - v1) / v1)
 }
 
 # https://stackoverflow.com/a/19801108
-multiout <- function(x, ...) {
+multiout <- function(lst, ...) {
   lapply(
-    seq_along(x),
-    function(i) c(x[[i]], lapply(list(...), function(y) y[[i]]))
+    seq_along(lst),
+    function(i) c(lst[[i]], lapply(list(...), function(y) y[[i]]))
   )
 }

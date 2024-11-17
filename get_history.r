@@ -1,10 +1,12 @@
-source("load_preset.r", encoding = "UTF-8")
-
 # Define parameters
 pattern <- "^(00|60)"
 t <- 5
 
-# ------------------------------------------------------------------------------
+print(paste0(
+    format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
+    " Started get_history()."
+  ), quote = FALSE
+)
 
 # [1]   code name
 symbol_list <- fromJSON(getForm(
@@ -15,16 +17,16 @@ symbol_list <- fromJSON(getForm(
 symbol_list <- symbol_list[, 1]
 print(paste0(
     format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
-    " Found ", length(symbol_list), " stock(s)."
-  )
+    " Found ", length(symbol_list), " stocks."
+  ), quote = FALSE
 )
 
 symbol_list <- symbol_list[grepl(pattern, symbol_list)]
-symbol_list <- sample(symbol_list, 10) # For testing only
+#symbol_list <- sample(symbol_list, 10) # For testing only
 print(paste0(
     format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
-    " Matched ", length(symbol_list), " stock(s) to ", pattern, "."
-  )
+    " Matched ", length(symbol_list), " stocks to ", pattern, "."
+  ), quote = FALSE
 )
 
 dir.create("data")
@@ -65,7 +67,7 @@ unregister_dopar
 writeLines(symbol_list, "symbol_list.txt")
 print(paste0(
     format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
-    " ", length(symbol_list), " stock(s) have ≥ ", t, " years of history;",
+    " ", length(symbol_list), " stocks have ≥ ", t, " years of history;",
     " wrote to data/."
-  )
+  ), quote = FALSE
 )

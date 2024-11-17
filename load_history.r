@@ -1,6 +1,8 @@
-source("load_preset.r", encoding = "UTF-8")
-
-# ------------------------------------------------------------------------------
+print(paste0(
+    format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
+    " Started load_history()."
+  ), quote = FALSE
+)
 
 symbol_list <- readLines("symbol_list.txt")
 
@@ -15,16 +17,16 @@ data_list <- foreach(
   data[, 1] <- as.Date(data[, 1])
   data[, 2] <- formatC(data$symbol, width = 6, format = "d", flag = "0")
 
-  list <- list()
-  list[[symbol]] <- data
-  return(list)
+  lst <- list()
+  lst[[symbol]] <- data
+  return(lst)
 }
 unregister_dopar
 
 print(paste0(
     format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
-    " Loaded ", length(data_list), " stock(s)."
-  )
+    " Loaded ", length(data_list), " stocks."
+  ), quote = FALSE
 )
 
-#return(list(symbol_list, data_list))
+return(list(symbol_list, data_list))

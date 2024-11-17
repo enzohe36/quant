@@ -1,79 +1,108 @@
-source("load_preset.r", encoding = "UTF-8")
-
 # Define parameters
-symbol_list <- symbol_list
-data_list <- data_list
-x_b <- 0.75
-x_s <- 0.5
-r_thr <- 0.01
+x_h <- 0.6
+x_l <- 0.5
+r_h <- 0.01
 t_min <- 10
-t_max <- 40
+t_max <- 60
 
-# ------------------------------------------------------------------------------
+print(paste0(
+    format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
+    " Started backtest()."
+  ), quote = FALSE
+)
 
 cl <- makeCluster(detectCores() - 1)
 registerDoParallel(cl)
 out <- foreach(
   symbol = symbol_list,
-  .combine = "multiout",
-  .export = "pct_change",
+  .combine = multiout,
   .multicombine = TRUE,
-  .init = list(list(), list())
+  .init = list(list(), list()),
+  .export = "pct_change"
 ) %dopar% {
   data <- data_list[[symbol]]
   data <- na.omit(data)
+  data[, 1] <- as.Date(data[, 1])
+
   s <- 1
-  r_list <- data.frame(matrix(nrow = 0, ncol = 4))
+  trading <- data.frame(matrix(nrow = 0, ncol = 4))
   for (i in 1:nrow(data)) {
-    if (i < s) next
-    if (data[i, "x"] < x_b) next
-    for (j in i:nrow(data)) {
-      if (!(
-          data[j, "x"] <= x_s &
-          pct_change(data[i, "close"], data[j, "close"]) >= r_thr &
-          j - i >= t_min &
-          j - i <= t_max
-        )
-      ) next
-      s <- j
-      break
+    if (i < s | data[i, "x"] < x_h | data[i, "dx"] <= 0) {
+      next
     }
-    r <- pct_change(data[i, "close"], data[s, "close"])
-    r_list <- rbind(r_list, c(symbol, data[i, "date"], data[s, "date"], r))
+    for (j in i:nrow(data)) {
+      if (
+        (
+          pct_change(data[i, "close"], data[j, "close"]) >= r_h &
+          data[j, "x"] <= x_l &
+          j - i >= t_min
+        ) | (
+          j - i >= t_max
+        )
+      ) {
+        s <- j
+        break
+      }
+    }
+    if (i < s) {
+      r <- pct_change(data[i, "close"], data[s, "close"])
+      trading <- rbind(
+        trading, list(symbol, data[i, "date"], data[s, "date"], r)
+      )
+    }
   }
+  colnames(trading) <- c("symbol", "buy", "sell", "r")
+  trading[, 2] <- as.Date(trading[, 2])
+  trading[, 3] <- as.Date(trading[, 3])
 
-  r_list <- data.frame(
-    symbol = r_list[, 1],
-    buy = as.Date(as.numeric(r_list[, 2])),
-    sell = as.Date(as.numeric(r_list[, 3])),
-    r = as.numeric(r_list[, 4])
-  )
-
-  r_stats <- c(
+  apy <- data.frame(
     symbol,
-    sum(r_list[, 4]) / as.numeric(data[nrow(data), 1] - data[1, 1]) * 365
+    sum(trading[, 4]) / as.numeric(data[nrow(data), 1] - data[1, 1]) * 365
   )
+  colnames(apy) <- c("symbol", "apy")
 
-  return(list(r_stats, r_list))
+  return(list(trading, apy))
 }
 unregister_dopar
 
-r_stats <- data.frame(do.call(rbind, out[[1]]))
-r_stats <- data.frame(symbol = r_stats[, 1], apy = as.numeric(r_stats[, 2]))
-
-r_list <- out[[2]]
-get_name <- function(df) {
-  unique(df[, 1])
-}
-names(r_list) <- do.call(c, lapply(out[[2]], get_name))
+trading_list <- out[[1]]
+names(trading_list) <- do.call(c, lapply(trading_list, function(df) df[1, 1]))
 print(paste0(
-    "Backtested ", length(r_list), " stocks;",
-    " APY mean = ", round(mean(r_stats[, 2]), 2), ",",
-    " CV = ", round(sd(r_stats[, 2]), 2), "."
+    format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
+    " Backtested ", length(trading_list), " stocks."
+  ), quote = FALSE
+)
+
+trading <- do.call(rbind, trading_list)
+writeLines(c(
+    "",
+    capture.output(round(quantile(trading[, 4], seq(0, 1, 0.1)), 4))
   )
 )
 
-r_cat <- do.call(rbind, r_list)
-hist <- hist(r_cat[r_cat[, 4] <= 1, 4], breaks = 100, probability = TRUE)
+apy_low <- do.call(rbind, out[[2]])[, 2]
+apy_high <- trading[, 4] / as.numeric(trading[, 3] - trading[, 2]) * 365
+stats <- data.frame(
+  Mean = c(
+    mean(trading[, 4]),
+    mean(as.numeric(trading[, 3] - trading[, 2])),
+    mean(apy_low),
+    mean(apy_high)
+  ),
+  SD = c(
+    sd(trading[, 4]),
+    sd(as.numeric(trading[, 3] - trading[, 2])),
+    sd(apy_low),
+    sd(apy_high)
+  ),
+  row.names = c("r", "t", "APY_low", "APY_high")
+)
+writeLines(c(
+    "",
+    capture.output(round(stats, 2))
+  )
+)
 
-#return(list(r_stats, r_list))
+hist <- hist(trading[trading$r <= 1 & trading$r >= -1, 4], breaks = 100)
+
+return(trading_list)
