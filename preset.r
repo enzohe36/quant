@@ -37,7 +37,7 @@ tnormalize <- function(v, t) {
 }
 
 # http://www.cftsc.com/qushizhibiao/610.html
-adx_alt <- function(hlc, n = 14, m = 6) {
+calc_adx <- function(hlc, n = 14, m = 6) {
   h <- hlc[, 1]
   l <- hlc[, 2]
   c <- hlc[, 3]
@@ -57,7 +57,7 @@ adx_alt <- function(hlc, n = 14, m = 6) {
   return(out)
 }
 
-pct_change <- function(v1, v2) {
+calc_ror <- function(v1, v2) {
   return((v2 - v1) / v1)
 }
 
