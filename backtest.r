@@ -68,10 +68,12 @@ backtest <- function(symbol_list = load[[1]], data_list = load[[2]]) {
     trade[, 3] <- as.Date(trade[, 3])
 
     apy <- data.frame(
-      symbol,
-      sum(trade[, 4]) / as.numeric(data[nrow(data), 1] - data[1, 1]) * 365
+      symbol = symbol,
+      apy = sum(trade[, 4]) /
+        as.numeric(data[nrow(data), 1] - data[1, 1]) * 365,
+      apy0 = calc_ror(data[1, 5], data[nrow(data), 5]) /
+        as.numeric(data[nrow(data), 1] - data[1, 1]) * 365
     )
-    colnames(apy) <- c("symbol", "apy")
 
     return(list(trade, apy))
   }
@@ -86,29 +88,17 @@ backtest <- function(symbol_list = load[[1]], data_list = load[[2]]) {
   )
 
   trade <- do.call(rbind, trade_list)
-  writeLines(c(
-      "",
-      capture.output(round(quantile(trade[, 4], seq(0, 1, 0.1)), 4))
-    )
-  )
-
   apy <- do.call(rbind, out[[2]])[, 2]
+  apy0 <- do.call(rbind, out[[2]])[, 3]
   stats <- data.frame(
-    Mean = c(
-      mean(trade[, 4]),
-      mean(as.numeric(trade[, 3] - trade[, 2])),
-      mean(apy)
-    ),
-    SD = c(
-      sd(trade[, 4]),
-      sd(as.numeric(trade[, 3] - trade[, 2])),
-      sd(apy)
-    ),
-    row.names = c("r", "t", "apy")
+    r = quantile(trade[, 4]),
+    t = quantile(as.numeric(trade[, 3] - trade[, 2])),
+    apy = quantile(apy),
+    apy0 = quantile(apy0)
   )
   writeLines(c(
       "",
-      capture.output(round(stats, 2))
+      capture.output(round(stats, 4))
     )
   )
 
