@@ -1,14 +1,13 @@
-calc_apy25 <- function(t_max) {
+backtest_min <- function(r_h, r_l) {
   # Define parameters
   symbol_list <- out0[[1]]
   data_list <- out0[[2]]
   t_adx <- 70
   t_cci <- 51
   x_h <- 0.53
-  x_l <- 0.31
-  r_h <- 0.037
-  t_min <- 14
-  #t_max <- 104
+  #r_h <- 0.1
+  #r_l <- -0.5
+  t_max <- 104
 
   cl <- makeCluster(detectCores() - 1)
   registerDoParallel(cl)
@@ -22,7 +21,7 @@ calc_apy25 <- function(t_max) {
 
     # Calculate predictor
     adx <- 1 - tnormalize(
-      abs(adx_alt(data[, 3:5])[, 1] - adx_alt(data[, 3:5])[, 2]), t_adx
+      abs(adx_alt(data[, 3:5])[, "adx"] - adx_alt(data[, 3:5])[, "adxr"]), t_adx
     )
     cci <- 1 - 2 * tnormalize(CCI(data[, 3:5]), t_cci)
     data$x <- adx * cci
@@ -30,43 +29,57 @@ calc_apy25 <- function(t_max) {
 
     data <- na.omit(data)
 
-    trade <- c()
-    s <- 1
-    for (i in 1:nrow(data)) {
-      if (i < s | data[i, "x"] < x_h | data[i, "dx"] <= 0) {
+    trade <- data.frame()
+    j <- 1
+    for (i in 1:(nrow(data) - 1)) {
+      if (!(i >= j & data[i, "x"] >= x_h & data[i, "dx"] > 0)) {
         next
       }
-      for (j in i:nrow(data)) {
+      for (j in (i + 1):nrow(data)) {
         if (
-          (
-            ror(data[i, "close"], data[j, "close"]) >= r_h &
-            data[j, "x"] <= x_l &
-            j - i >= t_min
-          ) | (
-            j - i >= t_max
-          )
+          ror(data[i, "close"], data[j, "high"]) >= r_h
         ) {
-          s <- j
+          r <- r_h
+          break
+        } else if (
+          ror(data[i, "close"], data[j, "low"]) <= r_l
+        ) {
+          ifelse(
+            ror(data[i, "close"], data[j, "high"]) > r_l,
+            r <- r_l,
+            r <- ror(data[i, "close"], data[j, "close"])
+          )
+          break
+        } else if (
+          j - i >= t_max
+        ) {
+          r <- ror(data[i, "close"], data[j, "close"])
           break
         }
       }
-      if (i < s) {
-        r <- ror(data[i, "close"], data[s, "close"])
-        trade <- c(trade, r)
-      }
+      trade <- rbind(
+        trade, list(r, j - i)
+      )
     }
+    colnames(trade) <- c("r", "t")
+    trade <- trade[trade$r >= 0.9^trade$t - 1 & trade$r <= 1.1^trade$t - 1, ]
 
-    apy <- sum(trade) / as.numeric(data[nrow(data), 1] - data[1, 1]) * 365
+    apy <- sum(trade$r) /
+      as.numeric(data[nrow(data), "date"] - data[1, "date"]) * 365
 
     return(apy)
   }
   unregister_dopar
 
-  return(quantile(out, 0.25))
+  write(
+    paste0(r_h, ",", r_l, ",", mean(out), mean(out) / sd(out)),
+    file = "optimization.csv",
+    append = TRUE
+  )
 }
 
-out <- optimize(
-  calc_apy25, c(40, 120), tol = 1, maximum = TRUE
-)
-
-print(out)
+for (i in 1:nrow(out)) {
+  for (j in 1:ncol(out)) {
+    backtest_min(i / 100, -j / 10)
+  }
+}

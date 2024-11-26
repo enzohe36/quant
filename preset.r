@@ -26,13 +26,8 @@ normalize0 <- function(v) {
 }
 
 tnormalize <- function(v, t) {
-  df <- data.frame(matrix(nrow = length(v), ncol = 0))
-  for (i in 1:t) {
-    df[, i] <- lag(v, i - 1)
-  }
-
   return(
-    (v - apply(df, 1, min)) / (apply(df, 1, max) - apply(df, 1, min))
+    (v - runMin(v, t)) / (runMax(v, t) - runMin(v, t))
   )
 }
 

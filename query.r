@@ -1,29 +1,17 @@
-query <- function(q_list) {
-  print(paste0(
-      format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
-      " Started query()."
-    ), quote = FALSE
-  )
-
+query <- function(symbol = read.csv("portfolio.csv")[, "symbol"]) {
   # Define parameters
-  data_list <- load[[2]]
-  latest <- load[[3]]
+  data_list <- out0[[2]]
+  latest <- out0[[3]]
 
-  cl <- makeCluster(detectCores() - 1)
-  registerDoParallel(cl)
-  out <- foreach(
-    symbol = q_list,
-    .combine = rbind
-  ) %dopar% {
-    return(latest[latest$symbol == symbol, ])
-  }
-  unregister_dopar
+  symbol <- formatC(as.integer(symbol), width = 6, format = "d", flag = "0")
 
-  out <- out[order(out$score, decreasing = TRUE), ]
-  out[, 4:10] <- format(round(out[, 4:10], 2), nsmall = 2)
-  writeLines(c("", capture.output(print(out, row.names = FALSE))))
+  out <- latest[latest$symbol %in% symbol, ]
+  out[, sapply(out, is.numeric)] <- format(
+    out[, sapply(out, is.numeric)], nsmall = 2
+  )
+  print(out, row.names = FALSE)
 
-  for (symbol in out[, 2]) {
+  for (symbol in out$symbol) {
     data <- data_list[[symbol]]
     data <- data[data$date > now(tzone = "Asia/Shanghai") - months(6), ]
     plot(

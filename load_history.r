@@ -1,8 +1,10 @@
 load_history <- function(pattern, adjust, start_date, end_date) {
-  print(paste0(
+  print(
+    paste0(
       format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
       " Started load_history()."
-    ), quote = FALSE
+    ),
+    quote = FALSE
   )
 
   # Define parameters
@@ -28,7 +30,7 @@ load_history <- function(pattern, adjust, start_date, end_date) {
       colClasses = c(date = "Date", symbol = "character")
     )
     data <- data[data$date >= start_date & data$date <= end_date, ]
-    if (data[1, 1] > start_date + days(2)) next
+    if (data[1, "date"] > start_date + days(2)) next
 
     return(list(symbol, data))
   }
@@ -37,12 +39,16 @@ load_history <- function(pattern, adjust, start_date, end_date) {
   symbol_list <- do.call(rbind, out[[1]])[, 1]
 
   data_list <- out[[2]]
-  names(data_list) <- do.call(c, lapply(data_list, function(df) df[1, 2]))
+  names(data_list) <- do.call(
+    c, lapply(data_list, function(df) df[1, "symbol"])
+  )
 
-  print(paste0(
+  print(
+    paste0(
       format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
       " Loaded ", length(data_list), " stocks from data_", adjust, "/."
-    ), quote = FALSE
+    ),
+    quote = FALSE
   )
 
   return(list(symbol_list, data_list))
