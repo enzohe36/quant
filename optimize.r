@@ -1,26 +1,28 @@
-calc_apy25 <- function(t_max, symbol_list = load[[1]], data_list = load[[2]]) {
+calc_apy25 <- function(t_max) {
   # Define parameters
+  symbol_list <- out0[[1]]
+  data_list <- out0[[2]]
   t_adx <- 70
   t_cci <- 51
   x_h <- 0.53
   x_l <- 0.31
   r_h <- 0.037
   t_min <- 14
-  t_max <- 104
+  #t_max <- 104
 
   cl <- makeCluster(detectCores() - 1)
   registerDoParallel(cl)
   out <- foreach(
     symbol = symbol_list,
     .combine = append,
-    .export = c("tnormalize", "calc_adx", "calc_ror"),
+    .export = c("tnormalize", "adx_alt", "ror"),
     .packages = c("TTR", "tidyverse")
   ) %dopar% {
     data <- data_list[[symbol]]
 
     # Calculate predictor
     adx <- 1 - tnormalize(
-      abs(calc_adx(data[, 3:5])[, 1] - calc_adx(data[, 3:5])[, 2]), t_adx
+      abs(adx_alt(data[, 3:5])[, 1] - adx_alt(data[, 3:5])[, 2]), t_adx
     )
     cci <- 1 - 2 * tnormalize(CCI(data[, 3:5]), t_cci)
     data$x <- adx * cci
@@ -37,7 +39,7 @@ calc_apy25 <- function(t_max, symbol_list = load[[1]], data_list = load[[2]]) {
       for (j in i:nrow(data)) {
         if (
           (
-            calc_ror(data[i, "close"], data[j, "close"]) >= r_h &
+            ror(data[i, "close"], data[j, "close"]) >= r_h &
             data[j, "x"] <= x_l &
             j - i >= t_min
           ) | (
@@ -49,7 +51,7 @@ calc_apy25 <- function(t_max, symbol_list = load[[1]], data_list = load[[2]]) {
         }
       }
       if (i < s) {
-        r <- calc_ror(data[i, "close"], data[s, "close"])
+        r <- ror(data[i, "close"], data[s, "close"])
         trade <- c(trade, r)
       }
     }

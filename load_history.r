@@ -1,28 +1,43 @@
-load_history <- function(adjust) {
+load_history <- function(pattern, adjust, start_date, end_date) {
   print(paste0(
       format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
       " Started load_history()."
     ), quote = FALSE
   )
 
+  # Define parameters
+  start_date <- as.Date(start_date)
+  end_date <- as.Date(end_date)
+
   symbol_list <- readLines("symbol_list.txt")
+  symbol_list <- symbol_list[grepl(pattern, symbol_list)]
 
   cl <- makeCluster(detectCores() - 1)
   registerDoParallel(cl)
-  data_list <- foreach(
+  out <- foreach(
     symbol = symbol_list,
-    .combine = append
+    .combine = multiout,
+    .multicombine = TRUE,
+    .init = list(list(), list()),
+    .errorhandling = "remove",
+    .packages = "tidyverse"
   ) %dopar% {
     # [1]   date symbol high low close volume
-    data <- read.csv(paste0("data_", adjust, "/", symbol, ".csv"))
-    data[, 1] <- as.Date(data[, 1])
-    data[, 2] <- formatC(data$symbol, width = 6, format = "d", flag = "0")
+    data <- read.csv(
+      paste0("data_", adjust, "/", symbol, ".csv"),
+      colClasses = c(date = "Date", symbol = "character")
+    )
+    data <- data[data$date >= start_date & data$date <= end_date, ]
+    if (data[1, 1] > start_date + days(2)) next
 
-    lst <- list()
-    lst[[symbol]] <- data
-    return(lst)
+    return(list(symbol, data))
   }
   unregister_dopar
+
+  symbol_list <- do.call(rbind, out[[1]])[, 1]
+
+  data_list <- out[[2]]
+  names(data_list) <- do.call(c, lapply(data_list, function(df) df[1, 2]))
 
   print(paste0(
       format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),

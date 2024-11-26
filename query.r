@@ -1,9 +1,13 @@
-query <- function(q_list, data_list = load[[2]], latest = load[[3]]) {
+query <- function(q_list) {
   print(paste0(
       format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
       " Started query()."
     ), quote = FALSE
   )
+
+  # Define parameters
+  data_list <- load[[2]]
+  latest <- load[[3]]
 
   cl <- makeCluster(detectCores() - 1)
   registerDoParallel(cl)

@@ -1,5 +1,13 @@
-update <- function(symbol_list = load[[1]], data_list = load[[2]]) {
+update <- function() {
+  print(paste0(
+      format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
+      " Started update()."
+    ), quote = FALSE
+  )
+
   # Define parameters
+  symbol_list <- out0[[1]]
+  data_list <- out0[[2]]
   t_adx <- 70
   t_cci <- 51
   x_h <- 0.53
@@ -7,12 +15,6 @@ update <- function(symbol_list = load[[1]], data_list = load[[2]]) {
   r_h <- 0.037
   t_min <- 14
   t_max <- 104
-
-  print(paste0(
-      format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
-      " Started update()."
-    ), quote = FALSE
-  )
 
   # [1]   序号 代码 名称 最新价 涨跌幅 涨跌额 成交量 成交额 振幅 最高
   # [11]  最低 今开 昨收 量比 换手率 市盈率-动态 市净率 总市值 流通市值 涨速
@@ -32,7 +34,7 @@ update <- function(symbol_list = load[[1]], data_list = load[[2]]) {
   data_list <- foreach(
     symbol = symbol_list,
     .combine = append,
-    .export = c("tnormalize", "calc_adx"),
+    .export = c("tnormalize", "adx_alt"),
     .packages = c("tidyverse", "TTR")
   ) %dopar% {
     data <- data_list[[symbol]]
@@ -52,7 +54,7 @@ update <- function(symbol_list = load[[1]], data_list = load[[2]]) {
 
     # Calculate predictor
     adx <- 1 - tnormalize(
-      abs(calc_adx(data[, 3:5])[, 1] - calc_adx(data[, 3:5])[, 2]), t_adx
+      abs(adx_alt(data[, 3:5])[, 1] - adx_alt(data[, 3:5])[, 2]), t_adx
     )
     cci <- 1 - 2 * tnormalize(CCI(data[, 3:5]), t_cci)
     data$x <- adx * cci
@@ -157,7 +159,7 @@ update <- function(symbol_list = load[[1]], data_list = load[[2]]) {
     j <- nrow(data)
     if (
       (
-        calc_ror(data[i, "close"], data[j, "close"]) >= r_h &
+        ror(data[i, "close"], data[j, "close"]) >= r_h &
         data[j, "x"] <= x_l &
         j - i >= t_min
       ) | (

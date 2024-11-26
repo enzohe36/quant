@@ -1,5 +1,13 @@
-backtest <- function(symbol_list = load[[1]], data_list = load[[2]]) {
+backtest <- function() {
+  print(paste0(
+      format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
+      " Started backtest()."
+    ), quote = FALSE
+  )
+
   # Define parameters
+  symbol_list <- out0[[1]]
+  data_list <- out0[[2]]
   t_adx <- 70
   t_cci <- 51
   x_h <- 0.53
@@ -8,12 +16,6 @@ backtest <- function(symbol_list = load[[1]], data_list = load[[2]]) {
   t_min <- 14
   t_max <- 104
 
-  print(paste0(
-      format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
-      " Started backtest()."
-    ), quote = FALSE
-  )
-
   cl <- makeCluster(detectCores() - 1)
   registerDoParallel(cl)
   out <- foreach(
@@ -21,14 +23,14 @@ backtest <- function(symbol_list = load[[1]], data_list = load[[2]]) {
     .combine = multiout,
     .multicombine = TRUE,
     .init = list(list(), list()),
-    .export = c("tnormalize", "calc_adx", "calc_ror"),
+    .export = c("tnormalize", "adx_alt", "ror"),
     .packages = c("TTR", "tidyverse")
   ) %dopar% {
     data <- data_list[[symbol]]
 
     # Calculate predictor
     adx <- 1 - tnormalize(
-      abs(calc_adx(data[, 3:5])[, 1] - calc_adx(data[, 3:5])[, 2]), t_adx
+      abs(adx_alt(data[, 3:5])[, 1] - adx_alt(data[, 3:5])[, 2]), t_adx
     )
     cci <- 1 - 2 * tnormalize(CCI(data[, 3:5]), t_cci)
     data$x <- adx * cci
@@ -45,7 +47,7 @@ backtest <- function(symbol_list = load[[1]], data_list = load[[2]]) {
       for (j in i:nrow(data)) {
         if (
           (
-            calc_ror(data[i, "close"], data[j, "close"]) >= r_h &
+            ror(data[i, "close"], data[j, "close"]) >= r_h &
             data[j, "x"] <= x_l &
             j - i >= t_min
           ) | (
@@ -57,7 +59,7 @@ backtest <- function(symbol_list = load[[1]], data_list = load[[2]]) {
         }
       }
       if (i < s) {
-        r <- calc_ror(data[i, "close"], data[s, "close"])
+        r <- ror(data[i, "close"], data[s, "close"])
         trade <- rbind(
           trade, list(symbol, data[i, "date"], data[s, "date"], r)
         )
@@ -71,7 +73,7 @@ backtest <- function(symbol_list = load[[1]], data_list = load[[2]]) {
       symbol = symbol,
       apy = sum(trade[, 4]) /
         as.numeric(data[nrow(data), 1] - data[1, 1]) * 365,
-      apy0 = calc_ror(data[1, 5], data[nrow(data), 5]) /
+      apy0 = ror(data[1, 5], data[nrow(data), 5]) /
         as.numeric(data[nrow(data), 1] - data[1, 1]) * 365
     )
 
