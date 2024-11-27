@@ -10,8 +10,8 @@ backtest <- function() {
   # Define parameters
   symbol_list <- out0[[1]]
   data_list <- out0[[2]]
-  t_adx <- 70
-  t_cci <- 51
+  t_adx <- 20
+  t_cci <- 25
   x_h <- 0.53
   r_h <- 0.1
   r_l <- -0.5
@@ -76,12 +76,12 @@ backtest <- function() {
     trade$buy <- as.Date(trade$buy)
     trade$sell <- as.Date(trade$sell)
 
+    t <- as.numeric(data[nrow(data), "date"] - data[1, "date"]) / 365
+
     apy <- data.frame(
       symbol = symbol,
-      apy = sum(trade$r) /
-        as.numeric(data[nrow(data), "date"] - data[1, "date"]) * 365,
-      apy0 = ror(data[1, "close"], data[nrow(data), "close"]) /
-        as.numeric(data[nrow(data), "date"] - data[1, "date"]) * 365
+      apy = sum(trade$r) / t,
+      apy0 = ror(data[1, "close"], data[nrow(data), "close"]) / t
     )
 
     return(list(trade, apy))
@@ -101,14 +101,13 @@ backtest <- function() {
   )
 
   trade <- do.call(rbind, trade_list)
-  apy <- do.call(rbind, out[[2]])[, "apy"]
-  apy0 <- do.call(rbind, out[[2]])[, "apy0"]
+  apy <- do.call(rbind, out[[2]])
   stats <- data.frame(
     r = quantile(trade$r),
     t = quantile(trade$t),
     t_cal = quantile(as.numeric(trade$sell - trade$buy)),
-    apy = quantile(apy),
-    apy0 = quantile(apy0)
+    apy = quantile(apy$apy),
+    apy0 = quantile(apy$apy0)
   )
   stats[, c("r", "apy", "apy0")] <- format(
     round(stats[, c("r", "apy", "apy0")], 3), nsmall = 3
@@ -121,8 +120,8 @@ backtest <- function() {
       mean(as.numeric(trade$sell - trade$buy)),
       sd(as.numeric(trade$sell - trade$buy))
     ),
-    apy = c(mean(apy), sd(apy)),
-    apy0 = c(mean(apy0), sd(apy0))
+    apy = c(mean(apy$apy), sd(apy$apy)),
+    apy0 = c(mean(apy$apy0), sd(apy$apy0))
   )
   rownames(stats2) <- c("mean", "sd")
   stats2[, c("r", "apy", "apy0")] <- format(
@@ -130,7 +129,7 @@ backtest <- function() {
   )
   stats2[, c("t", "t_cal")] <- round(stats2[, c("t", "t_cal")])
 
-  stats <- rbind(stats, list("", "", "", "", ""), stats2)
+  stats <- rbind(stats, rep(list(""), 5), stats2)
   rownames(stats)[rownames(stats) == "1"] <- ""
   writeLines(c("", capture.output(stats)))
 

@@ -24,7 +24,6 @@ load_history <- function(pattern, adjust, start_date, end_date) {
     .errorhandling = "remove",
     .packages = "tidyverse"
   ) %dopar% {
-    # [1]   date symbol high low close volume
     data <- read.csv(
       paste0("data_", adjust, "/", symbol, ".csv"),
       colClasses = c(date = "Date", symbol = "character")

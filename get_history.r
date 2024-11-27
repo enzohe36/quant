@@ -7,12 +7,14 @@ get_history <- function(pattern, adjust) {
     quote = FALSE
   )
 
-  # [1]   code name
-  symbol_list <- fromJSON(getForm(
+  symbol_list <- fromJSON(
+    getForm(
       uri = "http://127.0.0.1:8080/api/public/stock_info_a_code_name",
       .encoding = "utf-8"
     )
   )
+
+  # [1]   code name
   symbol_list <- symbol_list[, 1]
   writeLines(symbol_list, "symbol_list.txt")
   print(
@@ -25,7 +27,6 @@ get_history <- function(pattern, adjust) {
   )
 
   symbol_list <- symbol_list[grepl(pattern, symbol_list)]
-  #symbol_list <- sample(symbol_list, 10) # For testing only
   print(
     paste0(
       format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
@@ -47,9 +48,8 @@ get_history <- function(pattern, adjust) {
     file <- paste0("data_", adjust, "/", symbol, ".csv")
 
     if (adjust == "qfq") {
-      # [1]   日期 股票代码 开盘 收盘 最高 最低 成交量 成交额 振幅 涨跌幅
-      # [11]  涨跌额 换手率
-      data <- fromJSON(getForm(
+      data <- fromJSON(
+        getForm(
           uri = "http://127.0.0.1:8080/api/public/stock_zh_a_hist",
           symbol = symbol,
           adjust = adjust,
@@ -59,10 +59,13 @@ get_history <- function(pattern, adjust) {
           .encoding = "utf-8"
         )
       )
+
+      # [1]   日期 股票代码 开盘 收盘 最高 最低 成交量 成交额 振幅 涨跌幅
+      # [11]  涨跌额 换手率
       data <- data[, c(1, 2, 5, 6, 4, 7)]
       colnames(data) <- c("date", "symbol", "high", "low", "close", "volume")
       data$date <- as.Date(data$date)
-      write.csv(data, file, row.names = FALSE, quote = FALSE)
+      write.csv(data, file, quote = FALSE, row.names = FALSE)
 
       return(1)
     }
@@ -75,9 +78,8 @@ get_history <- function(pattern, adjust) {
     )
 
     if (class(out) == "try-error") {
-      # [1]   日期 股票代码 开盘 收盘 最高 最低 成交量 成交额 振幅 涨跌幅
-      # [11]  涨跌额 换手率
-      data <- fromJSON(getForm(
+      data <- fromJSON(
+        getForm(
           uri = "http://127.0.0.1:8080/api/public/stock_zh_a_hist",
           symbol = symbol,
           adjust = adjust,
@@ -85,17 +87,19 @@ get_history <- function(pattern, adjust) {
           .encoding = "utf-8"
         )
       )
+
+      # [1]   日期 股票代码 开盘 收盘 最高 最低 成交量 成交额 振幅 涨跌幅
+      # [11]  涨跌额 换手率
       data <- data[, c(1, 2, 5, 6, 4, 7)]
       colnames(data) <- c("date", "symbol", "high", "low", "close", "volume")
       data$date <- as.Date(data$date)
-      write.csv(data, file, row.names = FALSE, quote = FALSE)
+      write.csv(data, file, quote = FALSE, row.names = FALSE)
 
       return(1)
     }
 
-    # [1]   日期 股票代码 开盘 收盘 最高 最低 成交量 成交额 振幅 涨跌幅
-    # [11]  涨跌额 换手率
-    latest <- fromJSON(getForm(
+    latest <- fromJSON(
+      getForm(
         uri = "http://127.0.0.1:8080/api/public/stock_zh_a_hist",
         symbol = symbol,
         adjust = adjust,
@@ -106,16 +110,18 @@ get_history <- function(pattern, adjust) {
     )
 
     if (length(latest) != 0) {
+      # [1]   日期 股票代码 开盘 收盘 最高 最低 成交量 成交额 振幅 涨跌幅
+      # [11]  涨跌额 换手率
       latest <- latest[, c(1, 2, 5, 6, 4, 7)]
       latest[, 1] <- as.Date(latest[, 1])
       write.table(
         latest,
         file,
+        append = TRUE,
+        quote = FALSE,
         sep = ",",
         row.names = FALSE,
-        col.names = FALSE,
-        append = TRUE,
-        quote = FALSE
+        col.names = FALSE
       )
 
       return(1)

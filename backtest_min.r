@@ -1,13 +1,7 @@
-backtest_min <- function(r_h, r_l) {
+backtest_min <- function(t_adx, t_cci, x_h, r_h, r_l, t_max) {
   # Define parameters
   symbol_list <- out0[[1]]
   data_list <- out0[[2]]
-  t_adx <- 70
-  t_cci <- 51
-  x_h <- 0.53
-  #r_h <- 0.1
-  #r_l <- -0.5
-  t_max <- 104
 
   cl <- makeCluster(detectCores() - 1)
   registerDoParallel(cl)
@@ -72,14 +66,8 @@ backtest_min <- function(r_h, r_l) {
   unregister_dopar
 
   write(
-    paste0(r_h, ",", r_l, ",", mean(out), mean(out) / sd(out)),
-    file = "optimization.csv",
+    paste(t_adx, t_cci, x_h, r_h, r_l, t_max, mean(out), sd(out), sep = ","),
+    file = "param.csv",
     append = TRUE
   )
-}
-
-for (i in 1:nrow(out)) {
-  for (j in 1:ncol(out)) {
-    backtest_min(i / 100, -j / 10)
-  }
 }
