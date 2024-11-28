@@ -1,36 +1,36 @@
-buy <- function(symbol, cost = NA, buy = NA) {
-  # Define parameters
+buy <- function(symbol, cost = NaN, date = NA) {
+  # Format arguments
   symbol <- formatC(as.integer(symbol), width = 6, format = "d", flag = "0")
-  try(buy <- ymd(buy), silent = TRUE)
-  latest <- out0[[3]]
+  try(date <- ymd(date), silent = TRUE)
 
+  # Define input
+  latest <- out0[[3]]
   portfolio <- read.csv(
     "portfolio.csv",
-    colClasses = c(symbol = "character", buy = "Date", cost = "numeric")
+    colClasses = c(date = "Date", symbol = "character")
   )
 
-  out <- portfolio[portfolio$symbol == symbol, ]
-  if (nrow(out) == 0) {
+  df <- portfolio[portfolio$symbol == symbol, ]
+  if (nrow(df) == 0) {
     portfolio <- rbind(
       portfolio,
       list(
+        ifelse(is.na(date), date(now(tzone = "Asia/Shanghai")), date),
         symbol,
         latest[latest$symbol == symbol, "name"],
-        ifelse(is.na(buy), date(now(tzone = "Asia/Shanghai")), buy),
         cost
       )
     )
-    colnames(portfolio) <- c("symbol", "name", "buy", "cost")
-    portfolio$buy <- as.Date(portfolio$buy)
+    colnames(portfolio) <- c("date", "symbol", "name", "cost")
+    portfolio$date <- as.Date(portfolio$date)
   } else {
     portfolio[portfolio$symbol == symbol, ] <- list(
+      ifelse(is.na(date), df$date, date),
       symbol,
       latest[latest$symbol == symbol, "name"],
-      ifelse(is.na(buy), portfolio[portfolio$symbol == symbol, "buy"], buy),
-      ifelse(is.na(cost), portfolio[portfolio$symbol == symbol, "cost"], cost)
+      ifelse(is.na(cost), df$cost, cost)
     )
   }
-
   portfolio <- portfolio[order(portfolio$symbol), ]
   portfolio$cost <- format(round(portfolio$cost, 3), nsmall = 3)
   write.csv(portfolio, "portfolio.csv", quote = FALSE, row.names = FALSE)
@@ -38,12 +38,13 @@ buy <- function(symbol, cost = NA, buy = NA) {
 }
 
 sell <- function(symbol = read.csv("portfolio.csv")[, "symbol"]) {
-  # Define parameters
+  # Format arguments
   symbol <- formatC(as.integer(symbol), width = 6, format = "d", flag = "0")
 
+  # Define input
   portfolio <- read.csv(
     "portfolio.csv",
-    colClasses = c(symbol = "character", buy = "Date", cost = "numeric")
+    colClasses = c(date = "Date", symbol = "character")
   )
 
   portfolio <- portfolio[portfolio$symbol != symbol, ]

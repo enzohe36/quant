@@ -48,9 +48,10 @@ adx_alt <- function(hlc, n = 14, m = 6) {
   din <- dmn / tr
   adx <- SMA(abs(dip - din) / (dip + din), m)
   adxr <- (adx + lag(adx, m)) / 2
-  out <- cbind(adx, adxr)
-  colnames(out) <- c("adx", "adxr")
-  return(out)
+  df <- data.frame(adx, adxr)
+  colnames(df) <- c("adx", "adxr")
+
+  return(df)
 }
 
 ror <- function(v1, v2) {

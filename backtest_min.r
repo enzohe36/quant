@@ -1,5 +1,5 @@
 backtest_min <- function(t_adx, t_cci, x_h, r_h, r_l, t_max) {
-  # Define parameters
+  # Define input
   symbol_list <- out0[[1]]
   data_list <- out0[[2]]
 
@@ -14,9 +14,8 @@ backtest_min <- function(t_adx, t_cci, x_h, r_h, r_l, t_max) {
     data <- data_list[[symbol]]
 
     # Calculate predictor
-    adx <- 1 - tnormalize(
-      abs(adx_alt(data[, 3:5])[, "adx"] - adx_alt(data[, 3:5])[, "adxr"]), t_adx
-    )
+    adx <- adx_alt(data[, 3:5])
+    adx <- 1 - tnormalize(abs(adx$adx - adx$adxr), t_adx)
     cci <- 1 - 2 * tnormalize(CCI(data[, 3:5]), t_cci)
     data$x <- adx * cci
     data$dx <- momentum(data$x, 5)

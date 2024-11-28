@@ -7,9 +7,11 @@ backtest <- function() {
     quote = FALSE
   )
 
-  # Define parameters
+  # Define input
   symbol_list <- out0[[1]]
   data_list <- out0[[2]]
+
+  # Define parameters
   t_adx <- 20
   t_cci <- 25
   x_h <- 0.53
@@ -30,9 +32,8 @@ backtest <- function() {
     data <- data_list[[symbol]]
 
     # Calculate predictor
-    adx <- 1 - tnormalize(
-      abs(adx_alt(data[, 3:5])[, "adx"] - adx_alt(data[, 3:5])[, "adxr"]), t_adx
-    )
+    adx <- adx_alt(data[, 3:5])
+    adx <- 1 - tnormalize(abs(adx$adx - adx$adxr), t_adx)
     cci <- 1 - 2 * tnormalize(CCI(data[, 3:5]), t_cci)
     data$x <- adx * cci
     data$dx <- momentum(data$x, 5)

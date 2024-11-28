@@ -7,9 +7,11 @@ update <- function() {
     quote = FALSE
   )
 
-  # Define parameters
+  # Define input
   symbol_list <- out0[[1]]
   data_list <- out0[[2]]
+
+  # Define parameters
   t_adx <- 20
   t_cci <- 25
   x_h <- 0.53
@@ -17,6 +19,9 @@ update <- function() {
   r_l <- -0.5
   t_max <- 104
 
+  # [1]   序号 代码 名称 最新价 涨跌幅 涨跌额 成交量 成交额 振幅 最高
+  # [11]  最低 今开 昨收 量比 换手率 市盈率-动态 市净率 总市值 流通市值 涨速
+  # [21]  5分钟涨跌 60日涨跌幅 年初至今涨跌幅 date
   latest <- fromJSON(
     getForm(
       uri = "http://127.0.0.1:8080/api/public/stock_zh_a_spot_em",
@@ -24,10 +29,6 @@ update <- function() {
     )
   )
   latest <- mutate(latest, date = date(now(tzone = "Asia/Shanghai")))
-
-  # [1]   序号 代码 名称 最新价 涨跌幅 涨跌额 成交量 成交额 振幅 最高
-  # [11]  最低 今开 昨收 量比 换手率 市盈率-动态 市净率 总市值 流通市值 涨速
-  # [21]  5分钟涨跌 60日涨跌幅 年初至今涨跌幅 date
   latest <- latest[, c(24, 2, 10, 11, 4, 7)]
   colnames(latest) <- c("date", "symbol", "high", "low", "close", "volume")
   latest <- latest[latest$symbol %in% symbol_list, ]
@@ -42,24 +43,22 @@ update <- function() {
   ) %dopar% {
     data <- data_list[[symbol]]
 
+    df <- latest[latest$symbol == symbol, ]
     if (
-      !all(
-        (data[nrow(data), 3:6] == latest[latest$symbol == symbol, 3:6]) %in%
-          TRUE
-      )
+      !all((data[nrow(data), 3:6] == df[, 3:6]) %in% TRUE)
     ) {
-      if (data[nrow(data), "date"] == latest[latest$symbol == symbol, "date"]) {
-        data[nrow(data), ] <- latest[latest$symbol == symbol, ]
-      } else {
-        data <- bind_rows(data, latest[latest$symbol == symbol, ])
-      }
+      ifelse(
+        data[nrow(data), "date"] == df$date,
+        data[nrow(data), ] <- df,
+        data <- bind_rows(data, df)
+      )
     }
+
     if (any(is.na(data[nrow(data), ]))) data <- data[-c(nrow(data)), ]
 
     # Calculate predictor
-    adx <- 1 - tnormalize(
-      abs(adx_alt(data[, 3:5])[, "adx"] - adx_alt(data[, 3:5])[, "adxr"]), t_adx
-    )
+    adx <- adx_alt(data[, 3:5])
+    adx <- 1 - tnormalize(abs(adx$adx - adx$adxr), t_adx)
     cci <- 1 - 2 * tnormalize(CCI(data[, 3:5]), t_cci)
     data$x <- adx * cci
     data$dx <- momentum(data$x, 5)
@@ -89,6 +88,9 @@ update <- function() {
     indicator = fundflow_dict$indicator,
     .packages = c("jsonlite", "RCurl")
   ) %dopar% {
+    # [1]   序号 代码 名称 最新价 涨跌幅
+    # [6]   主力净流入额 主力净流入占比 超大单净流入额 超大单净流入占比 大单净流入额
+    # [11]  大单净流入占比 中单净流入额 中单净流入占比 小单净流入额 小单净流入占比
     fundflow <- fromJSON(
       getForm(
         uri = paste0(
@@ -98,10 +100,6 @@ update <- function() {
         .encoding = "utf-8"
       )
     )
-
-    # [1]   序号 代码 名称 最新价 涨跌幅
-    # [6]   主力净流入额 主力净流入占比 超大单净流入额 超大单净流入占比 大单净流入额
-    # [11]  大单净流入占比 中单净流入额 中单净流入占比 小单净流入额 小单净流入占比
     fundflow <- fundflow[, c(2, 3, 7)]
     header <- fundflow_dict[fundflow_dict$indicator == indicator, "header"]
     colnames(fundflow) <- c("symbol", "name", header)
@@ -115,15 +113,14 @@ update <- function() {
   fundflow <- reduce(fundflow, full_join, by = join_by("symbol", "name"))
   fundflow[, fundflow_dict$header] <- fundflow[, fundflow_dict$header] / 100
 
+  # [1]   symbol date high low close volume x dx name in1
+  # [11]  in3 in5 in10
   latest <- bind_rows(
     lapply(
       data_list,
       function(df) merge(df[nrow(df), ], fundflow, by = "symbol")
     )
   )
-
-  # [1]   symbol date high low close volume x dx name in1
-  # [11]  in3 in5 in10
   latest <- latest[, c(2, 1, 9, 7, 8, 10:13)]
   latest$in_score <- apply(latest[, fundflow_dict$header], 1, sum)
   latest <- latest[order(latest$in_score, decreasing = TRUE), ]
@@ -131,12 +128,12 @@ update <- function() {
     latest[, sapply(latest, is.numeric)], 2
   )
 
-  out <- latest[latest[, "x"] >= x_h & latest[, "dx"] > 0, ]
-  out[, sapply(out, is.numeric)] <- format(
-    out[, sapply(out, is.numeric)], nsmall = 2
+  df <- latest[latest[, "x"] >= x_h & latest[, "dx"] > 0, ]
+  df[, sapply(df, is.numeric)] <- format(
+    df[, sapply(df, is.numeric)], nsmall = 2
   )
   cat(
-    capture.output(print(out, row.names = FALSE)) %>%
+    capture.output(print(df, row.names = FALSE)) %>%
       gsub("symbol     name", "symbol    name", .),
     file = "ranking.txt",
     sep = "\n"
@@ -145,7 +142,7 @@ update <- function() {
     paste0(
       format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
       " Ranked ", nrow(latest), " stocks;",
-      " wrote ", nrow(out), " to ranking.txt."
+      " wrote ", nrow(df), " to ranking.txt."
     ),
     quote = FALSE
   )
@@ -153,36 +150,32 @@ update <- function() {
   # Evaluate portfolio
   portfolio <- read.csv(
     "portfolio.csv",
-    colClasses = c(symbol = "character", buy = "Date", cost = "numeric")
+    colClasses = c(date = "Date", symbol = "character")
   )
 
   if (nrow(portfolio) != 0) {
     out <- data.frame()
     for (symbol in portfolio$symbol) {
-      buy <- portfolio[portfolio$symbol == symbol, "buy"]
-      cost <- portfolio[portfolio$symbol == symbol, "cost"]
-
+      df <- portfolio[portfolio$symbol == symbol, ]
       data <- data_list[[symbol]]
-      i <- which(data$date == buy)
-      j <- nrow(data)
-      r <- ror(cost, data[j, "close"])
 
+      i <- which(data$date == df$date)
+      j <- nrow(data)
+      r <- ror(df$cost, data[j, "close"])
       out <- rbind(
-        out,
-        list(
+        out, list(
+          df$date,
           symbol,
           latest[latest$symbol == symbol, "name"],
-          buy,
-          cost,
+          df$cost,
           r,
           ifelse(r >= r_h | r <= r_l | j - i >= t_max, "SELL", "HOLD")
         )
       )
-      colnames(out) <- c("symbol", "name", "buy", "cost", "r", "action")
-      out$buy <- as.Date(out$buy)
+      colnames(out) <- c("date", "symbol", "name", "cost", "r", "action")
+      out$date <- as.Date(out$date)
     }
-    out$cost <- format(round(out$cost, 3), nsmall = 3)
-    out$r <- format(round(out$r, 3), nsmall = 3)
+    out[, c("cost", "r")] <- format(round(out[, c("cost", "r")], 3), nsmall = 3)
     writeLines(c("", capture.output(print(out, row.names = FALSE))))
   }
 
