@@ -14,10 +14,10 @@ backtest <- function() {
   # Define parameters
   t_adx <- 20
   t_cci <- 25
-  x_h <- 0.53
-  r_h <- 0.1
+  x_h <- 0.5
+  r_h <- 0.09
   r_l <- -0.5
-  t_max <- 104
+  t_max <- 105
 
   cl <- makeCluster(detectCores() - 1)
   registerDoParallel(cl)

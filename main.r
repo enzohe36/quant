@@ -18,7 +18,7 @@ source("update.r", encoding = "UTF-8")
 
 # out0 <- update()
 
-# query()
+# query(plot = FALSE)
 
 # buy(000001, 12.345, 20241127)
 

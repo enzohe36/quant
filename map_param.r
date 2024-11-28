@@ -1,7 +1,8 @@
 source("preset.r", encoding = "UTF-8")
+library(gplots)
 
-v1_name <- "t_adx"
-v2_name <- "t_cci"
+v1_name <- "r_h"
+v2_name <- "r_l"
 
 # ------------------------------------------------------------------------------
 
@@ -11,10 +12,10 @@ param <- read.csv("param.csv")
 # Define parameters
 t_adx <- 20
 t_cci <- 25
-x_h <- 0.53
-r_h <- 0.1
+x_h <- 0.5
+r_h <- 0.09
 r_l <- -0.5
-t_max <- 104
+t_max <- 105
 
 v1 <- sort(unique(param[, v1_name]))
 v2 <- sort(unique(param[, v2_name]))

@@ -4,7 +4,6 @@ library(tidyverse)
 library(TTR)
 library(foreach)
 library(doParallel)
-library(gplots)
 
 options(warn = -1)
 
