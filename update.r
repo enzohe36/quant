@@ -13,8 +13,8 @@ update <- function() {
 
   # Define parameters
   t_adx <- 20
-  t_cci <- 25
-  x_h <- 0.5
+  t_cci <- 10
+  x_h <- 0.53
   r_h <- 0.09
   r_l <- -0.5
   t_max <- 105
@@ -61,6 +61,7 @@ update <- function() {
     adx <- 1 - tnormalize(abs(adx$adx - adx$adxr), t_adx)
     cci <- 1 - 2 * tnormalize(CCI(data[, 3:5]), t_cci)
     data$x <- adx * cci
+    data$x1 <- lag(data$x, 1)
     data$dx <- momentum(data$x, 5)
 
     lst <- list()
@@ -121,14 +122,17 @@ update <- function() {
       function(df) merge(df[nrow(df), ], fundflow, by = "symbol")
     )
   )
-  latest <- latest[, c(2, 1, 9, 7, 8, 10:13)]
+  latest <- cbind(
+    latest[, c("date", "symbol", "name")],
+    latest[, 7:ncol(latest)] %>% .[, sapply(., is.numeric)]
+  )
   latest$in_score <- apply(latest[, fundflow_dict$header], 1, sum)
   latest <- latest[order(latest$in_score, decreasing = TRUE), ]
   latest[, sapply(latest, is.numeric)] <- round(
     latest[, sapply(latest, is.numeric)], 2
   )
 
-  df <- latest[latest[, "x"] >= x_h & latest[, "dx"] > 0, ]
+  df <- latest[latest$x >= x_h & latest$x1 < x_h & latest$dx > 0, ]
   df[, sapply(df, is.numeric)] <- format(
     df[, sapply(df, is.numeric)], nsmall = 2
   )

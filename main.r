@@ -14,6 +14,12 @@ source("update.r", encoding = "UTF-8")
 
 # get_data("^(00|60)", "qfq")
 
+# out0 <- load_data("^(00|60)", "hfq", date(now() - years(5)), date(now()))
+
+# writeLines(out0[[1]], "symbol_list.txt")
+
+# file.copy("symbol_list.bak", "symbol_list.txt", overwrite = TRUE)
+
 # out0 <- load_data("^(00|60)", "qfq", date(now() - years(1)), date(now()))
 
 # out0 <- update()

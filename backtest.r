@@ -13,8 +13,8 @@ backtest <- function() {
 
   # Define parameters
   t_adx <- 20
-  t_cci <- 25
-  x_h <- 0.5
+  t_cci <- 10
+  x_h <- 0.53
   r_h <- 0.09
   r_l <- -0.5
   t_max <- 105
