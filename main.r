@@ -1,24 +1,18 @@
 source("preset.r", encoding = "UTF-8")
 
-source("backtest_min.r", encoding = "UTF-8")
-source("backtest.r", encoding = "UTF-8")
-source("buysell.r", encoding = "UTF-8")
 source("get_data.r", encoding = "UTF-8")
 source("load_data.r", encoding = "UTF-8")
-source("query.r", encoding = "UTF-8")
 source("update.r", encoding = "UTF-8")
+source("query.r", encoding = "UTF-8")
+source("buysell.r", encoding = "UTF-8")
+source("backtest.r", encoding = "UTF-8")
+source("sample_apy.r", encoding = "UTF-8")
 
 # python -m aktools
 
 # ------------------------------------------------------------------------------
 
 # get_data("^(00|60)", "qfq")
-
-# out0 <- load_data("^(00|60)", "hfq", date(now() - years(5)), date(now()))
-
-# writeLines(out0[[1]], "symbol_list.txt")
-
-# file.copy("symbol_list.bak", "symbol_list.txt", overwrite = TRUE)
 
 # out0 <- load_data("^(00|60)", "qfq", date(now() - years(1)), date(now()))
 
@@ -36,4 +30,6 @@ source("update.r", encoding = "UTF-8")
 
 # out0 <- load_data("^(00|60)", "hfq", date(now() - years(5)), date(now()))
 
-# trade_list <- backtest()
+# trade <- backtest(20, 10, 0.53, 0.09, -0.5, 105)
+
+# print(sample_apy(30))

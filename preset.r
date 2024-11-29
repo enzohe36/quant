@@ -54,7 +54,7 @@ adx_alt <- function(hlc, n = 14, m = 6) {
 }
 
 ror <- function(v1, v2) {
-  return((v2 - v1) / v1)
+  return((v2 - v1) / abs(v1))
 }
 
 # https://stackoverflow.com/a/19801108

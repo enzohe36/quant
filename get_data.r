@@ -16,7 +16,6 @@ get_data <- function(pattern, adjust) {
   )
   symbol_list <- symbol_list[, 1]
   writeLines(symbol_list, "symbol_list.txt")
-  writeLines(symbol_list, "symbol_list.bak")
   print(
     paste0(
       format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
