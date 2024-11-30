@@ -1,15 +1,9 @@
 update <- function() {
-  print(
-    paste0(
-      format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
-      " Started update()."
-    ),
-    quote = FALSE
-  )
+  tsprint("Started update().")
 
   # Define input
-  symbol_list <- out0[[1]]
-  data_list <- out0[[2]]
+  symbol_list <- out0[["symbol_list"]]
+  data_list <- out0[["data_list"]]
 
   # Define parameters
   t_adx <- 20
@@ -28,7 +22,7 @@ update <- function() {
       .encoding = "utf-8"
     )
   )
-  latest <- mutate(latest, date = date(now(tzone = "Asia/Shanghai")))
+  latest <- mutate(latest, date = today())
   latest <- latest[, c(24, 2, 10, 11, 4, 7)]
   colnames(latest) <- c("date", "symbol", "high", "low", "close", "volume")
   latest <- latest[latest$symbol %in% symbol_list, ]
@@ -53,7 +47,6 @@ update <- function() {
         data <- bind_rows(data, df)
       )
     }
-
     if (any(is.na(data[nrow(data), ]))) data <- data[-c(nrow(data)), ]
 
     # Calculate predictor
@@ -70,13 +63,7 @@ update <- function() {
   }
   unregister_dopar
 
-  print(
-    paste0(
-      format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
-      " Checked ", nrow(latest), " stocks for update."
-    ),
-    quote = FALSE
-  )
+  tsprint(glue("Checked {nrow(latest)} stocks for update."))
 
   fundflow_dict <- data.frame(
     indicator = c("今日", "3日", "5日", "10日"),
@@ -138,17 +125,13 @@ update <- function() {
   )
   cat(
     capture.output(print(df, row.names = FALSE)) %>%
-      gsub("symbol     name", "symbol    name", .),
+      gsub("     name", "    name", .) %>%
+      gsub("^ ", "", .),
     file = "ranking.txt",
     sep = "\n"
   )
-  print(
-    paste0(
-      format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
-      " Ranked ", nrow(latest), " stocks;",
-      " wrote ", nrow(df), " to ranking.txt."
-    ),
-    quote = FALSE
+  tsprint(
+    glue("Ranked {nrow(latest)} stocks; wrote {nrow(df)} to ranking.txt.")
   )
 
   # Evaluate portfolio
@@ -176,12 +159,27 @@ update <- function() {
           ifelse(r >= r_h | r <= r_l | j - i >= t_max, "SELL", "HOLD")
         )
       )
-      colnames(out) <- c("date", "symbol", "name", "cost", "r", "action")
-      out$date <- as.Date(out$date)
     }
+    colnames(out) <- c("date", "symbol", "name", "cost", "r", "action")
+    out$date <- as.character(as.Date(out$date))
     out[, c("cost", "r")] <- format(round(out[, c("cost", "r")], 3), nsmall = 3)
-    writeLines(c("", capture.output(print(out, row.names = FALSE))))
+    out <- arrange(out, desc(action), symbol)
+    rownames(out) <- seq_len(nrow(out))
+
+    which_sell <- which(out$action == "SELL")
+    if (length(which_sell) != 0) {
+      out <- rbind(
+        out[which_sell, ],
+        setNames(
+          data.frame(t(replicate(ncol(out), "")), row.names = ""), names(out)
+        ),
+        out[-which_sell, ]
+      )
+    }
+    print(out)
   }
 
-  return(list(symbol_list, data_list, latest))
+  return(
+    list(symbol_list = symbol_list, data_list = data_list, latest = latest)
+  )
 }

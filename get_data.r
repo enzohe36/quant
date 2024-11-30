@@ -1,11 +1,5 @@
 get_data <- function(pattern, adjust) {
-  print(
-    paste0(
-      format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
-      " Started get_data()."
-    ),
-    quote = FALSE
-  )
+  tsprint("Started get_data().")
 
   # [1]   code name
   symbol_list <- fromJSON(
@@ -16,23 +10,10 @@ get_data <- function(pattern, adjust) {
   )
   symbol_list <- symbol_list[, 1]
   writeLines(symbol_list, "symbol_list.txt")
-  print(
-    paste0(
-      format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
-      " Found ", length(symbol_list), " stocks;",
-      " wrote to symbol_list.txt."
-    ),
-    quote = FALSE
-  )
+  tsprint(glue("Found {length(symbol_list)} stocks; wrote to symbol_list.txt."))
 
   symbol_list <- symbol_list[grepl(pattern, symbol_list)]
-  print(
-    paste0(
-      format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
-      " Matched ", length(symbol_list), " stocks to ", pattern, "."
-    ),
-    quote = FALSE
-  )
+  tsprint(glue("Matched {length(symbol_list)} stocks to \"pattern\"."))
 
   dir.create(paste0("data_", adjust))
 
@@ -54,9 +35,7 @@ get_data <- function(pattern, adjust) {
           uri = "http://127.0.0.1:8080/api/public/stock_zh_a_hist",
           symbol = symbol,
           adjust = adjust,
-          start_date = format(
-            now(tzone = "Asia/Shanghai") - years(1), "%Y%m%d"
-          ),
+          start_date = format(today() - years(1), "%Y%m%d"),
           .encoding = "utf-8"
         )
       )
@@ -83,7 +62,7 @@ get_data <- function(pattern, adjust) {
           uri = "http://127.0.0.1:8080/api/public/stock_zh_a_hist",
           symbol = symbol,
           adjust = adjust,
-          end_date = format(now(tzone = "Asia/Shanghai") - days(1), "%Y%m%d"),
+          end_date = format(today() - days(1), "%Y%m%d"),
           .encoding = "utf-8"
         )
       )
@@ -103,7 +82,7 @@ get_data <- function(pattern, adjust) {
         symbol = symbol,
         adjust = adjust,
         start_date = format(data[nrow(data), "date"] + days(1), "%Y%m%d"),
-        end_date = format(now(tzone = "Asia/Shanghai") - days(1), "%Y%m%d"),
+        end_date = format(today() - days(1), "%Y%m%d"),
         .encoding = "utf-8"
       )
     )
@@ -127,11 +106,5 @@ get_data <- function(pattern, adjust) {
   }
   unregister_dopar
 
-  print(
-    paste0(
-      format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
-      " Updated ", sum(out), " local files."
-    ),
-    quote = FALSE
-  )
+  tsprint(glue("Updated {sum(out)} local files."))
 }

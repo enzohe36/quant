@@ -4,8 +4,10 @@ library(tidyverse)
 library(TTR)
 library(foreach)
 library(doParallel)
+library(glue)
 
 options(warn = -1)
+Sys.setenv(TZ = "Asia/Shanghai")
 
 # https://stackoverflow.com/a/25110203
 unregister_dopar <- function() {
@@ -58,9 +60,14 @@ ror <- function(v1, v2) {
 }
 
 # https://stackoverflow.com/a/19801108
-multiout <- function(lst, ...) {
+multiout <- function(lst1, ...) {
   lapply(
-    seq_along(lst),
-    function(i) c(lst[[i]], lapply(list(...), function(y) y[[i]]))
+    seq_along(lst1),
+    function(i) c(lst1[[i]], lapply(list(...), function(lst2) lst2[[i]]))
   )
+}
+
+tsprint <- function(v) {
+  v <- paste0("[", format(now(), "%H:%M:%S"), "] ", v)
+  writeLines(v)
 }

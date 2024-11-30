@@ -1,15 +1,9 @@
 backtest <- function(t_adx, t_cci, x_h, r_h, r_l, t_max, descriptive = TRUE) {
-  print(
-    paste0(
-      format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
-      " Started backtest()."
-    ),
-    quote = FALSE
-  )
+  tsprint("Started backtest().")
 
   # Define input
-  symbol_list <- out0[[1]]
-  data_list <- out0[[2]]
+  symbol_list <- out0[["symbol_list"]]
+  data_list <- out0[["data_list"]]
 
   cl <- makeCluster(detectCores() - 1)
   registerDoParallel(cl)
@@ -28,14 +22,13 @@ backtest <- function(t_adx, t_cci, x_h, r_h, r_l, t_max, descriptive = TRUE) {
     data$x <- adx * cci
     data$x1 <- lag(data$x, 1)
     data$dx <- momentum(data$x, 5)
-
     data <- na.omit(data)
 
     trade <- data.frame()
-    for (i in 1:(nrow(data) - 1)) {
+    for (i in seq_len(nrow(data) - 1)) {
       r <- NaN
       if (!(data[i, "x"] >= x_h & data[i, "x1"] < x_h & data[i, "dx"] > 0)) next
-      for (j in (i + 1):nrow(data)) {
+      for (j in seq_len(nrow(data))[-(1:i)]) {
         if (ror(data[i, "close"], data[j, "high"]) >= r_h) {
           r <- r_h
           break
@@ -61,36 +54,16 @@ backtest <- function(t_adx, t_cci, x_h, r_h, r_l, t_max, descriptive = TRUE) {
     trade <- trade[trade$r >= 0.9^trade$t - 1 & trade$r <= 1.1^trade$t - 1, ]
     trade$buy <- as.Date(trade$buy)
     trade$sell <- as.Date(trade$sell)
-
     trade <- na.omit(trade)
 
     return(trade)
   }
   unregister_dopar
 
-  if (!descriptive) return(trade)
+  if (descriptive) {
+    tsprint(glue("Backtested {length(unique(trade$symbol))} stocks."))
 
-  print(
-    paste0(
-      format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
-      " Backtested ", length(unique(trade$symbol)), " stocks."
-    ),
-    quote = FALSE
-  )
-
-  stats <- rbind(
-    data.frame(
-      r = quantile(trade$r),
-      t = quantile(trade$t),
-      t_cal = quantile(as.numeric(trade$sell - trade$buy))
-    ),
-    data.frame(
-      r = NaN,
-      t = NaN,
-      t_cal = NaN,
-      row.names = ""
-    ),
-    data.frame(
+    stats_mean <- data.frame(
       r = c(mean(trade$r), sd(trade$r)),
       t = c(mean(trade$t), sd(trade$t)),
       t_cal = c(
@@ -99,13 +72,27 @@ backtest <- function(t_adx, t_cci, x_h, r_h, r_l, t_max, descriptive = TRUE) {
       ),
       row.names = c("mean", "sd")
     )
-  )
-  stats$r <- format(round(stats$r, 3), nsmall = 3)
-  stats[, c("t", "t_cal")] <- round(stats[, c("t", "t_cal")])
-  stats["", ] <- ""
-  writeLines(c("", capture.output(stats)))
+    stats_quantile <- data.frame(
+      r = quantile(trade$r),
+      t = quantile(trade$t),
+      t_cal = quantile(as.numeric(trade$sell - trade$buy))
+    )
+    stats <- rbind(stats_quantile, stats_mean)
+    stats$r <- format(round(stats$r, 3), nsmall = 3)
+    stats[, c("t", "t_cal")] <- round(stats[, c("t", "t_cal")])
 
-  hist <- hist(trade$r, breaks = 100)
+    which_1st <- seq_len(nrow(stats_quantile))
+    stats <- rbind(
+      stats[which_1st, ],
+      setNames(
+        data.frame(t(replicate(ncol(stats), "")), row.names = ""), names(stats)
+      ),
+      stats[-which_1st, ]
+    )
+    print(stats)
+
+    hist <- hist(trade$r, breaks = 100)
+  }
 
   return(trade)
 }

@@ -4,7 +4,7 @@ buy <- function(symbol, cost = NaN, date = NA) {
   try(date <- ymd(date), silent = TRUE)
 
   # Define input
-  latest <- out0[[3]]
+  latest <- out0[["latest"]]
   portfolio <- read.csv(
     "portfolio.csv",
     colClasses = c(date = "Date", symbol = "character")
@@ -15,7 +15,7 @@ buy <- function(symbol, cost = NaN, date = NA) {
     portfolio <- rbind(
       portfolio,
       list(
-        ifelse(is.na(date), date(now(tzone = "Asia/Shanghai")), date),
+        ifelse(is.na(date), today(), date),
         symbol,
         latest[latest$symbol == symbol, "name"],
         cost
@@ -34,12 +34,13 @@ buy <- function(symbol, cost = NaN, date = NA) {
   portfolio <- portfolio[order(portfolio$symbol), ]
   portfolio$cost <- format(round(portfolio$cost, 3), nsmall = 3)
   write.csv(portfolio, "portfolio.csv", quote = FALSE, row.names = FALSE)
-  print(portfolio, row.names = FALSE)
+  rownames(portfolio) <- seq_len(nrow(portfolio))
+  print(portfolio)
 }
 
-sell <- function(symbol = read.csv("portfolio.csv")[, "symbol"]) {
+sell <- function(...) {
   # Format arguments
-  symbol <- formatC(as.integer(symbol), width = 6, format = "d", flag = "0")
+  symbol_list <- c(...)
 
   # Define input
   portfolio <- read.csv(
@@ -47,8 +48,17 @@ sell <- function(symbol = read.csv("portfolio.csv")[, "symbol"]) {
     colClasses = c(date = "Date", symbol = "character")
   )
 
-  portfolio <- portfolio[portfolio$symbol != symbol, ]
+  if(length(symbol_list) != 0) {
+    symbol_list <- formatC(
+      as.integer(symbol_list), width = 6, format = "d", flag = "0"
+    )
+  } else {
+    symbol_list <- portfolio[, "symbol"]
+  }
+
+  portfolio <- portfolio[!(portfolio$symbol %in% symbol_list), ]
   portfolio$cost <- format(round(portfolio$cost, 3), nsmall = 3)
   write.csv(portfolio, "portfolio.csv", quote = FALSE, row.names = FALSE)
-  print(portfolio, row.names = FALSE)
+  rownames(portfolio) <- seq_len(nrow(portfolio))
+  print(portfolio)
 }

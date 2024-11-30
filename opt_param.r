@@ -10,7 +10,7 @@ for (i in seq_along(arg_list)) {
   eval(parse(text = arg_list[i]))
 }
 
-out0 <- load_data("^(00|60)", "hfq", ymd(20190526), ymd(20240526))
+out0 <- load_data("^(00|60)", "hfq", 20190526, 20240526)
 
 for (var in var_seq) {
   assign(var_name, var)

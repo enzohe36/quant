@@ -14,22 +14,22 @@ source("sample_apy.r", encoding = "UTF-8")
 
 # get_data("^(00|60)", "qfq")
 
-# out0 <- load_data("^(00|60)", "qfq", date(now() - years(1)), date(now()))
+# out0 <- load_data("^(00|60)", "qfq")
 
 # out0 <- update()
 
 # query(plot = FALSE)
 
-# buy(000001, 12.345, 20241127)
+# buy(000001, 12.345, 20240527)
 
-# sell(000001)
+# sell()
 
 # ------------------------------------------------------------------------------
 
 # get_data("^(00|60)", "hfq")
 
-# out0 <- load_data("^(00|60)", "hfq", date(now() - years(5)), date(now()))
+# out0 <- load_data("^(00|60)", "hfq", today() - years(10), today())
 
-# trade <- backtest(20, 10, 0.53, 0.09, -0.5, 105)
+# out0[["trade"]] <- backtest(20, 10, 0.53, 0.09, -0.5, 105)
 
-# print(sample_apy(30))
+# out1 <- sample_apy(30, 1, 1000)

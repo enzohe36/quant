@@ -1,15 +1,9 @@
-load_data <- function(pattern, adjust, start_date, end_date) {
-  print(
-    paste0(
-      format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
-      " Started load_data()."
-    ),
-    quote = FALSE
-  )
+load_data <- function(pattern, adjust, start_date = NA, end_date = NA) {
+  tsprint("Started load_data().")
 
   # Format arguments
-  start_date <- as.Date(start_date)
-  end_date <- as.Date(end_date)
+  start_date <- ymd(start_date)
+  end_date <- ymd(end_date)
 
   # Define input
   symbol_list <- readLines("symbol_list.txt")
@@ -32,6 +26,8 @@ load_data <- function(pattern, adjust, start_date, end_date) {
       colClasses = c(date = "Date", symbol = "character")
     )
 
+    if (is.na(start_date)) start_date <- data[1, "date"]
+    if (is.na(end_date)) end_date <- data[nrow(data), "date"]
     data <- data[data$date >= start_date & data$date <= end_date, ]
     if (data[1, "date"] > start_date + days(2)) next
 
@@ -45,13 +41,7 @@ load_data <- function(pattern, adjust, start_date, end_date) {
   names(data_list) <- do.call(
     c, lapply(data_list, function(df) df[1, "symbol"])
   )
-  print(
-    paste0(
-      format(now(tzone = "Asia/Shanghai"), "%H:%M:%S"),
-      " Loaded ", length(data_list), " stocks from data_", adjust, "/."
-    ),
-    quote = FALSE
-  )
+  tsprint(glue("Loaded {length(data_list)} stocks from data_{adjust}/."))
 
-  return(list(symbol_list, data_list))
+  return(list(symbol_list = symbol_list, data_list = data_list))
 }
