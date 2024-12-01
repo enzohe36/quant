@@ -1,98 +1,96 @@
-backtest <- function(t_adx, t_cci, x_h, r_h, r_l, t_max, descriptive = TRUE) {
-  tsprint("Started backtest().")
+source("lib/preset.r", encoding = "UTF-8")
+source("lib/fn_get_data.r", encoding = "UTF-8")
+source("lib/fn_load_data.r", encoding = "UTF-8")
+source("lib/fn_backtest.r", encoding = "UTF-8")
+source("lib/fn_sample_apy.r", encoding = "UTF-8")
 
-  # Define input
-  symbol_list <- out0[["symbol_list"]]
-  data_list <- out0[["data_list"]]
+library(signal)
 
-  cl <- makeCluster(detectCores() - 1)
-  registerDoParallel(cl)
-  trade <- foreach(
-    symbol = symbol_list,
-    .combine = rbind,
-    .export = c("tnormalize", "adx_alt", "ror"),
-    .packages = c("TTR", "tidyverse")
-  ) %dopar% {
-    data <- data_list[[symbol]]
+# python -m aktools
 
-    # Calculate predictor
-    adx <- adx_alt(data[, 3:5])
-    adx <- 1 - tnormalize(abs(adx$adx - adx$adxr), t_adx)
-    cci <- 1 - 2 * tnormalize(CCI(data[, 3:5]), t_cci)
-    data$x <- adx * cci
-    data$x1 <- lag(data$x, 1)
-    data$dx <- momentum(data$x, 5)
-    data <- na.omit(data)
+trade_path <- "assets/trade10.csv"
+apy_path <- "assets/apy30.csv"
+csi300_path <- "assets/csi300.csv"
 
-    trade <- data.frame()
-    for (i in seq_len(nrow(data) - 1)) {
-      r <- NaN
-      if (!(data[i, "x"] >= x_h & data[i, "x1"] < x_h & data[i, "dx"] > 0)) next
-      for (j in seq_len(nrow(data))[-(1:i)]) {
-        if (ror(data[i, "close"], data[j, "high"]) >= r_h) {
-          r <- r_h
-          break
-        }
-        if (ror(data[i, "close"], data[j, "low"]) <= r_l) {
-          ifelse(
-            ror(data[i, "close"], data[j, "high"]) > r_l,
-            r <- r_l,
-            r <- ror(data[i, "close"], data[j, "close"])
-          )
-          break
-        }
-        if (j - i >= t_max) {
-          r <- ror(data[i, "close"], data[j, "close"])
-          break
-        }
-      }
-      trade <- rbind(
-        trade, list(symbol, data[i, "date"], data[j, "date"], r, j - i)
-      )
-    }
-    colnames(trade) <- c("symbol", "buy", "sell", "r", "t")
-    trade <- trade[trade$r >= 0.9^trade$t - 1 & trade$r <= 1.1^trade$t - 1, ]
-    trade$buy <- as.Date(trade$buy)
-    trade$sell <- as.Date(trade$sell)
-    trade <- na.omit(trade)
+# ------------------------------------------------------------------------------
 
-    return(trade)
-  }
-  unregister_dopar
+# get_data("^(00|60)", "hfq")
 
-  if (descriptive) {
-    tsprint(glue("Backtested {length(unique(trade$symbol))} stocks."))
+# out0 <- load_data("^(00|60)", "hfq", today() - years(10), today())
 
-    stats_mean <- data.frame(
-      r = c(mean(trade$r), sd(trade$r)),
-      t = c(mean(trade$t), sd(trade$t)),
-      t_cal = c(
-        mean(as.numeric(trade$sell - trade$buy)),
-        sd(as.numeric(trade$sell - trade$buy))
-      ),
-      row.names = c("mean", "sd")
-    )
-    stats_quantile <- data.frame(
-      r = quantile(trade$r),
-      t = quantile(trade$t),
-      t_cal = quantile(as.numeric(trade$sell - trade$buy))
-    )
-    stats <- rbind(stats_quantile, stats_mean)
-    stats$r <- format(round(stats$r, 3), nsmall = 3)
-    stats[, c("t", "t_cal")] <- round(stats[, c("t", "t_cal")])
+# out0[["trade"]] <- backtest(20, 10, 0.53, 0.09, -0.5, 105)
 
-    which_1st <- seq_len(nrow(stats_quantile))
-    stats <- rbind(
-      stats[which_1st, ],
-      setNames(
-        data.frame(t(replicate(ncol(stats), "")), row.names = ""), names(stats)
-      ),
-      stats[-which_1st, ]
-    )
-    print(stats)
+# write.csv(out0[["trade"]], trade_path, quote = FALSE, row.names = FALSE)
 
-    hist <- hist(trade$r, breaks = 100)
-  }
-
-  return(trade)
+out0 <- list()
+out0[["trade"]] <- read.csv(
+  trade_path,
+  colClasses = c(symbol = "character", buy = "Date", sell = "Date")
+)
+out0[["apy"]] <- sample_apy(30, 1, 1000)
+if (!file.exists(apy_path)) {
+  write.csv(out0[["apy"]], apy_path, quote = FALSE, row.names = FALSE)
+} else {
+  write.table(
+    out0[["apy"]],
+    apy_path, append = TRUE,
+    sep = ",",
+    row.names = FALSE, col.names = FALSE
+  )
 }
+
+hist(out0[["apy"]][, "date"], breaks = 120)
+
+apy <- read.csv(apy_path, colClasses = c(date = "Date"))
+apy <- apy[order(apy$date), ]
+
+## [1]   date open close high low volume amount symbol
+#csi300 <- fromJSON(
+#  getForm(
+#    uri = "http://127.0.0.1:8080/api/public/stock_zh_index_daily_em",
+#    symbol = "sh000300",
+#    .encoding = "utf-8"
+#  )
+#)
+#csi300 <- csi300[
+#  csi300$date >= min(apy$date) & csi300$date <= max(apy$date), c(1, 3)
+#]
+#colnames(csi300) <- c("date", "csi300")
+#csi300$date <- as.Date(csi300$date)
+#write.csv(csi300, csi300_path, quote = FALSE, row.names = FALSE)
+
+csi300 <- read.csv(csi300_path, colClasses = c(date = "Date"))
+
+apy_mean <- split(apy, f = apy$date) %>% sapply(function(df) mean(df$apy))
+csi300_n <- normalize(csi300$csi300) * (max(apy_mean) - min(apy_mean)) +
+  min(apy_mean)
+plot(csi300$date, sgolayfilt(csi300_n), type = "l")
+lines(unique(apy$date), sgolayfilt(apy_mean), col = "red")
+
+opt_lm <- function(t) {
+  csi300$csi300_tn <- tnormalize(csi300$csi300, t)
+  df <- reduce(list(apy, csi300), full_join, by = "date")
+  fit <- lm(df$apy ~ df$csi300_tn)
+
+  return(fit$coefficients[2])
+}
+opt <- optimize(opt_lm, c(1, 250), tol = 0.01)
+print(opt)
+
+csi300$csi300_tn <- tnormalize(csi300$csi300, round(opt$minimum))
+df <- reduce(list(apy, csi300), full_join, by = "date") %>% na.omit
+plot(df$csi300_tn, df$apy, pch = "•", cex = 0.6)
+
+fit <- lm(apy ~ csi300_tn, df)
+print(summary(fit))
+
+ci_x <- seq(-0.1, 1.1, 0.01)
+ci <- predict(
+  fit,
+  newdata = data.frame(csi300_tn = ci_x),
+  interval = "prediction",
+  level = 0.95
+)
+abline(fit, col="red")
+lines(ci_x, ci[, 2], col = "blue", lty = 2)
+lines(ci_x, ci[, 3], col = "blue", lty = 2)

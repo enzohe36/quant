@@ -1,14 +1,10 @@
-source("preset.r", encoding = "UTF-8")
+source("lib/preset.r", encoding = "UTF-8")
+
 library(gplots)
 
-
-v1_name <- "t_adx"
-v2_name <- "t_cci"
+param_path <- "assets/param.csv"
 
 # ------------------------------------------------------------------------------
-
-# Define input
-param <- read.csv("param.csv")
 
 # Define parameters
 t_adx <- 20 # 20; seq 5 5 30
@@ -18,6 +14,10 @@ r_h <- 0.1 # 0.09; seq 0.05 0.05 0.3
 r_l <- -0.5 # -0.5; seq -0.7 0.05 -0.3
 t_max <- 105 # 105; seq 100 5 120
 
+v1_name <- "t_adx"
+v2_name <- "t_cci"
+
+param <- read.csv(param_path)
 v1 <- sort(unique(param[, v1_name]))
 v2 <- sort(unique(param[, v2_name]))
 
@@ -26,7 +26,6 @@ m_mean <- matrix(
   ncol = length(v1),
   dimnames = list(v2, v1)
 )
-
 m_icv <- m_mean
 
 get_row <- function(t_adx, t_cci, x_h, r_h, r_l, t_max) {
@@ -51,7 +50,6 @@ for (i in v1) for (j in v2) {
   m_mean[as.character(j), as.character(i)] <- ifelse(
     length(get_value("mean")) != 0, get_value("mean"), NA
   )
-
   m_icv[as.character(j), as.character(i)] <- ifelse(
     length(get_value("mean")) != 0, get_value("mean") / get_value("sd"), NA
   )
