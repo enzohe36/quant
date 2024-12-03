@@ -12,15 +12,17 @@ for (i in seq_along(arg_list)) {
   eval(parse(text = arg_list[i]))
 }
 
-out0 <- load_data("^(00|60)", "hfq", 20191129, 20241129)
+out0 <- load_data("^(00|60)", "hfq", 20190628, 20240628)
 
-for (var in var_seq) {
-  assign(var_name, var)
-  trade <- backtest(t_adx, t_cci, x_h, r_h, r_l, t_max, descriptive = FALSE)
+for (var1 in var_seq1) for (var2 in var_seq2) {
+  assign(var_name1, var1)
+  assign(var_name2, var2)
+
+  trade <- backtest(t_adx, t_cci, x_thr, t_max, r_max, r_min, descr = FALSE)
   if (!file.exists(param_path)) {
     write.csv(
       data.frame(
-        t_adx, t_cci, x_h, r_h, r_l, t_max,
+        t_adx, t_cci, x_thr, t_max, r_max, r_min,
         mean = mean(trade$r), sd = sd(trade$r)
       ),
       param_path,
@@ -30,7 +32,7 @@ for (var in var_seq) {
   } else {
     write.table(
       data.frame(
-        t_adx, t_cci, x_h, r_h, r_l, t_max,
+        t_adx, t_cci, x_thr, t_max, r_max, r_min,
         mean = mean(trade$r), sd = sd(trade$r)
       ),
       param_path, append = TRUE,
@@ -39,5 +41,6 @@ for (var in var_seq) {
       row.names = FALSE, col.names = FALSE
     )
   }
+
   gc()
 }

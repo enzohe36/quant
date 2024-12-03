@@ -10,7 +10,7 @@ library(signal)
 # python -m aktools
 
 trade_path <- "assets/trade10.csv"
-apy_path <- "assets/apy30.csv"
+apy_path <- "assets/apy10.csv"
 csi300_path <- "assets/csi300.csv"
 
 # ------------------------------------------------------------------------------
@@ -19,7 +19,7 @@ csi300_path <- "assets/csi300.csv"
 
 # out0 <- load_data("^(00|60)", "hfq", today() - years(10), today())
 
-# out0[["trade"]] <- backtest(20, 10, 0.53, 0.09, -0.5, 105)
+# out0[["trade"]] <- backtest(15, 30, 0.53, 0.09, -0.5, 105)
 
 # write.csv(out0[["trade"]], trade_path, quote = FALSE, row.names = FALSE)
 
@@ -28,7 +28,7 @@ out0[["trade"]] <- read.csv(
   trade_path,
   colClasses = c(symbol = "character", buy = "Date", sell = "Date")
 )
-out0[["apy"]] <- sample_apy(30, 1, 1000)
+out0[["apy"]] <- sample_apy(10, 1, 1000)
 if (!file.exists(apy_path)) {
   write.csv(out0[["apy"]], apy_path, quote = FALSE, row.names = FALSE)
 } else {
@@ -40,10 +40,9 @@ if (!file.exists(apy_path)) {
   )
 }
 
-hist(out0[["apy"]][, "date"], breaks = 120)
+hist(out0[["apy"]][, "date"], breaks = 40)
 
-apy <- read.csv(apy_path, colClasses = c(date = "Date"))
-apy <- apy[order(apy$date), ]
+apy <- read.csv(apy_path, colClasses = c(date = "Date")) %>% .[order(.$date), ]
 
 # [1]   date open close high low volume amount symbol
 csi300 <- fromJSON(

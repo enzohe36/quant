@@ -2,20 +2,20 @@ source("lib/preset.r", encoding = "UTF-8")
 
 library(gplots)
 
-param_path <- "assets/param.csv"
+param_path <- "assets/param_20241127.csv"
 
 # ------------------------------------------------------------------------------
 
 # Define parameters
-t_adx <- 20 # 20; seq 5 5 30
-t_cci <- 25 # 10; seq 5 5 40
-x_h <- 0.5 # 0.53; seq 0.2 0.05 0.6
-r_h <- 0.1 # 0.09; seq 0.05 0.05 0.3
-r_l <- -0.5 # -0.5; seq -0.7 0.05 -0.3
-t_max <- 105 # 105; seq 100 5 120
+t_adx <- 20 # 15; 5 to 25
+t_cci <- 25 # 30; 10 to 30
+x_thr <- 0.5 # 0.53; 0.4 to 0.6
+t_max <- 105 # 105; 100 to 120
+r_max <- 0.09 # 0.09
+r_min <- -0.5 # -0.5
 
-v1_name <- "t_adx"
-v2_name <- "t_cci"
+v1_name <- "r_max"
+v2_name <- "r_min"
 
 param <- read.csv(param_path)
 v1 <- sort(unique(param[, v1_name]))
@@ -28,14 +28,14 @@ m_mean <- matrix(
 )
 m_icv <- m_mean
 
-get_row <- function(t_adx, t_cci, x_h, r_h, r_l, t_max) {
+get_row <- function(t_adx, t_cci, x_thr, t_max, r_max, r_min) {
   param[
     param$t_adx == t_adx &
       param$t_cci == t_cci &
-      param$x_h == x_h &
-      param$r_h == r_h &
-      param$r_l == r_l &
-      param$t_max == t_max,
+      param$x_thr == x_thr &
+      param$t_max == t_max &
+      param$r_max == r_max &
+      param$r_min == r_min,
   ]
 }
 
@@ -44,7 +44,7 @@ for (i in v1) for (j in v2) {
   assign(v2_name, j)
 
   get_value <- function(col_name) {
-    get_row(t_adx, t_cci, x_h, r_h, r_l, t_max)[, col_name]
+    get_row(t_adx, t_cci, x_thr, t_max, r_max, r_min)[, col_name]
   }
 
   m_mean[as.character(j), as.character(i)] <- ifelse(

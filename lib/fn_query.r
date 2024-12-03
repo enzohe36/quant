@@ -25,8 +25,7 @@ query <- function(
 
   if (plot) {
     for (symbol in df$symbol) {
-      data <- data_list[[symbol]]
-      data <- data[data$date > today() - months(6), ]
+      data <- data_list[[symbol]] %>% .[.$date > today() - months(6), ]
       plot(
         data$date, 2 * normalize(data$close) - 1,
         type = "l",

@@ -13,7 +13,7 @@ source("lib/fn_sell.r", encoding = "UTF-8")
 
 # get_data("^(00|60)", "qfq")
 
-# out0 <- load_data("^(00|60)", "qfq")
+out0 <- load_data("^(00|60)", "qfq")
 
 out0 <- update()
 

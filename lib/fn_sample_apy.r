@@ -7,15 +7,15 @@ sample_apy <- function(
   cl <- makeCluster(detectCores() - 1)
   registerDoParallel(cl)
   out <- foreach(
-    i = 1:n_sample,
+    i = seq_len(n_sample),
     .combine = multiout,
     .multicombine = TRUE,
     .init = list(list(), list()),
     .packages = "tidyverse"
   ) %dopar% {
-    trade <- trade[sample(seq_len(nrow(trade))), ]
-    trade <- trade[order(trade$buy), ]
+    rm("date", "j", "portfolio", "r", "trade_tr")
 
+    trade <- trade[sample(seq_len(nrow(trade))), ] %>% .[order(.$buy), ]
     date <- unique(trade$buy) %>%
       .[. <= .[length(.)] - years(t)] %>%
       sample(., 1)
@@ -38,12 +38,13 @@ sample_apy <- function(
   unregister_dopar
 
   tsprint(
-    glue("Calculated {n_sample} samples of a {n_portfolio}-stock portfolio over {t} year(s).")
+    glue(
+      "Sampled a {n_portfolio}-stock portfolio over {t} year(s) {n_sample} times."
+    )
   )
 
-  df <- data.frame(date = as.Date(unlist(out[[1]])), apy = unlist(out[[2]]))
-  df <- na.omit(df)
-  df <- df[order(df$date), ]
-
+  df <- data.frame(date = as.Date(unlist(out[[1]])), apy = unlist(out[[2]])) %>%
+    na.omit %>%
+    .[order(.$date), ]
   return(df)
 }

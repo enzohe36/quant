@@ -26,86 +26,54 @@ get_data <- function(
 
   cl <- makeCluster(detectCores() - 1)
   registerDoParallel(cl)
-  out <- foreach(
+  count <- foreach(
     symbol = symbol_list,
     .combine = "c",
-    .export = "data_dir",
+    .export = c("data_dir", "em_data"),
     .packages = c("jsonlite", "RCurl", "tidyverse")
   ) %dopar% {
+    rm("data", "data_old", "data_path", "end_date", "i", "start_date")
+
     data_path <- eval(data_path_expr)
-
-    if (adjust == "qfq") {
-      # [1]   日期 股票代码 开盘 收盘 最高 最低 成交量 成交额 振幅 涨跌幅
-      # [11]  涨跌额 换手率
-      data <- fromJSON(
-        getForm(
-          uri = "http://127.0.0.1:8080/api/public/stock_zh_a_hist",
-          symbol = symbol,
-          adjust = adjust,
-          start_date = format(today() - years(1), "%Y%m%d"),
-          .encoding = "utf-8"
-        )
-      )
-      data <- data[, c(1, 2, 5, 6, 4, 7)]
-      colnames(data) <- c("date", "symbol", "high", "low", "close", "volume")
-      data$date <- as.Date(data$date)
-      write.csv(data, data_path, quote = FALSE, row.names = FALSE)
-      return(1)
-    }
-
-    error <- try(
-      data <- read.csv(
+    if(file.exists(data_path)) {
+      data_old <- read.csv(
         data_path, colClasses = c(date = "Date", symbol = "character")
-      ),
-      silent = TRUE
-    )
-    if (class(error) == "try-error") {
-      # [1]   日期 股票代码 开盘 收盘 最高 最低 成交量 成交额 振幅 涨跌幅
-      # [11]  涨跌额 换手率
-      data <- fromJSON(
-        getForm(
-          uri = "http://127.0.0.1:8080/api/public/stock_zh_a_hist",
-          symbol = symbol,
-          adjust = adjust,
-          end_date = format(today() - days(1), "%Y%m%d"),
-          .encoding = "utf-8"
+      )
+    }
+
+    for (i in 1:2) {
+      end_date <- format(today() - days(1), "%Y%m%d")
+      if (exists("data_old")) {
+        start_date <- format(data_old[nrow(data_old), "date"], "%Y%m%d")
+        data <- em_data(symbol, adjust, start_date, end_date)
+        if (all(data[1, ] == data_old[nrow(data_old), ])) {
+          data <- data[-1, ]
+          write.table(
+            data,
+            data_path, append = TRUE,
+            quote = FALSE,
+            sep = ",",
+            row.names = FALSE, col.names = FALSE
+          )
+          break
+        } else {
+          rm("data_old")
+        }
+      } else {
+        ifelse (
+          adjust == "qfq",
+          start_date <- format(today() - years(1), "%Y%m%d"),
+          start_date <- ""
         )
-      )
-      data <- data[, c(1, 2, 5, 6, 4, 7)]
-      colnames(data) <- c("date", "symbol", "high", "low", "close", "volume")
-      data$date <- as.Date(data$date)
-      write.csv(data, data_path, quote = FALSE, row.names = FALSE)
-      return(1)
+        data <- em_data(symbol, adjust, start_date, end_date)
+        write.csv(data, data_path, quote = FALSE, row.names = FALSE)
+        break
+      }
     }
 
-    # [1]   日期 股票代码 开盘 收盘 最高 最低 成交量 成交额 振幅 涨跌幅
-    # [11]  涨跌额 换手率
-    latest <- fromJSON(
-      getForm(
-        uri = "http://127.0.0.1:8080/api/public/stock_zh_a_hist",
-        symbol = symbol,
-        adjust = adjust,
-        start_date = format(data[nrow(data), "date"] + days(1), "%Y%m%d"),
-        end_date = format(today() - days(1), "%Y%m%d"),
-        .encoding = "utf-8"
-      )
-    )
-    if (length(latest) != 0) {
-      latest <- latest[, c(1, 2, 5, 6, 4, 7)]
-      latest[, 1] <- as.Date(latest[, 1])
-      write.table(
-        latest,
-        data_path, append = TRUE,
-        quote = FALSE,
-        sep = ",",
-        row.names = FALSE, col.names = FALSE
-      )
-      return(1)
-    }
-
-    return(0)
+    ifelse(nrow(data) != 0, return(1), return(0))
   }
   unregister_dopar
 
-  tsprint(glue("Updated {sum(out)} local files."))
+  tsprint(glue("Updated {sum(count)} local files."))
 }
