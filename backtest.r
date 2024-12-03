@@ -1,4 +1,5 @@
 source("lib/preset.r", encoding = "UTF-8")
+
 source("lib/fn_get_data.r", encoding = "UTF-8")
 source("lib/fn_load_data.r", encoding = "UTF-8")
 source("lib/fn_backtest.r", encoding = "UTF-8")
@@ -44,22 +45,20 @@ hist(out0[["apy"]][, "date"], breaks = 120)
 apy <- read.csv(apy_path, colClasses = c(date = "Date"))
 apy <- apy[order(apy$date), ]
 
-## [1]   date open close high low volume amount symbol
-#csi300 <- fromJSON(
-#  getForm(
-#    uri = "http://127.0.0.1:8080/api/public/stock_zh_index_daily_em",
-#    symbol = "sh000300",
-#    .encoding = "utf-8"
-#  )
-#)
-#csi300 <- csi300[
-#  csi300$date >= min(apy$date) & csi300$date <= max(apy$date), c(1, 3)
-#]
-#colnames(csi300) <- c("date", "csi300")
-#csi300$date <- as.Date(csi300$date)
-#write.csv(csi300, csi300_path, quote = FALSE, row.names = FALSE)
+# [1]   date open close high low volume amount symbol
+csi300 <- fromJSON(
+  getForm(
+    uri = "http://127.0.0.1:8080/api/public/stock_zh_index_daily_em",
+    symbol = "sh000300",
+    .encoding = "utf-8"
+  )
+)
+csi300 <- csi300[, c(1, 3)]
+colnames(csi300) <- c("date", "csi300")
+csi300$date <- as.Date(csi300$date)
+write.csv(csi300, csi300_path, quote = FALSE, row.names = FALSE)
 
-csi300 <- read.csv(csi300_path, colClasses = c(date = "Date"))
+csi300 <- csi300[csi300$date >= min(apy$date) & csi300$date <= max(apy$date), ]
 
 apy_mean <- split(apy, f = apy$date) %>% sapply(function(df) mean(df$apy))
 csi300_n <- normalize(csi300$csi300) * (max(apy_mean) - min(apy_mean)) +
@@ -79,7 +78,7 @@ print(opt)
 
 csi300$csi300_tn <- tnormalize(csi300$csi300, round(opt$minimum))
 df <- reduce(list(apy, csi300), full_join, by = "date") %>% na.omit
-plot(df$csi300_tn, df$apy, pch = "•", cex = 0.6)
+plot(df$csi300_tn, df$apy, pch = 20, cex = 0.5)
 
 fit <- lm(apy ~ csi300_tn, df)
 print(summary(fit))

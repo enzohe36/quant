@@ -6,8 +6,10 @@ library(foreach)
 library(doParallel)
 library(glue)
 
-options(warn = -1)
 Sys.setenv(TZ = "Asia/Shanghai")
+Sys.setlocale(locale = "Chinese")
+
+options(warn = -1)
 
 # https://stackoverflow.com/a/25110203
 unregister_dopar <- function() {
