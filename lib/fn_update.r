@@ -72,7 +72,7 @@ update <- function(
 
   fundflow <- reduce(fundflow, full_join, by = "symbol")
   fundflow[, fundflow_dict$header] <- fundflow[, fundflow_dict$header] / 100
-  tsprint(glue("Downloaded fundflow of {nrow(fundflow)} stocks."))
+  tsprint(glue("Found fundflow of {nrow(fundflow)} stocks."))
 
   latest <- bind_rows(
     lapply(
@@ -127,6 +127,9 @@ update <- function(
     data <- data_list[[symbol]]
 
     i <- which(data$date == df$date)
+    if (length(i) == 0) {
+      stop(glue("Buy date of {symbol} does not exist"))
+    }
     j <- nrow(data)
     r <- ror(df$cost, data[j, "close"])
     out <- rbind(

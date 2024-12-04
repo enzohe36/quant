@@ -42,7 +42,7 @@ get_data <- function(
     }
 
     for (i in 1:2) {
-      end_date <- format(today() - days(1), "%Y%m%d")
+      end_date <- format(today(), "%Y%m%d")
       if (exists("data_old")) {
         start_date <- format(data_old[nrow(data_old), "date"], "%Y%m%d")
         data <- em_data(symbol, adjust, start_date, end_date)
