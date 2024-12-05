@@ -1,3 +1,5 @@
+options(warn = -1)
+
 library(jsonlite)
 library(RCurl)
 library(tidyverse)
@@ -8,8 +10,6 @@ library(glue)
 
 Sys.setenv(TZ = "Asia/Shanghai")
 Sys.setlocale(locale = "Chinese")
-
-options(warn = -1)
 
 # https://stackoverflow.com/a/25110203
 unregister_dopar <- function() {
@@ -74,6 +74,14 @@ tsprint <- function(v) {
   writeLines(v)
 }
 
+bizday <- function(date = NA) {
+  date <- ymd(date)
+  if (is.na(date)) date <- as_date(now() - hours(16))
+  if (wday(date) == 1) date <- date - days(2)
+  if (wday(date) == 7) date <- date - days(1)
+  return(date)
+}
+
 em_data <- function(symbol, adjust, start_date, end_date) {
   data <- fromJSON(
     getForm(
@@ -102,7 +110,7 @@ em_data_update <- function() {
       .encoding = "utf-8"
     )
   )
-  df <- mutate(df, date = today())
+  df <- mutate(df, date = bizday())
   # [1]   序号 代码 名称 最新价 涨跌幅 涨跌额 成交量 成交额 振幅 最高
   # [11]  最低 今开 昨收 量比 换手率 市盈率-动态 市净率 总市值 流通市值 涨速
   # [21]  5分钟涨跌 60日涨跌幅 年初至今涨跌幅 date
@@ -152,5 +160,25 @@ predictor <- function(data) {
     data$x1 <- data$x
     data$dx <- data$x
   }
+  return(data)
+}
+
+em_index <- function(symbol) {
+  data <- fromJSON(
+    getForm(
+      uri = "http://127.0.0.1:8080/api/public/stock_zh_index_daily_em",
+      symbol = ifelse(
+        grepl("^399", symbol), paste0("sz", symbol), paste0("sh", symbol)
+      ),
+      .encoding = "utf-8"
+    )
+  )
+  data <- mutate(data, symbol = symbol)
+  # [1]   date open close high low volume amount symbol
+  data <- data[, c(1, 8, 2, 4, 5, 3, 6)]
+  colnames(data) <- c(
+    "date", "symbol", "open", "high", "low", "close", "volume"
+  )
+  data$date <- as.Date(data$date)
   return(data)
 }

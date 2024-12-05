@@ -7,15 +7,15 @@ param_path <- "assets/param_20241127.csv"
 # ------------------------------------------------------------------------------
 
 # Define parameters
-t_adx <- 20 # 15; 5 to 25
-t_cci <- 25 # 30; 10 to 30
+t_adx <- 25 # 15; 5 to 40
+t_cci <- 40 # 30; 10 to 50
 x_thr <- 0.5 # 0.53; 0.4 to 0.6
 t_max <- 105 # 105; 100 to 120
-r_max <- 0.09 # 0.09
+r_max <- 0.1 # 0.09
 r_min <- -0.5 # -0.5
 
-v1_name <- "r_max"
-v2_name <- "r_min"
+v1_name <- "t_adx"
+v2_name <- "t_cci"
 
 param <- read.csv(param_path)
 v1 <- sort(unique(param[, v1_name]))
@@ -55,17 +55,13 @@ for (i in v1) for (j in v2) {
   )
 }
 
-logit <- function(v) log(v / (1 - v))
-m <- logit(normalize(m_mean)) + logit(normalize(m_icv))
-m[is.infinite(m)] <- NA
-
 heatmap.2(
-  m,
+  normalize(m_mean) + normalize(m_icv),
   Rowv = FALSE, Colv = FALSE,
   dendrogram = "none",
   col = bluered(10),
   na.color = "grey",
   trace = "none",
-  main = "logit(norm(mean)) + logit(norm(1 / CV))",
+  main = "normalize(m_mean) + normalize(m_icv)",
   xlab = v1_name, ylab = v2_name
 )

@@ -3,7 +3,7 @@ source("lib/preset.r", encoding = "UTF-8")
 source("lib/fn_load_data.r", encoding = "UTF-8")
 source("lib/fn_backtest.r", encoding = "UTF-8")
 
-param_path <- "assets/param.csv"
+param_path <- "assets/param_20241203.csv"
 
 # ------------------------------------------------------------------------------
 

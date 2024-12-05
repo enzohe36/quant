@@ -18,7 +18,7 @@ buy <- function(
     portfolio <- rbind(
       portfolio,
       list(
-        ifelse(is.na(date), today(), date),
+        ifelse(is.na(date), bizday(), date),
         symbol,
         latest[latest$symbol == symbol, "name"],
         cost

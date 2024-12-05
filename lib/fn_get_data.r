@@ -1,6 +1,6 @@
 get_data <- function(
   pattern, adjust,
-  symbol_list_path = "assets/symbol_list.txt",
+  symbol_list_path = "assets/symbol_list.csv",
   data_dir = paste0("data_", adjust, "/"),
   data_path_expr = expression(paste0(data_dir, symbol, ".csv"))
 ) {
@@ -29,7 +29,7 @@ get_data <- function(
   count <- foreach(
     symbol = symbol_list,
     .combine = "c",
-    .export = c("data_dir", "em_data"),
+    .export = c("data_dir", "em_data", "bizday"),
     .packages = c("jsonlite", "RCurl", "tidyverse")
   ) %dopar% {
     rm("data", "data_old", "data_path", "end_date", "i", "start_date")
@@ -42,7 +42,7 @@ get_data <- function(
     }
 
     for (i in 1:2) {
-      end_date <- format(today(), "%Y%m%d")
+      end_date <- format(bizday(), "%Y%m%d")
       if (exists("data_old")) {
         start_date <- format(data_old[nrow(data_old), "date"], "%Y%m%d")
         data <- em_data(symbol, adjust, start_date, end_date)
@@ -62,7 +62,7 @@ get_data <- function(
       } else {
         ifelse (
           adjust == "qfq",
-          start_date <- format(today() - years(1), "%Y%m%d"),
+          start_date <- format(bizday() - years(1), "%Y%m%d"),
           start_date <- ""
         )
         data <- em_data(symbol, adjust, start_date, end_date)

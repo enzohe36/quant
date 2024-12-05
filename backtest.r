@@ -1,3 +1,5 @@
+# python -m aktools
+
 source("lib/preset.r", encoding = "UTF-8")
 
 source("lib/fn_get_data.r", encoding = "UTF-8")
@@ -7,20 +9,26 @@ source("lib/fn_sample_apy.r", encoding = "UTF-8")
 
 library(signal)
 
-# python -m aktools
-
-trade_path <- "assets/trade10.csv"
-apy_path <- "assets/apy10.csv"
-csi300_path <- "assets/csi300.csv"
+trade_path <- "tmp/trade.csv"
+apy_path <- "tmp/apy.csv"
+index_path <- "tmp/index.csv"
 
 # ------------------------------------------------------------------------------
 
+# Define parameters
+t_adx <- 15
+t_cci <- 30
+x_thr <- 0.53
+t_max <- 105
+r_max <- 0.09
+r_min <- -0.5
+
 # get_data("^(00|60)", "hfq")
 
-# out0 <- load_data("^(00|60)", "hfq", today() - years(10), today())
+# dir.create("tmp")
 
-# out0[["trade"]] <- backtest(15, 30, 0.53, 0.09, -0.5, 105)
-
+# out0 <- load_data("^(00|60)", "hfq", 20141129, 20241129)
+# out0[["trade"]] <- backtest(t_adx, t_cci, x_thr, t_max, r_max, r_min)
 # write.csv(out0[["trade"]], trade_path, quote = FALSE, row.names = FALSE)
 
 out0 <- list()
@@ -28,67 +36,42 @@ out0[["trade"]] <- read.csv(
   trade_path,
   colClasses = c(symbol = "character", buy = "Date", sell = "Date")
 )
-out0[["apy"]] <- sample_apy(10, 1, 1000)
-if (!file.exists(apy_path)) {
-  write.csv(out0[["apy"]], apy_path, quote = FALSE, row.names = FALSE)
-} else {
-  write.table(
-    out0[["apy"]],
-    apy_path, append = TRUE,
-    sep = ",",
-    row.names = FALSE, col.names = FALSE
-  )
-}
+apy <- sample_apy(30, 1, 10000)
+write.csv(apy, apy_path, quote = FALSE, row.names = FALSE)
 
-hist(out0[["apy"]][, "date"], breaks = 40)
+hist(apy$date, breaks = 100)
 
-apy <- read.csv(apy_path, colClasses = c(date = "Date")) %>% .[order(.$date), ]
-
-# [1]   date open close high low volume amount symbol
-csi300 <- fromJSON(
-  getForm(
-    uri = "http://127.0.0.1:8080/api/public/stock_zh_index_daily_em",
-    symbol = "sh000300",
-    .encoding = "utf-8"
-  )
-)
-csi300 <- csi300[, c(1, 3)]
-colnames(csi300) <- c("date", "csi300")
-csi300$date <- as.Date(csi300$date)
-write.csv(csi300, csi300_path, quote = FALSE, row.names = FALSE)
-
-csi300 <- csi300[csi300$date >= min(apy$date) & csi300$date <= max(apy$date), ]
+index <- em_index("000300")
+index <- index[
+  index$date >= min(apy$date) & index$date <= max(apy$date), c("date", "close")
+]
+write.csv(index, index_path, quote = FALSE, row.names = FALSE)
 
 apy_mean <- split(apy, f = apy$date) %>% sapply(function(df) mean(df$apy))
-csi300_n <- normalize(csi300$csi300) * (max(apy_mean) - min(apy_mean)) +
+index_n <- normalize(index$close) * (max(apy_mean) - min(apy_mean)) +
   min(apy_mean)
-plot(csi300$date, sgolayfilt(csi300_n), type = "l")
+plot(index$date, sgolayfilt(index_n), type = "l")
 lines(unique(apy$date), sgolayfilt(apy_mean), col = "red")
 
 opt_lm <- function(t) {
-  csi300$csi300_tn <- tnormalize(csi300$csi300, t)
-  df <- reduce(list(apy, csi300), full_join, by = "date")
-  fit <- lm(df$apy ~ df$csi300_tn)
+  index$close_tn <- tnormalize(index$close, t)
+  df <- reduce(list(apy, index), full_join, by = "date")
+  fit <- lm(df$apy ~ df$close_tn)
 
   return(fit$coefficients[2])
 }
 opt <- optimize(opt_lm, c(1, 250), tol = 0.01)
 print(opt)
 
-csi300$csi300_tn <- tnormalize(csi300$csi300, round(opt$minimum))
-df <- reduce(list(apy, csi300), full_join, by = "date") %>% na.omit
-plot(df$csi300_tn, df$apy, pch = 20, cex = 0.5)
+index$close_tn <- tnormalize(index$close, round(opt$minimum))
+df <- reduce(list(apy, index), full_join, by = "date") %>% na.omit
+plot(df$close_tn, df$apy, pch = 20, cex = 0.5)
 
-fit <- lm(apy ~ csi300_tn, df)
+fit <- lm(apy ~ close_tn, df)
 print(summary(fit))
 
-ci_x <- seq(-0.1, 1.1, 0.01)
-ci <- predict(
-  fit,
-  newdata = data.frame(csi300_tn = ci_x),
-  interval = "prediction",
-  level = 0.95
-)
-abline(fit, col="red")
-lines(ci_x, ci[, 2], col = "blue", lty = 2)
-lines(ci_x, ci[, 3], col = "blue", lty = 2)
+ci_x <- data.frame(close_tn = seq(0, 1, 0.01))
+ci <- as.data.frame(predict(fit, newdata = ci_x, interval = "prediction"))
+lines(ci_x$close_tn, ci$fit, col="red")
+lines(ci_x$close_tn, ci$lwr, col = "blue", lty = 2)
+lines(ci_x$close_tn, ci$upr, col = "blue", lty = 2)

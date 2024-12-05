@@ -2,7 +2,7 @@ update <- function(
   symbol_list = out0[["symbol_list"]],
   data_list = out0[["data_list"]],
   portfolio_path = "assets/portfolio.csv",
-  ranking_path = "assets/ranking.txt"
+  ranking_path = "tmp/ranking.txt"
 ) {
   tsprint("Started update().")
 
