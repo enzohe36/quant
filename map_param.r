@@ -2,15 +2,15 @@ source("lib/preset.r", encoding = "UTF-8")
 
 library(gplots)
 
-param_path <- "assets/param_20241127.csv"
+param_path <- "assets/param_20241203.csv"
 
 # ------------------------------------------------------------------------------
 
 # Define parameters
-t_adx <- 25 # 15; 5 to 40
-t_cci <- 40 # 30; 10 to 50
-x_thr <- 0.5 # 0.53; 0.4 to 0.6
-t_max <- 105 # 105; 100 to 120
+t_adx <- 15 # 15; 5 to 40
+t_cci <- 55 # 30; 50 to 65
+x_thr <- 0.6 # 0.53; 0.45 to 0.65
+t_max <- 115 # 105; 110 to 125
 r_max <- 0.1 # 0.09
 r_min <- -0.5 # -0.5
 
