@@ -2,12 +2,11 @@
 
 source("lib/preset.r", encoding = "UTF-8")
 
+source("lib/fn_misc.r", encoding = "UTF-8")
 source("lib/fn_get_data.r", encoding = "UTF-8")
 source("lib/fn_load_data.r", encoding = "UTF-8")
 source("lib/fn_backtest.r", encoding = "UTF-8")
 source("lib/fn_sample_apy.r", encoding = "UTF-8")
-
-library(signal)
 
 trade_path <- "tmp/trade.csv"
 apy_path <- "tmp/apy.csv"
@@ -31,21 +30,22 @@ r_min <- -0.5
 # out0[["trade"]] <- backtest(t_adx, t_cci, x_thr, t_max, r_max, r_min)
 # write.csv(out0[["trade"]], trade_path, quote = FALSE, row.names = FALSE)
 
+# apy <- sample_apy(30, 1, 10000)
+# write.csv(apy, apy_path, quote = FALSE, row.names = FALSE)
+
+# index <- em_index("000300") %>%
+#   .[.$date >= min(apy$date) & .$date <= max(apy$date), c("date", "close")]
+# write.csv(index, index_path, quote = FALSE, row.names = FALSE)
+
 out0 <- list()
 out0[["trade"]] <- read.csv(
   trade_path,
   colClasses = c(symbol = "character", buy = "Date", sell = "Date")
 )
-apy <- sample_apy(30, 1, 10000)
-write.csv(apy, apy_path, quote = FALSE, row.names = FALSE)
+apy <- read.csv(apy_path, colClasses = c(date = "Date"))
+index <- read.csv(index_path, colClasses = c(date = "Date"))
 
 hist(apy$date, breaks = 100)
-
-index <- em_index("000300")
-index <- index[
-  index$date >= min(apy$date) & index$date <= max(apy$date), c("date", "close")
-]
-write.csv(index, index_path, quote = FALSE, row.names = FALSE)
 
 apy_mean <- split(apy, f = apy$date) %>% sapply(function(df) mean(df$apy))
 index_n <- normalize(index$close) * (max(apy_mean) - min(apy_mean)) +

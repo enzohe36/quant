@@ -1,6 +1,6 @@
 source("lib/preset.r", encoding = "UTF-8")
 
-library(gplots)
+source("lib/fn_misc.r", encoding = "UTF-8")
 
 param_path <- "assets/param_20241203.csv"
 
