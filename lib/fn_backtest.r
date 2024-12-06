@@ -1,5 +1,5 @@
 backtest <- function(
-  t_adx, t_cci, x_thr, t_max, r_max, r_min, descr = TRUE,
+  t_adx, t_cci, xa_thr, xb_thr, t_max, r_max, r_min, descr = TRUE,
   symbol_list = out0[["symbol_list"]],
   data_list = out0[["data_list"]]
 ) {
@@ -10,8 +10,10 @@ backtest <- function(
   trade <- foreach(
     symbol = symbol_list,
     .combine = rbind,
-    .export = c("tnormalize", "adx_alt", "ror", "predictor", "t_adx", "t_cci"),
-    .packages = c("TTR", "tidyverse")
+    .export = c(
+      "predictor", "normalize", "tnormalize", "adx_alt", "ror", "t_adx", "t_cci"
+    ),
+    .packages = c("tidyverse", "TTR", "signal")
   ) %dopar% {
     rm("data", "i", "j", "r", "trade")
 
@@ -24,7 +26,14 @@ backtest <- function(
     trade <- data.frame()
     for (i in 1:(nrow(data) - 1)) {
       if (
-        !(data[i, "x"] >= x_thr & data[i, "x1"] < x_thr & data[i, "dx"] > 0)
+        !(
+          (
+            (data$xa[i] >= xa_thr & data$xa1[i] < xa_thr & data$xad[i] > 0) |
+              (data$xb[i] >= xb_thr & data$xb1[i] < xb_thr & data$xbd[i] > 0)
+          ) & (
+            data$sgd[i] <= 0
+          )
+        )
       ) {
         next
       }
@@ -42,7 +51,7 @@ backtest <- function(
           )
           break
         }
-        if (j - i == t_max) {
+        if (j - i >= t_max) {
           r <- ror(data[i, "close"], data[j, "close"])
           break
         }
@@ -56,7 +65,7 @@ backtest <- function(
     colnames(trade) <- c("symbol", "buy", "sell", "r", "t")
     trade$buy <- as.Date(trade$buy)
     trade$sell <- as.Date(trade$sell)
-    trade <- na.omit(trade)
+    trade <- na.omit(trade) %>% .[.$r > -1, ]
     return(trade)
   }
   unregister_dopar

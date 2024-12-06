@@ -4,7 +4,7 @@ source("lib/fn_misc.r", encoding = "UTF-8")
 source("lib/fn_load_data.r", encoding = "UTF-8")
 source("lib/fn_backtest.r", encoding = "UTF-8")
 
-param_path <- "assets/param_20241205.csv"
+param_path <- "assets/param_20241206.csv"
 
 # ------------------------------------------------------------------------------
 
@@ -19,9 +19,11 @@ for (var1 in var_seq1) for (var2 in var_seq2) {
   assign(var_name1, var1)
   assign(var_name2, var2)
 
-  trade <- backtest(t_adx, t_cci, x_thr, t_max, r_max, r_min, descr = FALSE)
+  trade <- backtest(
+    t_adx, t_cci, xa_thr, xb_thr, t_max, r_max, r_min, descr = FALSE
+  )
   out <- data.frame(
-    t_adx, t_cci, x_thr, t_max, r_max, r_min,
+    t_adx, t_cci, xa_thr, xb_thr, t_max, r_max, r_min,
     mean = mean(trade$r), sd = sd(trade$r),
     t_mean = mean(trade$t), t_sd = sd(trade$t)
   )

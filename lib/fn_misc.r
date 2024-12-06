@@ -134,18 +134,22 @@ predictor <- function(data) {
   error <- try(
     {
       adx <- adx_alt(data[, 4:6])
-      cci <- CCI(data[, 4:6])
-      data$x <- (1 - tnormalize(abs(adx$adx - adx$adxr), t_adx)) *
-        (1 - 2 * tnormalize(cci, t_cci))
-      data$x1 <- lag(data$x, 1)
-      data$dx <- momentum(data$x, 5)
+      cci_n <- (1 - 2 * tnormalize(CCI(data[, 4:6]), t_cci))
+      data$xa <- (1 - normalize(abs(adx$adx - adx$adxr))) * cci_n
+      data$xa1 <- lag(data$xa, 1)
+      data$xad <- momentum(data$xa, 5)
+      data$xb <- tnormalize(adx$adx, t_adx) * cci_n
+      data$xb1 <- lag(data$xb, 1)
+      data$xbd <- abs(momentum(data$xb, 5)) - abs(momentum(data$xb, 1))
+      data$sg <- sgolayfilt(data$close, n = 7)
+      data$sgd <- ror(lag(data$sg, 10), data$sg)
     },
     silent = TRUE
   )
   if (class(error) == "try-error") {
-    data$x <- rep(NaN, nrow(data))
-    data$x1 <- data$x
-    data$dx <- data$x
+    for (header in c("xa", "xa1", "xad", "xb", "xb1", "xbd", "sg", "sgd")) {
+      data[, header] <- rep(NaN, nrow(data))
+    }
   }
   return(data)
 }

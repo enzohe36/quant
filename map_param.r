@@ -2,16 +2,16 @@ source("lib/preset.r", encoding = "UTF-8")
 
 source("lib/fn_misc.r", encoding = "UTF-8")
 
-param_path <- "assets/param_20241203.csv"
+param_path <- "assets/param_20241205.csv"
 
 # ------------------------------------------------------------------------------
 
 # Define parameters
 t_adx <- 15 # 15; 5 to 40
-t_cci <- 55 # 30; 50 to 65
-x_thr <- 0.6 # 0.53; 0.45 to 0.65
-t_max <- 115 # 105; 110 to 125
-r_max <- 0.1 # 0.09
+t_cci <- 60 # 30; 50 to 65
+x_thr <- 0.75 # 0.53; 0.55 to 0.75
+t_max <- 110 # 105; 110 to 125
+r_max <- 0.09 # 0.09
 r_min <- -0.5 # -0.5
 
 v1_name <- "t_adx"

@@ -9,7 +9,8 @@ update <- function(
   # Define parameters
   t_adx <- 15
   t_cci <- 30
-  x_thr <- 0.53
+  xa_thr <- 0.5
+  xb_thr <- 0.5
   t_max <- 105
   r_max <- 0.09
   r_min <- -0.5
@@ -23,8 +24,10 @@ update <- function(
   data_list <- foreach(
     symbol = symbol_list,
     .combine = append,
-    .export = c("tnormalize", "adx_alt", "predictor", "t_adx", "t_cci"),
-    .packages = c("tidyverse", "TTR")
+    .export = c(
+      "predictor", "normalize", "tnormalize", "adx_alt", "ror", "t_adx", "t_cci"
+    ),
+    .packages = c("tidyverse", "TTR", "signal")
   ) %dopar% {
     rm("data", "df", "lst")
 
@@ -83,16 +86,32 @@ update <- function(
       }
     )
   )
-  # [1]   symbol name date open high low close volume x x1
-  # [11]  dx in1 in3 in5 in10
-  latest <- latest[, c(3, 1, 2, 4:ncol(latest))] %>%
-    .[, !colnames(.) %in% c("open", "high", "low", "close", "volume")]
-  latest$in_score <- apply(latest[, fundflow_dict$header], 1, sum)
-  latest <- latest[order(latest$in_score, decreasing = TRUE), ]
+  # [1]   symbol name date open high low close volume xa xa1
+  # [11]  xad xb xb1 xbd sgd in1 in3 in5 in10
+  latest <- latest[, c(3, 1, 2, 4:ncol(latest))]
+  latest$score <- apply(
+    latest[, fundflow_dict$header], 1, function(v) {
+      v[1] * 0.4 + v[2] * 0.3 + v[3] * 0.2 + v[4] * 0.1
+    }
+  )
+  latest <- latest[order(latest$score, decreasing = TRUE), ]
 
-  ranking <- latest[latest$x >= x_thr & latest$x1 < x_thr & latest$dx > 0, ] %>%
-    .[order(desc(.$in_score)), ] %>%
-    na.omit(.)
+  ranking <- latest[
+    (
+      (latest$xa >= xa_thr & latest$xa1 < xa_thr & latest$xad > 0) |
+        (latest$xb >= xb_thr & latest$xb1 < xb_thr & latest$xbd > 0)
+    ) & (
+      latest$sgd <= 0
+    ),
+  ] %>%
+    .[order(desc(.$score)), ] %>%
+    na.omit(.) %>%
+    .[,
+      colnames(.) %in% c(
+        "date", "symbol", "name",
+        "xa", "xb", "sgd", fundflow_dict$header, "score"
+      )
+    ]
   ranking[, sapply(ranking, is.numeric)] <- format(
     round(ranking[, sapply(ranking, is.numeric)], 2), nsmall = 2
   )

@@ -17,35 +17,38 @@ index_path <- "tmp/index.csv"
 # Define parameters
 t_adx <- 15
 t_cci <- 30
-x_thr <- 0.53
+xa_thr <- 0.5
+xb_thr <- 0.5
 t_max <- 105
 r_max <- 0.09
 r_min <- -0.5
 
 # get_data("^(00|60)", "hfq")
 
-# dir.create("tmp")
+dir.create("tmp")
 
-# out0 <- load_data("^(00|60)", "hfq", 20141129, 20241129)
-# out0[["trade"]] <- backtest(t_adx, t_cci, x_thr, t_max, r_max, r_min)
-# write.csv(out0[["trade"]], trade_path, quote = FALSE, row.names = FALSE)
+out0 <- load_data("^(00|60)", "hfq", 20141129, 20241129)
+out0[["trade"]] <- backtest(t_adx, t_cci, xa_thr, xb_thr, t_max, r_max, r_min)
+write.csv(out0[["trade"]], trade_path, quote = FALSE, row.names = FALSE)
 
-# apy <- sample_apy(30, 1, 10000)
-# write.csv(apy, apy_path, quote = FALSE, row.names = FALSE)
+# out0 <- list()
+# out0[["trade"]] <- read.csv(
+#   trade_path,
+#   colClasses = c(symbol = "character", buy = "Date", sell = "Date")
+# )
 
-# index <- em_index("000300") %>%
-#   .[.$date >= min(apy$date) & .$date <= max(apy$date), c("date", "close")]
-# write.csv(index, index_path, quote = FALSE, row.names = FALSE)
+apy <- sample_apy(30, 1, 10000)
+write.csv(apy, apy_path, quote = FALSE, row.names = FALSE)
 
-out0 <- list()
-out0[["trade"]] <- read.csv(
-  trade_path,
-  colClasses = c(symbol = "character", buy = "Date", sell = "Date")
-)
-apy <- read.csv(apy_path, colClasses = c(date = "Date"))
-index <- read.csv(index_path, colClasses = c(date = "Date"))
+# apy <- read.csv(apy_path, colClasses = c(date = "Date"))
 
 hist(apy$date, breaks = 100)
+
+index <- em_index("000300") %>%
+  .[.$date >= min(apy$date) & .$date <= max(apy$date), c("date", "close")]
+write.csv(index, index_path, quote = FALSE, row.names = FALSE)
+
+# index <- read.csv(index_path, colClasses = c(date = "Date"))
 
 apy_mean <- split(apy, f = apy$date) %>% sapply(function(df) mean(df$apy))
 index_n <- normalize(index$close) * (max(apy_mean) - min(apy_mean)) +
