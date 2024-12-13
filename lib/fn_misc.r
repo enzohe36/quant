@@ -5,25 +5,19 @@ unregister_dopar <- function() {
 }
 
 normalize <- function(v) {
-  return(
-    (v - min(v, na.rm = TRUE)) / (max(v, na.rm = TRUE) - min(v, na.rm = TRUE))
-  )
+  (v - min(v, na.rm = TRUE)) / (max(v, na.rm = TRUE) - min(v, na.rm = TRUE))
 }
 
 normalize0 <- function(v) {
-  return(
-    (0 - min(v, na.rm = TRUE)) / (max(v, na.rm = TRUE) - min(v, na.rm = TRUE))
-  )
+  (0 - min(v, na.rm = TRUE)) / (max(v, na.rm = TRUE) - min(v, na.rm = TRUE))
 }
 
 tnormalize <- function(v, t) {
-  return(
-    (v - runMin(v, t)) / (runMax(v, t) - runMin(v, t))
-  )
+  (v - runMin(v, t)) / (runMax(v, t) - runMin(v, t))
 }
 
 # http://www.cftsc.com/qushizhibiao/610.html
-adx_alt <- function(hlc, n = 14, m = 6) {
+ADX <- function(hlc, n = 14, m = 6) {
   h <- hlc[, 1]
   l <- hlc[, 2]
   c <- hlc[, 3]
@@ -40,12 +34,11 @@ adx_alt <- function(hlc, n = 14, m = 6) {
   adxr <- (adx + lag(adx, m)) / 2
   df <- data.frame(adx, adxr)
   colnames(df) <- c("adx", "adxr")
-
   return(df)
 }
 
-ror <- function(v1, v2) {
-  return((v2 - v1) / abs(v1))
+ROR <- function(v1, v2) {
+  (v2 - v1) / abs(v1)
 }
 
 # https://stackoverflow.com/a/19801108
@@ -130,37 +123,14 @@ em_fundflow <- function(indicator, fundflow_dict) {
   return(fundflow)
 }
 
-predictor <- function(data) {
-  error <- try(
-    {
-      adx <- adx_alt(data[, 4:6])
-      cci_n <- (1 - 2 * tnormalize(CCI(data[, 4:6]), t_cci))
-      data$xa <- (1 - normalize(abs(adx$adx - adx$adxr))) * cci_n
-      data$xa1 <- lag(data$xa, 1)
-      data$xad <- momentum(data$xa, 5)
-      data$xb <- tnormalize(adx$adx, t_adx) * cci_n
-      data$xb1 <- lag(data$xb, 1)
-      data$xbd <- abs(momentum(data$xb, 5)) - abs(momentum(data$xb, 1))
-      data$sg <- sgolayfilt(data$close, n = 7)
-      data$sgd <- ror(lag(data$sg, 10), data$sg)
-    },
-    silent = TRUE
-  )
-  if (class(error) == "try-error") {
-    for (header in c("xa", "xa1", "xad", "xb", "xb1", "xbd", "sg", "sgd")) {
-      data[, header] <- rep(NaN, nrow(data))
-    }
-  }
-  return(data)
-}
-
 em_index <- function(symbol) {
+  symbol <- ifelse(
+    grepl("^399", symbol), paste0("sz", symbol), paste0("sh", symbol)
+  )
   data <- fromJSON(
     getForm(
       uri = "http://127.0.0.1:8080/api/public/stock_zh_index_daily_em",
-      symbol = ifelse(
-        grepl("^399", symbol), paste0("sz", symbol), paste0("sh", symbol)
-      ),
+      symbol = symbol,
       .encoding = "utf-8"
     )
   )
@@ -172,4 +142,87 @@ em_index <- function(symbol) {
   )
   data$date <- as.Date(data$date)
   return(data)
+}
+
+get_predictor <- function(data, t_adx, t_cci) {
+  error <- try(
+    {
+      adx <- ADX(data[, c("high", "low", "close")])
+      cci_n <- (
+        1 - 2 * tnormalize(CCI(data[, c("high", "low", "close")]), t_cci)
+      )
+      data$xa <- (1 - normalize(abs(adx$adx - adx$adxr))) * cci_n
+      data$xa1 <- lag(data$xa, 1)
+      data$xad <- momentum(data$xa, 5)
+      data$xb <- tnormalize(adx$adx, t_adx) * cci_n
+      data$xb1 <- lag(data$xb, 1)
+      data$xbd <- abs(momentum(data$xb, 5)) - abs(momentum(data$xb, 1))
+      data$sg <- sgolayfilt(data$close, n = 7)
+      data$sgd <- ROR(lag(data$sg, 10), data$sg)
+    },
+    silent = TRUE
+  )
+  if (class(error) == "try-error") {
+    for (header in c("xa", "xa1", "xad", "xb", "xb1", "xbd", "sg", "sgd")) {
+      data[, header] <- rep(NaN, nrow(data))
+    }
+  }
+  return(data)
+}
+
+get_trade <- function(data, xa_thr, xb_thr, t_max, r_max, r_min) {
+  trade_null <- tibble(
+    symbol = character(), buy = Date(), sell = Date(), r = numeric()
+  )
+
+  trade <- filter(
+    data,
+    (
+      (xa >= xa_thr & xa1 < xa_thr & xad > 0) |
+        (xb >= xb_thr & xb1 < xb_thr & xbd > 0)
+    ) &
+      sgd <= 0
+  )
+  if (nrow(trade) == 0) return(trade_null)
+
+  trade <- select(trade, symbol, buy = date, cost = close) %>%
+    rowwise() %>%
+    mutate(
+      data_sell = filter(
+        data,
+        date > buy &
+          (
+            ROR(cost, high) >= r_max |
+              ROR(cost, low) <= r_min |
+              date >= buy + days(t_max)
+          )
+      ) %>%
+        filter(row_number() == 1) %>%
+        select(date, open, high, low, close) %>%
+        list()
+    ) %>%
+    filter(nrow(data_sell) != 0)
+  if (nrow(trade) == 0) return(trade_null)
+
+  trade <- mutate(
+    trade,
+    sell = as_date(as.vector(data_sell$date)),
+    r = {
+      if (ROR(cost, data_sell$high) >= r_max) {
+        r_max
+      } else if (ROR(cost, data_sell$low) <= r_min) {
+        ifelse(
+          ROR(cost, data_sell$open) <= r_min,
+          ROR(cost, data_sell$open),
+          r_min
+        )
+      } else if (data_sell$date >= buy + days(t_max)) {
+        ROR(cost, data_sell$close)
+      }
+    } %>%
+      as.vector(),
+    cost = NULL,
+    data_sell = NULL
+  )
+  return(trade)
 }

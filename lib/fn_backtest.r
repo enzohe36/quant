@@ -1,74 +1,34 @@
 backtest <- function(
   t_adx, t_cci, xa_thr, xb_thr, t_max, r_max, r_min, descr = TRUE,
-  symbol_list = out0[["symbol_list"]],
-  data_list = out0[["data_list"]]
+  tb = tb0
 ) {
   tsprint("Started backtest().")
 
-  cl <- makeCluster(detectCores() - 1)
+  tb = tb0; t0 <- now()
+
+  core_count <- detectCores() - 1
+  cl <- makeCluster(core_count)
   registerDoParallel(cl)
-  trade <- foreach(
-    symbol = symbol_list,
+  tb <- foreach(
+    tb_chunk = split(tb, ceiling(row_number(tb) / nrow(tb) * core_count)),
     .combine = rbind,
     .export = c(
-      "predictor", "normalize", "tnormalize", "adx_alt", "ror", "t_adx", "t_cci"
+      "normalize", "tnormalize", "ADX", "ROR", "get_predictor", "get_trade",
+      "t_adx", "t_cci", "xa_thr", "xb_thr", "t_max", "r_max", "r_min"
     ),
-    .packages = c("tidyverse", "TTR", "signal")
+    .packages = c("TTR", "signal", "tidyverse", "dtplyr")
   ) %dopar% {
-    rm("data", "i", "j", "r", "trade")
-
-    try(data <- data_list[[symbol]], silent = TRUE)
-    if (is.null(data)) return(NULL)
-
-    data <- predictor(data) %>% na.omit
-    if (nrow(data) == 0) return(NULL)
-
-    trade <- data.frame()
-    for (i in 1:(nrow(data) - 1)) {
-      if (
-        !(
-          (
-            (data$xa[i] >= xa_thr & data$xa1[i] < xa_thr & data$xad[i] > 0) |
-              (data$xb[i] >= xb_thr & data$xb1[i] < xb_thr & data$xbd[i] > 0)
-          ) & (
-            data$sgd[i] <= 0
-          )
-        )
-      ) {
-        next
-      }
-      for (j in (i + 1):nrow(data)) {
-        r <- NaN
-        if (ror(data[i, "close"], data[j, "high"]) >= r_max) {
-          r <- r_max
-          break
-        }
-        if (ror(data[i, "close"], data[j, "low"]) <= r_min) {
-          ifelse(
-            ror(data[i, "close"], data[j, "open"]) <= r_min,
-            r <- ror(data[i, "close"], data[j, "open"]),
-            r <- r_min
-          )
-          break
-        }
-        if (j - i >= t_max) {
-          r <- ror(data[i, "close"], data[j, "close"])
-          break
-        }
-      }
-      trade <- rbind(
-        trade, list(symbol, data[i, "date"], data[j, "date"], r, j - i)
-      )
-    }
-    if (nrow(trade) == 0) return(NULL)
-
-    colnames(trade) <- c("symbol", "buy", "sell", "r", "t")
-    trade$buy <- as.Date(trade$buy)
-    trade$sell <- as.Date(trade$sell)
-    trade <- na.omit(trade) %>% .[.$r > -1, ]
-    return(trade)
+    tb %>%
+      lazy_dt() %>%
+      mutate(data = lapply(data, get_predictor, t_adx, t_cci)) %>%
+      mutate(
+        trade = lapply(data, get_trade, xa_thr, xb_thr, t_max, r_max, r_min)
+      ) %>%
+      as_tibble()
   }
   unregister_dopar
+
+  print(now() - t0); tb
 
   if (descr) {
     tsprint(glue("Backtested {length(unique(trade$symbol))} stocks."))

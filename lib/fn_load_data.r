@@ -13,7 +13,7 @@ load_data <- function(
 
   cl <- makeCluster(detectCores() - 1)
   registerDoParallel(cl)
-  out <- foreach(
+  lst <- foreach(
     symbol = symbol_list,
     .combine = multiout,
     .multicombine = TRUE,
@@ -37,13 +37,8 @@ load_data <- function(
   }
   unregister_dopar
 
-  symbol_list <- do.call(rbind, out[[1]])[, 1]
-
-  data_list <- out[[2]]
-  names(data_list) <- do.call(
-    c, lapply(data_list, function(df) df[1, "symbol"])
-  )
-  tsprint(glue("Loaded {length(data_list)} stocks from {data_dir}."))
-
-  return(list(symbol_list = symbol_list, data_list = data_list))
+  tb <- tibble(symbol = unlist(lst[[1]]), data = lst[[2]]) %>%
+    filter(sapply(data, nrow) != 0)
+  tsprint(glue("Loaded {nrow(tb)} stocks from {data_dir}."))
+  return(tb)
 }
