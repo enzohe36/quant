@@ -1,6 +1,5 @@
 update <- function(
-  symbol_list = out0[["symbol_list"]],
-  data_list = out0[["data_list"]],
+  .data_list = data_list,
   portfolio_path = "assets/portfolio.csv",
   ranking_path = "tmp/ranking.txt"
 ) {
@@ -15,23 +14,24 @@ update <- function(
   r_max <- 0.09
   r_min <- -0.5
 
+  symbol_list <- names(.data_list)
   out <- em_data_update()
   data_update <- out[[1]] %>% .[.$symbol %in% symbol_list, ]
   data_name <- out[[2]]
 
   cl <- makeCluster(detectCores() - 1)
   registerDoParallel(cl)
-  data_list <- foreach(
+  .data_list <- foreach(
     symbol = symbol_list,
     .combine = append,
     .export = c(
-      "predictor", "normalize", "tnormalize", "adx_alt", "ror", "t_adx", "t_cci"
+      "get_predictor", "normalize", "tnormalize", "ADX", "ROR"
     ),
-    .packages = c("tidyverse", "TTR", "signal")
+    .packages = c("TTR", "signal", "tidyverse")
   ) %dopar% {
     rm("data", "df", "lst")
 
-    data <- data_list[[symbol]]
+    data <- .data_list[[symbol]]
     df <- data_update[data_update$symbol == symbol, ]
     if (
       !all((data[nrow(data), 2:7] == df[, 2:7]) %in% TRUE)
@@ -44,7 +44,7 @@ update <- function(
     }
     if (any(is.na(data[nrow(data), ]))) data <- data[-nrow(data), ]
 
-    data <- predictor(data)
+    data <- get_predictor(data, t_adx, t_cci)
 
     lst <- list()
     lst[[symbol]] <- data
@@ -52,7 +52,7 @@ update <- function(
   }
   unregister_dopar
 
-  tsprint(glue("Checked {length(data_list)} stocks for update."))
+  tsprint(glue("Checked {length(.data_list)} stocks for update."))
 
   fundflow_dict <- data.frame(
     indicator = c("今日", "3日", "5日", "10日"),
@@ -79,7 +79,7 @@ update <- function(
 
   latest <- bind_rows(
     lapply(
-      data_list,
+      .data_list,
       function(df) {
         merge(data_name, df[nrow(df), ], by = "symbol") %>%
           merge(fundflow, by = "symbol")
@@ -95,6 +95,8 @@ update <- function(
     }
   )
   latest <- latest[order(latest$score, decreasing = TRUE), ]
+
+  dir.create("tmp/")
 
   ranking <- latest[
     (
@@ -129,56 +131,54 @@ update <- function(
   )
 
   # Evaluate portfolio
-  out0 <- list(
-    symbol_list = symbol_list, data_list = data_list, latest = latest
-  )
-  if (!file.exists(portfolio_path)) return(out0)
+  out <- list(data_list = .data_list, latest = latest)
+  if (!file.exists(portfolio_path)) return(out)
 
   portfolio <- read.csv(
     portfolio_path,
     colClasses = c(date = "Date", symbol = "character")
   )
-  if (nrow(portfolio) == 0) return(out0)
+  if (nrow(portfolio) == 0) return(out)
 
-  out <- data.frame()
+  df <- data.frame()
   for (symbol in portfolio$symbol) {
-    df <- portfolio[portfolio$symbol == symbol, ]
-    data <- data_list[[symbol]]
+    df_symbol <- portfolio[portfolio$symbol == symbol, ]
+    data <- .data_list[[symbol]]
 
-    i <- which(data$date == df$date)
+    i <- which(data$date == df_symbol$date)
     if (length(i) == 0) {
       stop(glue("Buy date of {symbol} does not exist"))
     }
     j <- nrow(data)
-    r <- ror(df$cost, data[j, "close"])
-    out <- rbind(
-      out, list(
-        df$date,
+    r <- ROR(df_symbol$cost, data[j, "close"])
+    df <- rbind(
+      df, list(
+        df_symbol$date,
         symbol,
         latest[latest$symbol == symbol, "name"],
-        df$cost,
+        df_symbol$cost,
         r,
         ifelse(r >= r_max | r <= r_min | j - i >= t_max, "SELL", "HOLD")
       )
     )
   }
-  colnames(out) <- c("date", "symbol", "name", "cost", "r", "action")
-  out$date <- as.character(as.Date(out$date))
-  out <- arrange(out, desc(action), desc(r))
-  out[, c("cost", "r")] <- format(round(out[, c("cost", "r")], 3), nsmall = 3)
-  rownames(out) <- seq_len(nrow(out))
+  colnames(df) <- c("date", "symbol", "name", "cost", "r", "action")
+  df$date <- as.character(as.Date(df$date))
+  df <- arrange(df, desc(action), desc(r))
+  df[, c("cost", "r")] <- format(round(df[, c("cost", "r")], 3), nsmall = 3)
+  rownames(df) <- seq_len(nrow(df))
 
-  v <- which(out$action == "SELL")
+  v <- which(df$action == "SELL")
   if (length(v) != 0) {
-    out <- rbind(
-      out[v, ],
+    df <- rbind(
+      df[v, ],
       setNames(
-        data.frame(t(replicate(ncol(out), "")), row.names = ""), names(out)
+        data.frame(t(replicate(ncol(df), "")), row.names = ""), names(df)
       ),
-      out[-v, ]
+      df[-v, ]
     )
   }
-  print(out)
+  print(df)
 
-  return(out0)
+  return(out)
 }

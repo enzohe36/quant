@@ -1,6 +1,6 @@
 buy <- function(
   symbol, cost = NaN, date = NA,
-  latest = out0[["latest"]],
+  .latest = latest,
   portfolio_path = "assets/portfolio.csv"
 ) {
   symbol <- formatC(as.integer(symbol), width = 6, format = "d", flag = "0")
@@ -20,7 +20,7 @@ buy <- function(
       list(
         ifelse(is.na(date), bizday(), date),
         symbol,
-        latest[latest$symbol == symbol, "name"],
+        .latest[.latest$symbol == symbol, "name"],
         cost
       )
     )
@@ -30,7 +30,7 @@ buy <- function(
     portfolio[portfolio$symbol == symbol, ] <- list(
       ifelse(is.na(date), df$date, date),
       symbol,
-      latest[latest$symbol == symbol, "name"],
+      .latest[.latest$symbol == symbol, "name"],
       ifelse(is.na(cost), df$cost, cost)
     )
   }

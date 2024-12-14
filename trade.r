@@ -1,8 +1,9 @@
 # python -m aktools
 
-source("lib/preset.r", encoding = "UTF-8")
+rm(list = ls())
 
-source("lib/fn_misc.r", encoding = "UTF-8")
+source("lib/preset.r", encoding = "UTF-8")
+source("lib/misc.r", encoding = "UTF-8")
 source("lib/fn_get_data.r", encoding = "UTF-8")
 source("lib/fn_load_data.r", encoding = "UTF-8")
 source("lib/fn_update.r", encoding = "UTF-8")
@@ -14,9 +15,11 @@ source("lib/fn_sell.r", encoding = "UTF-8")
 
 # get_data("^(00|60)", "qfq")
 
-out0 <- load_data("^(00|60)", "qfq")
+data_list <- load_data("^(00|60)", "qfq")
 
-out0 <- update()
+out <- update()
+data_list <- out[["data_list"]]
+latest <- out[["latest"]]
 
 # query(000001, 20240527)
 

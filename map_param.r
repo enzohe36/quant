@@ -1,6 +1,7 @@
-source("lib/preset.r", encoding = "UTF-8")
+rm(list = ls())
 
-source("lib/fn_misc.r", encoding = "UTF-8")
+source("lib/preset.r", encoding = "UTF-8")
+source("lib/misc.r", encoding = "UTF-8")
 
 param_path <- "assets/param_20241205.csv"
 

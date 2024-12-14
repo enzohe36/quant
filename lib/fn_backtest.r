@@ -1,108 +1,79 @@
 backtest <- function(
-  t_adx, t_cci, xa_thr, xb_thr, t_max, r_max, r_min, descr = TRUE,
-  symbol_list = out0[["symbol_list"]],
-  data_list = out0[["data_list"]]
+  .data_list = data_list,
+  .t_adx = t_adx,
+  .t_cci = t_cci,
+  .xa_thr = xa_thr,
+  .xb_thr = xb_thr,
+  .t_max = t_max,
+  .r_max = r_max,
+  .r_min = r_min
 ) {
-  tsprint("Started backtest().")
-
   cl <- makeCluster(detectCores() - 1)
   registerDoParallel(cl)
-  trade <- foreach(
-    symbol = symbol_list,
-    .combine = rbind,
+  trade_list <- foreach(
+    data = .data_list,
+    .combine = append,
     .export = c(
-      "predictor", "normalize", "tnormalize", "adx_alt", "ror", "t_adx", "t_cci"
+      "get_predictor", "normalize", "tnormalize", "ADX", "ROR"
     ),
-    .packages = c("tidyverse", "TTR", "signal")
+    .packages = c("TTR", "signal", "tidyverse")
   ) %dopar% {
-    rm("data", "i", "j", "r", "trade")
+    rm("i", "j", "r", "trade_list")
 
-    try(data <- data_list[[symbol]], silent = TRUE)
-    if (is.null(data)) return(NULL)
+    symbol <- data[1, 2]
 
-    data <- predictor(data) %>% na.omit
+    data <- get_predictor(data, .t_adx, .t_cci) %>%
+      na.omit() %>%
+      data.matrix()
     if (nrow(data) == 0) return(NULL)
 
-    trade <- data.frame()
-    for (i in 1:(nrow(data) - 1)) {
-      if (
-        !(
-          (
-            (data$xa[i] >= xa_thr & data$xa1[i] < xa_thr & data$xad[i] > 0) |
-              (data$xb[i] >= xb_thr & data$xb1[i] < xb_thr & data$xbd[i] > 0)
-          ) & (
-            data$sgd[i] <= 0
-          )
+    trade_list <- list()
+    for (
+      i in which(
+        (
+          data[, "xa"] >= .xa_thr &
+            data[, "xa1"] < .xa_thr &
+            data[, "xad"] > 0 &
+            data[, "sgd"] <= 0
+        ) | (
+          data[, "xb"] >= .xb_thr &
+            data[, "xb1"] < .xb_thr &
+            data[, "xbd"] > 0 &
+            data[, "sgd"] <= 0
         )
-      ) {
-        next
-      }
-      for (j in (i + 1):nrow(data)) {
+      )
+    ) {
+      for (j in i:nrow(data)) {
         r <- NaN
-        if (ror(data[i, "close"], data[j, "high"]) >= r_max) {
-          r <- r_max
+        if (ROR(data[i, "close"], data[j, "high"]) >= .r_max) {
+          r <- .r_max
           break
         }
-        if (ror(data[i, "close"], data[j, "low"]) <= r_min) {
+        if (ROR(data[i, "close"], data[j, "low"]) <= .r_min) {
           ifelse(
-            ror(data[i, "close"], data[j, "open"]) <= r_min,
-            r <- ror(data[i, "close"], data[j, "open"]),
-            r <- r_min
+            ROR(data[i, "close"], data[j, "open"]) <= .r_min,
+            r <- ROR(data[i, "close"], data[j, "open"]),
+            r <- .r_min
           )
           break
         }
-        if (j - i >= t_max) {
-          r <- ror(data[i, "close"], data[j, "close"])
+        if (j - i >= .t_max) {
+          r <- ROR(data[i, "close"], data[j, "close"])
           break
         }
       }
-      trade <- rbind(
-        trade, list(symbol, data[i, "date"], data[j, "date"], r, j - i)
+      trade_list[[i]] <- list(
+        symbol, data[i, "date"], data[j, "date"], r, j - i
       )
     }
-    if (nrow(trade) == 0) return(NULL)
-
-    colnames(trade) <- c("symbol", "buy", "sell", "r", "t")
-    trade$buy <- as.Date(trade$buy)
-    trade$sell <- as.Date(trade$sell)
-    trade <- na.omit(trade) %>% .[.$r > -1, ]
-    return(trade)
+    ifelse(length(trade_list) == 0, return(NULL), return(trade_list))
   }
   unregister_dopar
 
-  if (descr) {
-    tsprint(glue("Backtested {length(unique(trade$symbol))} stocks."))
-
-    stats_mean <- data.frame(
-      r = c(mean(trade$r), sd(trade$r)),
-      t = c(mean(trade$t), sd(trade$t)),
-      t_cal = c(
-        mean(as.numeric(trade$sell - trade$buy)),
-        sd(as.numeric(trade$sell - trade$buy))
-      ),
-      row.names = c("mean", "sd")
-    )
-    stats_q <- data.frame(
-      r = quantile(trade$r),
-      t = quantile(trade$t),
-      t_cal = quantile(as.numeric(trade$sell - trade$buy))
-    )
-    stats <- rbind(stats_q, stats_mean)
-    stats$r <- format(round(stats$r, 3), nsmall = 3)
-    stats[, c("t", "t_cal")] <- round(stats[, c("t", "t_cal")])
-
-    v <- seq_len(nrow(stats_q))
-    stats <- rbind(
-      stats[v, ],
-      setNames(
-        data.frame(t(replicate(ncol(stats), "")), row.names = ""), names(stats)
-      ),
-      stats[-v, ]
-    )
-    print(stats)
-
-    hist <- hist(trade$r, breaks = 100)
-  }
-
+  trade <- rbindlist(trade_list) %>%
+    as.data.frame() %>%
+    `colnames<-`(c("symbol", "buy", "sell", "r", "t")) %>%
+    filter(r > -1 & buy < sell) %>%
+    mutate(buy = as_date(buy), sell = as_date(sell))
   return(trade)
 }

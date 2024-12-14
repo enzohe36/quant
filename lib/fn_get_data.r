@@ -62,7 +62,7 @@ get_data <- function(
       } else {
         ifelse (
           adjust == "qfq",
-          start_date <- format(bizday() - years(1), "%Y%m%d"),
+          start_date <- format(bizday() %m-% years(1), "%Y%m%d"),
           start_date <- ""
         )
         data <- em_data(symbol, adjust, start_date, end_date)

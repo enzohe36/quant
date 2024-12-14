@@ -1,50 +1,52 @@
 sample_apy <- function(
-  n_portfolio, t, n_sample,
-  trade = out0[["trade"]]
+  .trade = trade, n_portfolio, t, n_sample
 ) {
-  tsprint("Started sample_apy().")
+  start_date_list <- filter(.trade, buy <= last(sell) %m-% years(t)) %>%
+    .$buy %>%
+    unique() %>%
+    sample(n_sample, replace = TRUE)
 
   cl <- makeCluster(detectCores() - 1)
   registerDoParallel(cl)
   out <- foreach(
-    i = seq_len(n_sample),
+    start_date = start_date_list,
     .combine = multiout,
     .multicombine = TRUE,
     .init = list(list(), list()),
     .packages = "tidyverse"
   ) %dopar% {
-    rm("date", "j", "portfolio", "r", "trade_tr")
+    end_date <- start_date %m+% years(1)
 
-    trade <- trade[sample(seq_len(nrow(trade))), ] %>% .[order(.$buy), ]
-    date <- unique(trade$buy) %>%
-      .[. <= .[length(.)] - years(t)] %>%
-      sample(., 1)
-    trade_tr <- trade[
-      trade$buy >= date & trade$sell <= date + years(t),
-    ]
+    portfolio <- filter(
+      .trade, buy < start_date & sell >= start_date & sell <= end_date
+    ) %>%
+      slice_sample(n = min(nrow(.), n_portfolio)) %>%
+      data.matrix()
 
-    portfolio <- data.frame()
+    trade_t <- filter(.trade, buy >= start_date & buy <= end_date) %>%
+      slice_sample(n = nrow(.)) %>%
+      data.matrix()
+
     r <- 0
-    for (j in seq_len(nrow(trade_tr))) {
-      r <- sum(r, portfolio[portfolio$sell == trade_tr[j, "buy"], "r"])
-      portfolio <- portfolio[portfolio$sell != trade_tr[j, "buy"], ]
-      if (n_portfolio - nrow(portfolio) > 0) {
-        portfolio <- rbind(portfolio, trade_tr[j, ])
+    for (x in start_date:end_date) {
+      i <- which(portfolio[, "sell"] == x)
+      r <- sum(r, portfolio[i, "r"], na.rm = TRUE)
+      portfolio <- portfolio[!seq_len(nrow(portfolio)) %in% i, , drop = FALSE]
+      portfolio_rem <- n_portfolio - nrow(portfolio)
+      if (portfolio_rem > 0) {
+        trade_t_x <- trade_t[trade_t[, "buy"] == x, , drop = FALSE] %>%
+          .[seq_len(min(nrow(.), portfolio_rem)), ]
+        portfolio <- rbind(portfolio, trade_t_x)
       }
     }
-
-    return(list(date, r / n_portfolio / t))
+    return(list(start_date, r / n_portfolio / t))
   }
   unregister_dopar
 
-  tsprint(
-    glue(
-      "Sampled a {n_portfolio}-stock portfolio over {t} year(s) {n_sample} times."
-    )
-  )
-
-  df <- data.frame(date = as.Date(unlist(out[[1]])), apy = unlist(out[[2]])) %>%
+  apy <- data.frame(
+    date = as.Date(unlist(out[[1]])), apy = unlist(out[[2]])
+  ) %>%
     na.omit %>%
     .[order(.$date), ]
-  return(df)
+  return(apy)
 }
