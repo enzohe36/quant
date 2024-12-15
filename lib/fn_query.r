@@ -1,7 +1,6 @@
 query <- function(
   symbol, date = NA, plot = TRUE,
-  .data_list = data_list,
-  portfolio_path = "assets/portfolio.csv"
+  .data_list = data_list
 ) {
   symbol <- formatC(as.integer(symbol), width = 6, format = "d", flag = "0")
   date <- bizday(date)
@@ -18,10 +17,13 @@ query <- function(
       ylim = c(-1, 1),
       main = glue("{symbol}: {date}"), xlab = "", ylab = ""
     )
-    lines(data$date, data$x, col = "red")
+    lines(data$date, data$xa, col = "red")
+    lines(data$date, data$xb, col = "orange")
     abline(v = date, col = "blue")
     legend(
-      "topleft", legend = c("close", "x"), fill = c("black", "red")
+      "topleft",
+      legend = c("close", "xa", "xb"),
+      fill = c("black", "red", "orange")
     )
   }
 

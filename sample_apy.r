@@ -41,16 +41,18 @@ write.csv(apy, apy_path, quote = FALSE, row.names = FALSE)
 hist(apy$date, breaks = 100)
 
 # index <- em_index("000300") %>%
-#   .[.$date >= min(apy$date) & .$date <= max(apy$date), c("date", "close")]
+#   select(date, close) %>%
+#   filter(date >= min(apy$date) & date <= max(apy$date))
 # write.csv(index, index_path, quote = FALSE, row.names = FALSE)
 
 index <- read.csv(index_path, colClasses = c(date = "Date"))
 
-apy_mean <- split(apy, f = apy$date) %>% sapply(function(df) mean(df$apy))
+apy_mean <- split(apy, f = apy$date) %>%
+  sapply(function(df) mean(df$apy))
 index_n <- normalize(index$close) * (max(apy_mean) - min(apy_mean)) +
   min(apy_mean)
-plot(index$date, sgolayfilt(index_n), type = "l")
-lines(unique(apy$date), sgolayfilt(apy_mean), col = "red")
+plot(index$date, sgolayfilt(index_n, n = 7), type = "l")
+lines(unique(apy$date), sgolayfilt(apy_mean, n = 7), col = "red")
 
 opt_lm <- function(t) {
   index$close_tn <- tnormalize(index$close, t)

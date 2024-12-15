@@ -18,7 +18,7 @@ backtest <- function(
     ),
     .packages = c("TTR", "signal", "tidyverse")
   ) %dopar% {
-    rm("i", "j", "r", "trade_list")
+    rm("i", "j", "r", "symbol", "trade_list")
 
     symbol <- data[1, 2]
 
@@ -57,13 +57,13 @@ backtest <- function(
           )
           break
         }
-        if (j - i >= .t_max) {
+        if (data[j, "date"] - data[i, "date"] >= .t_max) {
           r <- ROR(data[i, "close"], data[j, "close"])
           break
         }
       }
       trade_list[[i]] <- list(
-        symbol, data[i, "date"], data[j, "date"], r, j - i
+        data[i, "date"], data[j, "date"], symbol, r
       )
     }
     ifelse(length(trade_list) == 0, return(NULL), return(trade_list))
@@ -72,7 +72,7 @@ backtest <- function(
 
   trade <- rbindlist(trade_list) %>%
     as.data.frame() %>%
-    `colnames<-`(c("symbol", "buy", "sell", "r", "t")) %>%
+    `colnames<-`(c("buy", "sell", "symbol", "r")) %>%
     filter(r > -1 & buy < sell) %>%
     mutate(buy = as_date(buy), sell = as_date(sell))
   return(trade)

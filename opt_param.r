@@ -21,8 +21,9 @@ for (var1 in var_seq1) for (var2 in var_seq2) {
   assign(var_name1, var1)
   assign(var_name2, var2)
 
-  apy <- backtest() %>%
-    sample_apy(30, 1, 1000)
+  runtime <- system.time(apy <- backtest() %>% sample_apy(30, 1, 1000))
+  tsprint(glue("Total time: {runtime[3]} s."))
+
   out <- data.frame(
     t_adx, t_cci, xa_thr, xb_thr, t_max, r_max, r_min,
     apy_mean = mean(apy$apy), apy_sd = sd(apy$apy)
@@ -37,5 +38,4 @@ for (var1 in var_seq1) for (var2 in var_seq2) {
       row.names = FALSE, col.names = FALSE
     )
   }
-  print(unname(out), row.names = FALSE)
 }

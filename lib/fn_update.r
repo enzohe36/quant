@@ -67,6 +67,7 @@ update <- function(
     .packages = c("jsonlite", "RCurl", "tidyverse")
   ) %dopar% {
     rm("fundflow")
+
     fundflow <- em_fundflow(indicator, fundflow_dict) %>%
       .[.$symbol %in% symbol_list, ]
     return(fundflow)
@@ -136,37 +137,41 @@ update <- function(
 
   portfolio <- read.csv(
     portfolio_path,
-    colClasses = c(date = "Date", symbol = "character")
+    colClasses = c(buy = "Date", symbol = "character")
   )
   if (nrow(portfolio) == 0) return(out)
 
   df <- data.frame()
-  for (symbol in portfolio$symbol) {
-    df_symbol <- portfolio[portfolio$symbol == symbol, ]
+  for (portfolio_i in split(portfolio, portfolio$symbol)) {
+    symbol <- portfolio_i$symbol
     data <- .data_list[[symbol]]
-
-    i <- which(data$date == df_symbol$date)
-    if (length(i) == 0) {
-      stop(glue("Buy date of {symbol} does not exist"))
+    if (!any(data$date == portfolio_i$buy)) {
+      stop(glue("Purchase date of {symbol} does not exist"))
     }
-    j <- nrow(data)
-    r <- ROR(df_symbol$cost, data[j, "close"])
+    r <- ROR(portfolio_i$cost, last(data$close))
     df <- rbind(
       df, list(
-        df_symbol$date,
+        portfolio_i$buy,
         symbol,
         latest[latest$symbol == symbol, "name"],
-        df_symbol$cost,
+        portfolio_i$cost,
         r,
-        ifelse(r >= r_max | r <= r_min | j - i >= t_max, "SELL", "HOLD")
+        ifelse(
+          r >= r_max | r <= r_min | last(data$date) - portfolio_i$buy >= t_max,
+          "SELL",
+          "HOLD"
+        )
       )
     )
   }
-  colnames(df) <- c("date", "symbol", "name", "cost", "r", "action")
-  df$date <- as.character(as.Date(df$date))
-  df <- arrange(df, desc(action), desc(r))
-  df[, c("cost", "r")] <- format(round(df[, c("cost", "r")], 3), nsmall = 3)
-  rownames(df) <- seq_len(nrow(df))
+  df <- `colnames<-`(df, c("buy", "symbol", "name", "cost", "r", "action")) %>%
+    arrange(desc(action), desc(r)) %>%
+    mutate(
+      buy = as.character(as_date(buy)),
+      cost = format(round(cost, 3), nsmall = 3),
+      r = format(round(r, 3), nsmall = 3)
+    ) %>%
+    `rownames<-`(seq_len(nrow(.)))
 
   v <- which(df$action == "SELL")
   if (length(v) != 0) {

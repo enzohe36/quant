@@ -1,43 +1,46 @@
 buy <- function(
-  symbol, cost = NaN, date = NA,
+  symbol, cost = NaN, buy = NA,
   .latest = latest,
   portfolio_path = "assets/portfolio.csv"
 ) {
   symbol <- formatC(as.integer(symbol), width = 6, format = "d", flag = "0")
-  try(date <- ymd(date), silent = TRUE)
+  try(buy <- ymd(buy), silent = TRUE)
 
-  if (!file.exists(portfolio_path)) portfolio <- data.frame()
-
-  portfolio <- read.csv(
-    portfolio_path,
-    colClasses = c(date = "Date", symbol = "character")
-  )
+  if (!file.exists(portfolio_path)) {
+    portfolio <- data.frame(matrix(ncol = 4)) %>%
+      `colnames<-`(c("buy", "symbol", "name", "cost")) %>%
+      na.omit()
+    write.csv(portfolio, portfolio_path, quote = FALSE, row.names = FALSE)
+  } else {
+    portfolio <- read.csv(
+      portfolio_path,
+      colClasses = c(buy = "Date", symbol = "character")
+    )
+  }
 
   df <- portfolio[portfolio$symbol == symbol, ]
   if (nrow(df) == 0) {
     portfolio <- rbind(
       portfolio,
       list(
-        ifelse(is.na(date), bizday(), date),
-        symbol,
-        .latest[.latest$symbol == symbol, "name"],
-        cost
+        buy = ifelse(is.na(buy), bizday(), buy),
+        symbol = symbol,
+        name = .latest[.latest$symbol == symbol, "name"],
+        cost = cost
       )
-    )
-    colnames(portfolio) <- c("date", "symbol", "name", "cost")
-    portfolio$date <- as.Date(portfolio$date)
+    ) %>%
+      mutate(buy = as_date(buy))
   } else {
     portfolio[portfolio$symbol == symbol, ] <- list(
-      ifelse(is.na(date), df$date, date),
+      ifelse(is.na(buy), df$buy, buy),
       symbol,
       .latest[.latest$symbol == symbol, "name"],
       ifelse(is.na(cost), df$cost, cost)
     )
   }
-  portfolio <- portfolio[order(portfolio$symbol), ]
-  portfolio$cost <- format(round(portfolio$cost, 3), nsmall = 3)
+  portfolio <- arrange(portfolio, symbol) %>%
+    mutate(cost = format(round(cost, 3), nsmall = 3)) %>%
+    `rownames<-`(seq_len(nrow(.)))
   write.csv(portfolio, portfolio_path, quote = FALSE, row.names = FALSE)
-
-  rownames(portfolio) <- seq_len(nrow(portfolio))
   print(portfolio)
 }

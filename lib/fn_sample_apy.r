@@ -1,6 +1,8 @@
 sample_apy <- function(
   .trade = trade, n_portfolio, t, n_sample
 ) {
+  tsprint("Started sample_apy().")
+
   start_date_list <- filter(.trade, buy <= last(sell) %m-% years(t)) %>%
     .$buy %>%
     unique() %>%
@@ -15,6 +17,11 @@ sample_apy <- function(
     .init = list(list(), list()),
     .packages = "tidyverse"
   ) %dopar% {
+    rm(
+      "end_date", "i", "portfolio", "portfolio_rem", "r",
+      "trade_t", "trade_x", "x"
+    )
+
     end_date <- start_date %m+% years(1)
 
     portfolio <- filter(
@@ -34,11 +41,12 @@ sample_apy <- function(
       portfolio <- portfolio[!seq_len(nrow(portfolio)) %in% i, , drop = FALSE]
       portfolio_rem <- n_portfolio - nrow(portfolio)
       if (portfolio_rem > 0) {
-        trade_t_x <- trade_t[trade_t[, "buy"] == x, , drop = FALSE] %>%
+        trade_x <- trade_t[trade_t[, "buy"] == x, , drop = FALSE] %>%
           .[seq_len(min(nrow(.), portfolio_rem)), ]
-        portfolio <- rbind(portfolio, trade_t_x)
+        portfolio <- rbind(portfolio, trade_x)
       }
     }
+
     return(list(start_date, r / n_portfolio / t))
   }
   unregister_dopar

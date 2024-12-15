@@ -29,7 +29,6 @@ load_data <- function(
     if (is.na(start_date)) start_date <- data[1, "date"]
     if (is.na(end_date)) end_date <- data[nrow(data), "date"]
     data <- data[data$date >= start_date & data$date <= end_date, ]
-
     return(data)
   }
   unregister_dopar
