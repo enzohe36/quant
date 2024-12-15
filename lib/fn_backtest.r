@@ -13,33 +13,56 @@ backtest <- function(
   trade_list <- foreach(
     data = .data_list,
     .combine = append,
-    .export = c(
-      "get_predictor", "normalize", "tnormalize", "ADX", "ROR"
-    ),
+    .export = c("normalize", "tnormalize", "ADX", "ROR"),
     .packages = c("TTR", "signal", "tidyverse")
   ) %dopar% {
-    rm("i", "j", "r", "trade_list")
+    symbol <- data[1, "symbol"]
 
-    symbol <- data[1, 2]
+    data_name <- c("date", "open", "high", "low", "close", "volume")
+    data <- data.matrix(data)[, data_name]
 
-    data <- get_predictor(data, .t_adx, .t_cci) %>%
-      na.omit() %>%
-      data.matrix()
-    if (nrow(data) == 0) return(NULL)
+    error <- try(
+      {
+        adx <- ADX(data[, c("high", "low", "close")])
+        cci_n <- (
+          1 - 2 * tnormalize(CCI(data[, c("high", "low", "close")]), .t_cci)
+        )
+
+        predictor_list <- list() %>%
+          c(xa = list((1 - normalize(abs(adx$adx - adx$adxr))) * cci_n)) %>%
+          c(xa1 = list(lag(.$xa, 1))) %>%
+          c(xad = list(momentum(.$xa, 5))) %>%
+          c(xb = list(tnormalize(adx$adx, .t_adx) * cci_n)) %>%
+          c(xb1 = list(lag(.$xb, 1))) %>%
+          c(xbd = list(abs(momentum(.$xb, 5)) - abs(momentum(.$xb, 1)))) %>%
+          c(sg = list(sgolayfilt(data[, "close"], n = 7))) %>%
+          c(sgd = list(ROR(lag(.$sg, 10), .$sg)))
+      },
+      silent = TRUE
+    )
+    if (class(error) == "try-error") {
+      predictor_name <- c("xa", "xa1", "xad", "xb", "xb1", "xbd", "sg", "sgd")
+      predictor_list <- lapply(
+        predictor_name, function(str) rep(NaN, length(date))
+      ) %>%
+        `names<-`(predictor_name)
+    }
+
+    if (any(sapply(predictor_list, function(v) all(is.na(v))))) return(NULL)
 
     trade_list <- list()
     for (
       i in which(
         (
-          data[, "xa"] >= .xa_thr &
-            data[, "xa1"] < .xa_thr &
-            data[, "xad"] > 0 &
-            data[, "sgd"] <= 0
+          predictor_list$xa >= .xa_thr &
+            predictor_list$xa1 < .xa_thr &
+            predictor_list$xad > 0 &
+            predictor_list$sgd <= 0
         ) | (
-          data[, "xb"] >= .xb_thr &
-            data[, "xb1"] < .xb_thr &
-            data[, "xbd"] > 0 &
-            data[, "sgd"] <= 0
+          predictor_list$xb >= .xb_thr &
+            predictor_list$xb1 < .xb_thr &
+            predictor_list$xbd > 0 &
+            predictor_list$sgd <= 0
         )
       )
     ) {
