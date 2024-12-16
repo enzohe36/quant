@@ -1,7 +1,7 @@
 load_data <- function(
   pattern, adjust, start_date = NA, end_date = NA,
-  symbol_list_path = "assets/symbol_list.csv",
   data_dir = paste0("data_", adjust, "/"),
+  symbol_list_path = paste0(data_dir, "symbol_list.csv"),
   data_path_expr = expression(paste0(data_dir, symbol, ".csv"))
 ) {
   tsprint("Started load_data().")

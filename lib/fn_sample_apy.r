@@ -1,8 +1,6 @@
 sample_apy <- function(
   .trade = trade, n_portfolio, t, n_sample
 ) {
-  tsprint("Started sample_apy().")
-
   start_date_list <- filter(.trade, buy <= last(sell) %m-% years(t)) %>%
     .$buy %>%
     unique() %>%

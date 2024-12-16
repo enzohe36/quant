@@ -6,13 +6,16 @@ update <- function(
   tsprint("Started update().")
 
   # Define parameters
-  t_adx <- 15
-  t_cci <- 30
-  xa_thr <- 0.5
-  xb_thr <- 0.5
-  t_max <- 105
-  r_max <- 0.09
-  r_min <- -0.5
+  t_adx <- 143
+  t_cci <- 156
+  t_xad <- 5
+  t_xbd <- 2
+  t_sgd <- 16
+  xa_thr <- 0.4
+  xb_thr <- 0.27
+  t_max <- 52
+  r_max <- 0.06
+  r_min <- -0.54
 
   symbol_list <- names(.data_list)
   out <- em_data_update()
@@ -44,7 +47,7 @@ update <- function(
     }
     if (any(is.na(data[nrow(data), ]))) data <- data[-nrow(data), ]
 
-    data <- get_predictor(data, t_adx, t_cci)
+    data <- get_predictor(data, t_adx, t_cci, t_xad, t_xbd, t_sgd)
 
     lst <- list()
     lst[[symbol]] <- data

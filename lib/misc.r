@@ -143,7 +143,7 @@ em_index <- function(symbol) {
   return(data)
 }
 
-get_predictor <- function(data, t_adx, t_cci) {
+get_predictor <- function(data, t_adx, t_cci, t_xad, t_xbd, t_sgd) {
   error <- try(
     {
       adx <- ADX(data[, c("high", "low", "close")])
@@ -152,12 +152,12 @@ get_predictor <- function(data, t_adx, t_cci) {
       )
       data$xa <- (1 - normalize(abs(adx$adx - adx$adxr))) * cci_n
       data$xa1 <- lag(data$xa, 1)
-      data$xad <- momentum(data$xa, 5)
+      data$xad <- momentum(data$xa, t_xad)
       data$xb <- tnormalize(adx$adx, t_adx) * cci_n
       data$xb1 <- lag(data$xb, 1)
-      data$xbd <- abs(momentum(data$xb, 5)) - abs(momentum(data$xb, 1))
+      data$xbd <- abs(momentum(data$xb, t_xbd)) - abs(momentum(data$xb, 1))
       data$sg <- sgolayfilt(data$close, n = 7)
-      data$sgd <- ROR(lag(data$sg, 10), data$sg)
+      data$sgd <- ROR(lag(data$sg, t_sgd), data$sg)
     },
     silent = TRUE
   )

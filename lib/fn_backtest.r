@@ -2,6 +2,9 @@ backtest <- function(
   .data_list = data_list,
   .t_adx = t_adx,
   .t_cci = t_cci,
+  .t_xad = t_xad,
+  .t_xbd = t_xbd,
+  .t_sgd = t_sgd,
   .xa_thr = xa_thr,
   .xb_thr = xb_thr,
   .t_max = t_max,
@@ -22,7 +25,7 @@ backtest <- function(
 
     symbol <- data[1, 2]
 
-    data <- get_predictor(data, .t_adx, .t_cci) %>%
+    data <- get_predictor(data, .t_adx, .t_cci, .t_xad, .t_xbd, .t_sgd) %>%
       na.omit() %>%
       data.matrix()
     if (nrow(data) == 0) return(NULL)
