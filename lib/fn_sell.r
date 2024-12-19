@@ -3,7 +3,7 @@ sell <- function(
   portfolio_path = "assets/portfolio.csv"
 ) {
   portfolio <- read.csv(
-    portfolio_path, colClasses = c(buy = "Date", symbol = "character")
+    portfolio_path, colClasses = c(date = "Date", symbol = "character")
   )
 
   if(length(c(...)) != 0) {

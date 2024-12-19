@@ -1,41 +1,41 @@
 buy <- function(
-  symbol, cost = NaN, buy = NA,
-  .latest = latest,
+  symbol, cost = NaN, date = NA,
+  latest = get("latest", envir = .GlobalEnv),
   portfolio_path = "assets/portfolio.csv"
 ) {
   symbol <- formatC(as.integer(symbol), width = 6, format = "d", flag = "0")
-  try(buy <- ymd(buy), silent = TRUE)
+  date <- ymd(date)
 
-  if (!file.exists(portfolio_path)) {
-    portfolio <- data.frame(matrix(ncol = 4)) %>%
-      `colnames<-`(c("buy", "symbol", "name", "cost")) %>%
-      na.omit()
-    write.csv(portfolio, portfolio_path, quote = FALSE, row.names = FALSE)
-  } else {
+  if (file.exists(portfolio_path)) {
     portfolio <- read.csv(
       portfolio_path,
-      colClasses = c(buy = "Date", symbol = "character")
+      colClasses = c(date = "Date", symbol = "character")
     )
+  } else {
+    portfolio <- data.frame(matrix(ncol = 4)) %>%
+      `colnames<-`(c("date", "symbol", "name", "cost")) %>%
+      na.omit()
+    write.csv(portfolio, portfolio_path, quote = FALSE, row.names = FALSE)
   }
 
-  df <- portfolio[portfolio$symbol == symbol, ]
-  if (nrow(df) == 0) {
+  portfolio_i <- portfolio[portfolio$symbol == symbol, ]
+  if (nrow(portfolio_i) == 0) {
     portfolio <- rbind(
       portfolio,
       list(
-        buy = ifelse(is.na(buy), bizday(), buy),
+        date = ifelse(is.na(date), as_tdate(today()), date),
         symbol = symbol,
-        name = .latest[.latest$symbol == symbol, "name"],
+        name = latest[latest$symbol == symbol, "name"],
         cost = cost
       )
     ) %>%
-      mutate(buy = as_date(buy))
+      mutate(date = as_date(date))
   } else {
     portfolio[portfolio$symbol == symbol, ] <- list(
-      ifelse(is.na(buy), df$buy, buy),
-      symbol,
-      .latest[.latest$symbol == symbol, "name"],
-      ifelse(is.na(cost), df$cost, cost)
+      date = ifelse(is.na(date), portfolio_i$date, date),
+      symbol = symbol,
+      name = latest[latest$symbol == symbol, "name"],
+      cost = ifelse(is.na(cost), portfolio_i$cost, cost)
     )
   }
   portfolio <- arrange(portfolio, symbol) %>%

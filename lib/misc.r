@@ -32,9 +32,8 @@ ADX <- function(hlc, n = 14, m = 6) {
   din <- dmn / tr
   adx <- SMA(abs(dip - din) / (dip + din), m)
   adxr <- (adx + lag(adx, m)) / 2
-  df <- data.frame(adx, adxr)
-  colnames(df) <- c("adx", "adxr")
-  return(df)
+  out <- data.frame(adx, adxr) %>% `colnames<-`(c("adx", "adxr"))
+  return(out)
 }
 
 ROR <- function(v1, v2) {
@@ -54,15 +53,9 @@ tsprint <- function(v) {
   writeLines(v)
 }
 
-bizday <- function(date = NA) {
-  date <- ymd(date)
-  if (is.na(date)) date <- as_date(now() - hours(16))
-  if (wday(date) == 1) date <- date - days(2)
-  if (wday(date) == 7) date <- date - days(1)
-  return(date)
-}
-
 em_data <- function(symbol, adjust, start_date, end_date) {
+  # [1]   日期 股票代码 开盘 收盘 最高 最低 成交量 成交额 振幅 涨跌幅
+  # [11]  涨跌额 换手率
   data <- fromJSON(
     getForm(
       uri = "http://127.0.0.1:8080/api/public/stock_zh_a_hist",
@@ -72,38 +65,54 @@ em_data <- function(symbol, adjust, start_date, end_date) {
       end_date = end_date,
       .encoding = "utf-8"
     )
-  )
-  # [1]   日期 股票代码 开盘 收盘 最高 最低 成交量 成交额 振幅 涨跌幅
-  # [11]  涨跌额 换手率
-  data <- data[, c(1, 2, 3, 5, 6, 4, 7)]
-  colnames(data) <- c(
-    "date", "symbol", "open", "high", "low", "close", "volume"
-  )
-  data$date <- as.Date(data$date)
+  ) %>%
+    select(c(1, 2, 3, 5, 6, 4, 7)) %>%
+    `colnames<-`(
+      c("date", "symbol", "open", "high", "low", "close", "volume")
+    ) %>%
+    mutate(
+      date = as_date(date),
+      open = as.numeric(open),
+      high = as.numeric(high),
+      low = as.numeric(low),
+      close = as.numeric(close),
+      volume = as.numeric(volume)
+    )
   return(data)
 }
 
 em_data_update <- function() {
+  # [1]   序号 代码 名称 最新价 涨跌幅 涨跌额 成交量 成交额 振幅 最高
+  # [11]  最低 今开 昨收 量比 换手率 市盈率-动态 市净率 总市值 流通市值 涨速
+  # [21]  5分钟涨跌 60日涨跌幅 年初至今涨跌幅 date
   df <- fromJSON(
     getForm(
       uri = "http://127.0.0.1:8080/api/public/stock_zh_a_spot_em",
       .encoding = "utf-8"
     )
   )
-  df <- mutate(df, date = bizday())
-  # [1]   序号 代码 名称 最新价 涨跌幅 涨跌额 成交量 成交额 振幅 最高
-  # [11]  最低 今开 昨收 量比 换手率 市盈率-动态 市净率 总市值 流通市值 涨速
-  # [21]  5分钟涨跌 60日涨跌幅 年初至今涨跌幅 date
-  data_update <- df[, c(24, 2, 12, 10, 11, 4, 7)]
-  colnames(data_update) <- c(
-    "date", "symbol", "open", "high", "low", "close", "volume"
-  )
-  data_name <- df[, c(2, 3)]
-  colnames(data_name) <- c("symbol", "name")
-  return(list(data_update, data_name))
+  data_update <- mutate(df, date = as_tdate(today())) %>%
+    select(c(24, 2, 12, 10, 11, 4, 7)) %>%
+    `colnames<-`(
+      c("date", "symbol", "open", "high", "low", "close", "volume")
+    ) %>%
+    mutate(
+      date = as_date(date),
+      open = as.numeric(open),
+      high = as.numeric(high),
+      low = as.numeric(low),
+      close = as.numeric(close),
+      volume = as.numeric(volume)
+    )
+  data_name <- select(df, c(2, 3)) %>%
+    `colnames<-`(c("symbol", "name"))
+  return(list(data_update = data_update, data_name = data_name))
 }
 
-em_fundflow <- function(indicator, fundflow_dict) {
+em_fundflow <- function(indicator, header = indicator) {
+  # [1]   序号 代码 名称 最新价 涨跌幅
+  # [6]   主力净流入额 主力净流入占比 超大单净流入额 超大单净流入占比 大单净流入额
+  # [11]  大单净流入占比 中单净流入额 中单净流入占比 小单净流入额 小单净流入占比
   fundflow <- fromJSON(
     getForm(
       uri = paste0(
@@ -112,34 +121,39 @@ em_fundflow <- function(indicator, fundflow_dict) {
       indicator = indicator,
       .encoding = "utf-8"
     )
-  )
-  # [1]   序号 代码 名称 最新价 涨跌幅
-  # [6]   主力净流入额 主力净流入占比 超大单净流入额 超大单净流入占比 大单净流入额
-  # [11]  大单净流入占比 中单净流入额 中单净流入占比 小单净流入额 小单净流入占比
-  fundflow <- fundflow[, c(2, 7)]
-  header <- fundflow_dict[fundflow_dict$indicator == indicator, "header"]
-  colnames(fundflow) <- c("symbol", header)
-  fundflow[, header] <- as.numeric(fundflow[, header])
+  ) %>%
+    select(c(2, 7)) %>%
+    `colnames<-`(c("symbol", header)) %>%
+    mutate(!!header := as.numeric(.[, header]))
   return(fundflow)
 }
 
 em_index <- function(symbol) {
+  symbol <- ifelse(
+    grepl("^399", symbol), paste0("sz", symbol), paste0("sh", symbol)
+  )
+
+  # [1]   date open close high low volume amount symbol
   data <- fromJSON(
     getForm(
       uri = "http://127.0.0.1:8080/api/public/stock_zh_index_daily_em",
-      symbol = ifelse(
-        grepl("^399", symbol), paste0("sz", symbol), paste0("sh", symbol)
-      ),
+      symbol = symbol,
       .encoding = "utf-8"
     )
-  )
-  data <- mutate(data, symbol = symbol)
-  # [1]   date open close high low volume amount symbol
-  data <- data[, c(1, 8, 2, 4, 5, 3, 6)]
-  colnames(data) <- c(
-    "date", "symbol", "open", "high", "low", "close", "volume"
-  )
-  data$date <- as.Date(data$date)
+  ) %>%
+    mutate(symbol = symbol) %>%
+    select(c(1, 8, 2, 4, 5, 3, 6)) %>%
+    `colnames<-`(
+      c( "date", "symbol", "open", "high", "low", "close", "volume")
+    ) %>%
+    mutate(
+      date = as_date(date),
+      open = as.numeric(open),
+      high = as.numeric(high),
+      low = as.numeric(low),
+      close = as.numeric(close),
+      volume = as.numeric(volume)
+    )
   return(data)
 }
 

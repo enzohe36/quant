@@ -1,7 +1,7 @@
 update <- function(
-  .data_list = data_list,
-  portfolio_path = "assets/portfolio.csv",
-  ranking_path = "tmp/ranking.txt"
+  data_list = get("data_list", envir = .GlobalEnv),
+  ranking_path = "tmp/ranking.txt",
+  portfolio_path = "assets/portfolio.csv"
 ) {
   tsprint("Started update().")
 
@@ -11,38 +11,41 @@ update <- function(
   t_xad <- 5
   t_xbd <- 2
   t_sgd <- 16
-  xa_thr <- 0.4
-  xb_thr <- 0.27
+  xa_h <- 0.4
+  xb_h <- 0.27
   t_max <- 52
   r_max <- 0.06
   r_min <- -0.54
 
-  symbol_list <- names(.data_list)
+  symbol_list <- names(data_list)
   out <- em_data_update()
-  data_update <- out[[1]] %>% .[.$symbol %in% symbol_list, ]
-  data_name <- out[[2]]
+  data_update <- out[["data_update"]] %>% filter(symbol %in% symbol_list)
+  data_name <- out[["data_name"]]
 
   cl <- makeCluster(detectCores() - 1)
   registerDoParallel(cl)
-  .data_list <- foreach(
-    symbol = symbol_list,
-    .combine = append,
-    .export = c(
-      "get_predictor", "normalize", "tnormalize", "ADX", "ROR"
-    ),
+  data_list <- foreach(
+    data = data_list,
+    .combine = "c",
+    .export = c("normalize", "tnormalize", "ADX", "ROR", "get_predictor"),
     .packages = c("TTR", "signal", "tidyverse")
   ) %dopar% {
-    rm("data", "df", "lst")
+    rm("data_update_i", "lst", "symbol")
 
-    data <- .data_list[[symbol]]
-    df <- data_update[data_update$symbol == symbol, ]
+    symbol <- data[1, 2]
+
+    data_update_i <- data_update[data_update$symbol == symbol, ]
     if (
-      !all((data[nrow(data), 2:7] == df[, 2:7]) %in% TRUE)
+      !all(
+        select(data[nrow(data), ], is.numeric) ==
+          select(data_update_i, is.numeric)
+      ) %in%
+        TRUE
     ) {
       ifelse(
-        data[nrow(data), "date"] == df$date,
-        data[nrow(data), ] <- df,
-        data <- bind_rows(data, df)
+        data[nrow(data), "date"] == data_update_i$date,
+        data[nrow(data), ] <- data_update_i,
+        data <- rbind(data, data_update_i)
       )
     }
     if (any(is.na(data[nrow(data), ]))) data <- data[-nrow(data), ]
@@ -55,7 +58,7 @@ update <- function(
   }
   unregister_dopar
 
-  tsprint(glue("Checked {length(.data_list)} stocks for update."))
+  tsprint(glue("Checked {length(data_list)} stocks for update."))
 
   fundflow_dict <- data.frame(
     indicator = c("今日", "3日", "5日", "10日"),
@@ -69,58 +72,59 @@ update <- function(
     .export = "em_fundflow",
     .packages = c("jsonlite", "RCurl", "tidyverse")
   ) %dopar% {
-    rm("fundflow")
+    rm("fundflow", "header")
 
-    fundflow <- em_fundflow(indicator, fundflow_dict) %>%
-      .[.$symbol %in% symbol_list, ]
+    header <- fundflow_dict[fundflow_dict$indicator == indicator, "header"]
+
+    fundflow <- em_fundflow(indicator, header) %>%
+      filter(symbol %in% symbol_list) %>%
+      mutate
+    fundflow[, header] <- fundflow[, header] / 100
     return(fundflow)
   }
   unregister_dopar
 
   fundflow <- reduce(fundflow, full_join, by = "symbol")
-  fundflow[, fundflow_dict$header] <- fundflow[, fundflow_dict$header] / 100
   tsprint(glue("Found fundflow of {nrow(fundflow)} stocks."))
 
-  latest <- bind_rows(
+  latest <- rbindlist(
     lapply(
-      .data_list,
-      function(df) {
-        merge(data_name, df[nrow(df), ], by = "symbol") %>%
-          merge(fundflow, by = "symbol")
-      }
+      data_list,
+      function(df, data_name, fundflow) {
+        symbol <- df[1, "symbol"]
+        out <- df[nrow(df), ] %>%
+          mutate(
+            name = filter(data_name, symbol == !!symbol) %>% pull(name),
+            .after = symbol
+          ) %>%
+          cbind(filter(fundflow, symbol == !!symbol) %>% select(!symbol))
+        return(out)
+      },
+      data_name, fundflow
     )
-  )
-  # [1]   symbol name date open high low close volume xa xa1
-  # [11]  xad xb xb1 xbd sgd in1 in3 in5 in10
-  latest <- latest[, c(3, 1, 2, 4:ncol(latest))]
-  latest$score <- apply(
-    latest[, fundflow_dict$header], 1, function(v) {
-      v[1] * 0.4 + v[2] * 0.3 + v[3] * 0.2 + v[4] * 0.1
-    }
-  )
-  latest <- latest[order(latest$score, decreasing = TRUE), ]
+  ) %>%
+    rowwise %>%
+    mutate(r = close / open - 1, .after = volume) %>%
+    mutate(score = in1 * 0.4 + in3 * 0.3 + in5 * 0.2 + in10 * 0.1) %>%
+    as.data.frame()
 
   dir.create("tmp/")
 
-  ranking <- latest[
-    (
-      (latest$xa >= xa_thr & latest$xa1 < xa_thr & latest$xad > 0) |
-        (latest$xb >= xb_thr & latest$xb1 < xb_thr & latest$xbd > 0)
-    ) & (
-      latest$sgd <= 0
-    ),
-  ] %>%
-    .[order(desc(.$score)), ] %>%
-    na.omit(.) %>%
-    .[,
-      colnames(.) %in% c(
-        "date", "symbol", "name",
-        "xa", "xb", "sgd", fundflow_dict$header, "score"
-      )
-    ]
-  ranking[, sapply(ranking, is.numeric)] <- format(
-    round(ranking[, sapply(ranking, is.numeric)], 2), nsmall = 2
-  )
+  ranking <- filter(
+    latest,
+    r <= 0.05 &
+      (
+        (xa >= xa_h & xa1 < xa_h & xad > 0) |
+          (xb >= xb_h & xb1 < xb_h & xbd > 0)
+      ) &
+      sgd <= 0
+  ) %>%
+    arrange(desc(score)) %>%
+    na.omit() %>%
+    select(date, symbol, name, r, xa, xb, in1, in3, in5, in10, score) %>%
+    mutate(across(where(is.numeric), round, 3)) %>%
+    mutate(across(where(is.numeric), format, nsmall = 2)) %>%
+    as.data.frame()
   cat(
     capture.output(print(ranking, row.names = FALSE)) %>%
       gsub("     name", "    name", .) %>%
@@ -135,58 +139,61 @@ update <- function(
   )
 
   # Evaluate portfolio
-  out <- list(data_list = .data_list, latest = latest)
+  out <- list(data_list = data_list, latest = latest)
   if (!file.exists(portfolio_path)) return(out)
 
   portfolio <- read.csv(
     portfolio_path,
-    colClasses = c(buy = "Date", symbol = "character")
+    colClasses = c(date = "Date", symbol = "character")
   )
   if (nrow(portfolio) == 0) return(out)
 
-  df <- data.frame()
-  for (portfolio_i in split(portfolio, portfolio$symbol)) {
-    symbol <- portfolio_i$symbol
-    data <- .data_list[[symbol]]
-    if (!any(data$date == portfolio_i$buy)) {
-      stop(glue("Purchase date of {symbol} does not exist"))
-    }
-    r <- ROR(portfolio_i$cost, last(data$close))
-    df <- rbind(
-      df, list(
-        portfolio_i$buy,
-        symbol,
-        latest[latest$symbol == symbol, "name"],
-        portfolio_i$cost,
-        r,
-        ifelse(
-          r >= r_max | r <= r_min | last(data$date) - portfolio_i$buy >= t_max,
+  portfolio_eval <- lapply(
+    split(portfolio, portfolio$symbol),
+    function(df, data_name, data_list = get("data_list", envir = .GlobalEnv)) {
+      symbol <- df$symbol
+      data <- data_list[[symbol]]
+      if (!any(data$date == df$date)) stop(
+        glue("Purchase date of {symbol} not found")
+      )
+
+      r <- ROR(df$cost, last(data$close))
+      out <- list(
+        date = df$date,
+        symbol = symbol,
+        name = filter(data_name, symbol == !!symbol) %>% pull(name),
+        cost = df$cost,
+        r = r,
+        action = ifelse(
+          r >= r_max | r <= r_min | last(data$date) - df$date >= t_max,
           "SELL",
           "HOLD"
         )
       )
-    )
-  }
-  df <- `colnames<-`(df, c("buy", "symbol", "name", "cost", "r", "action")) %>%
+      return(out)
+    },
+    data_name
+  ) %>%
+    rbindlist() %>%
     arrange(desc(action), desc(r)) %>%
-    mutate(
-      buy = as.character(as_date(buy)),
-      cost = format(round(cost, 3), nsmall = 3),
-      r = format(round(r, 3), nsmall = 3)
-    ) %>%
-    `rownames<-`(seq_len(nrow(.)))
+    mutate(date = as.character(as_date(date))) %>%
+    mutate(across(where(is.numeric), round, 3)) %>%
+    mutate(across(where(is.numeric), format, nsmall = 2)) %>%
+    `rownames<-`(seq_len(nrow(.))) %>%
+    as.data.frame()
 
-  v <- which(df$action == "SELL")
+  v <- which(portfolio_eval$action == "SELL")
   if (length(v) != 0) {
-    df <- rbind(
-      df[v, ],
+    portfolio_eval <- rbind(
+      portfolio_eval[v, ],
       setNames(
-        data.frame(t(replicate(ncol(df), "")), row.names = ""), names(df)
+        data.frame(t(replicate(ncol(portfolio_eval), "")), row.names = ""),
+        names(portfolio_eval)
       ),
-      df[-v, ]
+      portfolio_eval[-v, ]
     )
   }
-  print(df)
+  print(portfolio_eval)
 
   return(out)
 }
