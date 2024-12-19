@@ -1,7 +1,7 @@
 sample_apy <- function(
-  .trade = trade, n_portfolio, t, n_sample
+  trade = get("trade", envir = .GlobalEnv), n_portfolio, t, n_sample
 ) {
-  start_date_list <- filter(.trade, buy <= last(sell) %m-% years(t)) %>%
+  start_date_list <- filter(trade, buy <= last(sell) %m-% years(t)) %>%
     .$buy %>%
     unique() %>%
     sample(n_sample, replace = TRUE)
@@ -23,12 +23,12 @@ sample_apy <- function(
     end_date <- start_date %m+% years(1)
 
     portfolio <- filter(
-      .trade, buy < start_date & sell >= start_date & sell <= end_date
+      trade, buy < start_date & sell >= start_date & sell <= end_date
     ) %>%
       slice_sample(n = min(nrow(.), n_portfolio)) %>%
       data.matrix()
 
-    trade_t <- filter(.trade, buy >= start_date & buy <= end_date) %>%
+    trade_t <- filter(trade, buy >= start_date & buy <= end_date) %>%
       slice_sample(n = nrow(.)) %>%
       data.matrix()
 
@@ -50,7 +50,7 @@ sample_apy <- function(
   unregister_dopar
 
   apy <- data.frame(
-    date = as.Date(unlist(out[[1]])), apy = unlist(out[[2]])
+    date = as_date(unlist(out[[1]])), apy = unlist(out[[2]])
   ) %>%
     na.omit %>%
     .[order(.$date), ]

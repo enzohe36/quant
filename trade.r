@@ -21,7 +21,7 @@ out <- update()
 data_list <- out[["data_list"]]
 latest <- out[["latest"]]
 
-# query(000001, 20240527)
+# query(000001, 20241219)
 
 # buy(000001, 12.345, 20240527)
 

@@ -5,3 +5,4 @@ data*/
 tmp/
 test*
 *.log*
+*.pdf

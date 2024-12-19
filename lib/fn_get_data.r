@@ -12,8 +12,8 @@ get_data <- function(
       uri = "http://127.0.0.1:8080/api/public/stock_info_a_code_name",
       .encoding = "utf-8"
     )
-  )
-  symbol_list <- symbol_list[, 1]
+  ) %>%
+    .[, 1]
   writeLines(symbol_list, symbol_list_path)
   tsprint(
     glue("Found {length(symbol_list)} stocks; wrote to {symbol_list_path}.")
@@ -49,10 +49,7 @@ get_data <- function(
         if (all(data[1, ] == data_old[nrow(data_old), ])) {
           data <- data[-1, ]
           write.table(
-            data,
-            data_path, append = TRUE,
-            quote = FALSE,
-            sep = ",",
+            data, data_path, append = TRUE, quote = FALSE, sep = ",",
             row.names = FALSE, col.names = FALSE
           )
           break
@@ -70,8 +67,7 @@ get_data <- function(
         break
       }
     }
-
-    ifelse(nrow(data) != 0, return(1), return(0))
+    ifelse(nrow(data) == 0, return(0), return(1))
   }
   unregister_dopar
 

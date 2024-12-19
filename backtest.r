@@ -20,8 +20,8 @@ t_cci <- 156
 t_xad <- 5
 t_xbd <- 2
 t_sgd <- 16
-xa_thr <- 0.4
-xb_thr <- 0.27
+xa_h <- 0.4
+xb_h <- 0.27
 t_max <- 52
 r_max <- 0.06
 r_min <- -0.54

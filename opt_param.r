@@ -36,7 +36,7 @@ if (!file.exists(param_path)) {
         for (str in names(v)) assign(str, v[str])
         apy <- backtest(
           data_list,
-          t_adx, t_cci, t_xad, t_xbd, t_sgd, xa_thr, xb_thr, t_max, r_max, r_min
+          t_adx, t_cci, t_xad, t_xbd, t_sgd, xa_h, xb_h, t_max, r_max, r_min
         ) %>%
           sample_apy(n_portfolio, t, n_sample)
         return(c(as.list(v), apy_mean = mean(apy$apy), apy_sd = sd(apy$apy)))
@@ -74,7 +74,7 @@ opt_param <- function(var) {
   round_assign(var_name, var, envir = .GlobalEnv)
   apy <- backtest(
     data_list,
-    t_adx, t_cci, t_xad, t_xbd, t_sgd, xa_thr, xb_thr, t_max, r_max, r_min
+    t_adx, t_cci, t_xad, t_xbd, t_sgd, xa_h, xb_h, t_max, r_max, r_min
   ) %>%
     sample_apy(n_portfolio, t, n_sample)
   assign("apy_mean", mean(apy$apy), envir = .GlobalEnv)
@@ -99,7 +99,7 @@ for (var_name in sample(var_dict$name, 3)) {
   score <- get_score()
   param_best <- param[score == max(score), ] %>%
     .[sample(nrow(.), 1), ]
-  param_init <- (tail(param, 1) + param_best) / 2
+  param_init <- (param[nrow(param), ] + param_best) / 2
   for (str in var_dict$name) {
     round_assign(str, param_init[, str], envir = .GlobalEnv)
   }
