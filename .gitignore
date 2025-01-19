@@ -3,6 +3,9 @@
 
 data*/
 tmp/
-test*
+old/
+models/
+
+temp*
 *.log*
 *.pdf
