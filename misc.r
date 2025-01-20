@@ -110,7 +110,6 @@ as_tradedate <- function(datetime) {
       )
     ) %>%
       as_date()
-    print("assigned globally")
   }
   tradedate <- lapply(
     date,
