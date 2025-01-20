@@ -15,7 +15,7 @@ tnormalize <- function(v, t) {
   (v - runMin(v, t)) / (runMax(v, t) - runMin(v, t))
 }
 
-get_roc <- function(v1, v2) {
+get_ror <- function(v1, v2) {
   (v2 - v1) / abs(v1)
 }
 
@@ -135,9 +135,9 @@ as_tradedate <- function(datetime) {
 
 get_index_comp <- function(symbol) {
   # 日期 指数代码 指数名称 指数英文名称 成分券代码 成分券名称 成分券英文名称 交易所
-  # 交易所英文名称
+  # 交易所英文名称 权重
   getForm(
-    uri = "http://127.0.0.1:8080/api/public/index_stock_cons_csindex",
+    uri = "http://127.0.0.1:8080/api/public/index_stock_cons_weight_csindex",
     symbol = symbol,
     .encoding = "utf-8"
   ) %>%
@@ -145,6 +145,19 @@ get_index_comp <- function(symbol) {
     mutate(
       symbol = `成分券代码`,
       name = `成分券名称`,
+      weight = `权重` / 100,
+      mkt = sapply(
+        symbol,
+        function(str) {
+          if (str_extract(str, "^.") == 0)
+            "sz_main" else if (str_extract(str, "^.") == 3)
+            "sz_chinext" else if (str_extract(str, "^.{2}") == 60)
+            "sh_main" else if (str_extract(str, "^.{2}") == 68)
+            "sh_star" else if (str_extract(str, "^.") == 8)
+            "bj_neeq" else NA
+        }
+      ),
+      mkt_abbr = sapply(mkt, function(str) str_extract(str, "^.{2}")),
       across(!matches("^[a-z0-9_]+$"), ~ NULL)
     )
 }
@@ -228,7 +241,7 @@ get_hist_cost <- function(symbol, adjust) {
     fromJSON() %>%
     mutate(
       date = as_date(`日期`),
-      avgcost = `平均成本`,
+      mktcost = `平均成本`,
       profitable = `获利比例`,
       cr70 = `70集中度`,
       cr90 = `90集中度`,
@@ -283,7 +296,7 @@ add_pctma <- function(data, var_list, lag_list) {
     for (pair in asplit(var_combn, 2)) {
       lag1 <- str_extract(pair[1], "[0-9]+")
       lag2 <- str_extract(pair[2], "[0-9]+")
-      data[, paste0(var, "_pctma", lag1, "_", lag2)] <- get_roc(
+      data[, paste0(var, "_pctma", lag1, "_", lag2)] <- get_ror(
         data[, pair[2]], data[, pair[1]]
       )
     }

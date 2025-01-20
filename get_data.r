@@ -7,6 +7,7 @@ library(foreach)
 library(RCurl)
 library(jsonlite)
 library(glue)
+library(data.table)
 library(tidyverse)
 
 source("misc.r", encoding = "UTF-8")
@@ -20,24 +21,25 @@ data_dir <- "data/"
 
 dir.create(data_dir)
 
-symbol_list <- foreach(
+symbol_dict <- foreach(
   index = index_list,
-  .combine = "c"
+  .combine = "append"
 ) %dofuture% {
   symbol_dict_path <- paste0(data_dir, "symbol_dict_", index, ".csv")
   symbol_dict <- get_index_comp(index)
   write.csv(symbol_dict, symbol_dict_path, quote = FALSE, row.names = FALSE)
-  return(symbol_dict$symbol)
-}
+  return(list(symbol_dict))
+} %>%
+  rbindlist()
 
-tsprint(glue("Found {length(symbol_list)} stocks."))
+tsprint(glue("Found {nrow(symbol_dict)} stocks."))
 
 period <- "daily"
 end_date <- as_tradedate(now() - hours(16))
 adjust <- "qfq"
 
 count <- foreach(
-  symbol = symbol_list,
+  symbol = symbol_dict$symbol,
   .combine = "c"
 ) %dofuture% {
   data_path <- paste0(data_dir, symbol, ".csv")
@@ -71,14 +73,9 @@ count <- foreach(
 
   hist_valuation <- get_hist_valuation(symbol)
 
-  market <- if (grepl("^(0|3)", symbol)) {
-    "sz"
-  } else if (grepl("^6", symbol)) {
-    "sh"
-  } else if (grepl("^8", symbol)) {
-    "bj"
-  }
-  hist_fundflow <- get_hist_fundflow(symbol, market)
+  hist_fundflow <- get_hist_fundflow(
+    symbol, symbol_dict$mkt_abbr[symbol_dict$symbol == symbol]
+  )
 
   hist_cost <- get_hist_cost(symbol, adjust)
 
