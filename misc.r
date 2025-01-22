@@ -15,7 +15,7 @@ tnormalize <- function(v, t) {
   (v - runMin(v, t)) / (runMax(v, t) - runMin(v, t))
 }
 
-get_ror <- function(v1, v2) {
+get_pctr <- function(v1, v2) {
   (v2 - v1) / abs(v1)
 }
 
@@ -230,7 +230,7 @@ get_hist_fundflow <- function(symbol, market) {
     )
 }
 
-get_hist_cost <- function(symbol, adjust) {
+get_hist_mktcost <- function(symbol, adjust) {
   # 日期 获利比例 平均成本 90成本-低 90成本-高 90集中度 70成本-低 70成本-高 70集中度
   getForm(
     uri = "http://127.0.0.1:8080/api/public/stock_cyq_em",
@@ -252,7 +252,7 @@ get_hist_cost <- function(symbol, adjust) {
 add_mom <- function(data, var_list, lag_list) {
   for (var in var_list) {
     for (i in lag_list) {
-      data[, paste0(var, "_mom", i)] <- momentum(data[, var], n = i)
+      data[, paste0(var, "_mom", i)] <- momentum(data[, var], i)
     }
   }
   return(data)
@@ -261,7 +261,7 @@ add_mom <- function(data, var_list, lag_list) {
 add_roc <- function(data, var_list, lag_list) {
   for (var in var_list) {
     for (i in lag_list) {
-      data[, paste0(var, "_roc", i)] <- ROC(data[, var], n = i)
+      data[, paste0(var, "_roc", i)] <- ROC(data[, var], i)
     }
   }
   return(data)
@@ -270,7 +270,7 @@ add_roc <- function(data, var_list, lag_list) {
 add_sd <- function(data, var_list, lag_list) {
   for (var in var_list) {
     for (i in lag_list) {
-      data[, paste0(var, "_sd", i)] <- runSD(data[, var], n = i)
+      data[, paste0(var, "_sd", i)] <- runSD(data[, var], i)
     }
   }
   return(data)
@@ -279,7 +279,7 @@ add_sd <- function(data, var_list, lag_list) {
 add_ma <- function(data, var_list, lag_list) {
   for (var in var_list) {
     for (i in lag_list) {
-      data[, paste0(var, "_ma", i)] <- SMA(data[, var], n = i)
+      data[, paste0(var, "_ma", i)] <- SMA(data[, var], i)
     }
   }
   return(data)
@@ -288,7 +288,7 @@ add_ma <- function(data, var_list, lag_list) {
 add_pctma <- function(data, var_list, lag_list) {
   for (var in var_list) {
     for (i in lag_list) {
-      data[, paste0(var, "_ma", i)] <- SMA(data[, var], n = i)
+      data[, paste0(var, "_ma", i)] <- SMA(data[, var], i)
     }
     var_combn <- combn(
       names(data) %>% .[grepl(paste0("^", var, "_ma"), .)], 2
@@ -296,7 +296,7 @@ add_pctma <- function(data, var_list, lag_list) {
     for (pair in asplit(var_combn, 2)) {
       lag1 <- str_extract(pair[1], "[0-9]+")
       lag2 <- str_extract(pair[2], "[0-9]+")
-      data[, paste0(var, "_pctma", lag1, "_", lag2)] <- get_ror(
+      data[, paste0(var, "_pctma", lag1, "_", lag2)] <- get_pctr(
         data[, pair[2]], data[, pair[1]]
       )
     }

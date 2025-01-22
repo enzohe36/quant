@@ -18,6 +18,7 @@ plan(multisession, workers = availableCores() - 1)
 
 index_list <- c("000300", "000905", "000852", "932000")
 data_dir <- "data/"
+symbol_dict_path <- paste0(data_dir, "symbol_dict.csv")
 
 dir.create(data_dir)
 
@@ -25,13 +26,11 @@ symbol_dict <- foreach(
   index = index_list,
   .combine = "append"
 ) %dofuture% {
-  symbol_dict_path <- paste0(data_dir, "symbol_dict_", index, ".csv")
   symbol_dict <- get_index_comp(index)
-  write.csv(symbol_dict, symbol_dict_path, quote = FALSE, row.names = FALSE)
   return(list(symbol_dict))
 } %>%
   rbindlist()
-
+write.csv(symbol_dict, symbol_dict_path, quote = FALSE, row.names = FALSE)
 tsprint(glue("Found {nrow(symbol_dict)} stocks."))
 
 period <- "daily"
@@ -77,10 +76,12 @@ count <- foreach(
     symbol, symbol_dict$mkt_abbr[symbol_dict$symbol == symbol]
   )
 
-  hist_cost <- get_hist_cost(symbol, adjust)
+  hist_mktcost <- get_hist_mktcost(symbol, adjust)
 
   data <- reduce(
-    list(hist, hist_valuation, hist_fundflow, hist_cost), left_join, by = "date"
+    list(hist, hist_valuation, hist_fundflow, hist_mktcost),
+    left_join,
+    by = "date"
   )
   if (append_tf) {
     write.table(
