@@ -2,6 +2,7 @@ Sys.setenv(TZ = "Asia/Shanghai")
 Sys.setlocale(locale = "Chinese")
 
 options(warn = -1)
+options(ranger.num.threads = availableCores(omit = 1))
 
 normalize <- function(v) {
   (v - min(v, na.rm = TRUE)) / (max(v, na.rm = TRUE) - min(v, na.rm = TRUE))
@@ -15,7 +16,7 @@ tnormalize <- function(v, t) {
   (v - runMin(v, t)) / (runMax(v, t) - runMin(v, t))
 }
 
-get_pctr <- function(v1, v2) {
+get_roc <- function(v1, v2) {
   (v2 - v1) / abs(v1)
 }
 
@@ -143,21 +144,13 @@ get_index_comp <- function(symbol) {
   ) %>%
     fromJSON() %>%
     mutate(
+      index = !!symbol,
       symbol = `成分券代码`,
       name = `成分券名称`,
       weight = `权重` / 100,
-      mkt = sapply(
-        symbol,
-        function(str) {
-          if (str_extract(str, "^.") == 0)
-            "sz_main" else if (str_extract(str, "^.") == 3)
-            "sz_chinext" else if (str_extract(str, "^.{2}") == 60)
-            "sh_main" else if (str_extract(str, "^.{2}") == 68)
-            "sh_star" else if (str_extract(str, "^.") == 8)
-            "bj_neeq" else NA
-        }
-      ),
-      mkt_abbr = sapply(mkt, function(str) str_extract(str, "^.{2}")),
+      mkt = ifelse(grepl("^(0|3)", symbol), "sz", NA) %>%
+        coalesce(ifelse(grepl("^6", symbol), "sh", NA)) %>%
+        coalesce(ifelse(grepl("^(4|8)", symbol), "bj", NA)),
       across(!matches("^[a-z0-9_]+$"), ~ NULL)
     )
 }
@@ -249,6 +242,15 @@ get_hist_mktcost <- function(symbol, adjust) {
     )
 }
 
+add_tnorm <- function(data, var_list, lag_list) {
+  for (var in var_list) {
+    for (i in lag_list) {
+      data[, paste0(var, "_tnorm", i)] <- tnormalize(data[, var], i)
+    }
+  }
+  return(data)
+}
+
 add_mom <- function(data, var_list, lag_list) {
   for (var in var_list) {
     for (i in lag_list) {
@@ -261,16 +263,7 @@ add_mom <- function(data, var_list, lag_list) {
 add_roc <- function(data, var_list, lag_list) {
   for (var in var_list) {
     for (i in lag_list) {
-      data[, paste0(var, "_roc", i)] <- ROC(data[, var], i)
-    }
-  }
-  return(data)
-}
-
-add_sd <- function(data, var_list, lag_list) {
-  for (var in var_list) {
-    for (i in lag_list) {
-      data[, paste0(var, "_sd", i)] <- runSD(data[, var], i)
+      data[, paste0(var, "_roc", i)] <- ROC(data[, var], i, "discrete")
     }
   }
   return(data)
@@ -291,16 +284,34 @@ add_pctma <- function(data, var_list, lag_list) {
       data[, paste0(var, "_ma", i)] <- SMA(data[, var], i)
     }
     var_combn <- combn(
-      names(data) %>% .[grepl(paste0("^", var, "_ma"), .)], 2
+      names(data) %>% .[grepl(paste0("^", var, "_ma[0-9]+$"), .)],
+      2,
+      simplify = FALSE
     )
-    for (pair in asplit(var_combn, 2)) {
-      lag1 <- str_extract(pair[1], "[0-9]+")
-      lag2 <- str_extract(pair[2], "[0-9]+")
-      data[, paste0(var, "_pctma", lag1, "_", lag2)] <- get_pctr(
-        data[, pair[2]], data[, pair[1]]
+    for (var_pair in var_combn) {
+      lag1 <- str_extract(var_pair[1], "[0-9]+")
+      lag2 <- str_extract(var_pair[2], "[0-9]+")
+      data[, paste0(var, "_pctma", lag1, "_", lag2)] <- get_roc(
+        data[, var_pair[2]], data[, var_pair[1]]
       )
     }
-    data <- select(data, !matches(paste0("^", var, "_ma")))
+    data <- select(data, !matches(paste0("^", var, "_ma[0-9]+$")))
   }
   return(data)
+}
+
+add_sd <- function(data, var_list, lag_list) {
+  for (var in var_list) {
+    for (i in lag_list) {
+      data[, paste0(var, "_sd", i)] <- runSD(data[, var], i)
+    }
+  }
+  return(data)
+}
+
+fit_normal <- function(x, y) {
+  nls(
+    y ~ 1 / (s * sqrt(2 * pi)) * exp(-1 / 2 * ((x - m) / s) ^ 2),
+    start = c(s = 1, m = 0)
+  )
 }
