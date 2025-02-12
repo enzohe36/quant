@@ -4,12 +4,14 @@ Sys.setlocale(locale = "Chinese")
 options(warn = -1)
 options(ranger.num.threads = availableCores(omit = 1))
 
-normalize <- function(v) {
-  (v - min(v, na.rm = TRUE)) / (max(v, na.rm = TRUE) - min(v, na.rm = TRUE))
-}
-
-normalize0 <- function(v) {
-  (0 - min(v, na.rm = TRUE)) / (max(v, na.rm = TRUE) - min(v, na.rm = TRUE))
+normalize <- function(v, range = c(0, 1), h = NULL) {
+  min <- min(v, na.rm = TRUE)
+  max <- max(v, na.rm = TRUE)
+  range_min <- min(range, na.rm = TRUE)
+  range_max <- max(range, na.rm = TRUE)
+  if (!is.null(h)) v <- h
+  v_norm <- (v - min) / (max - min) * (range_max - range_min) + range_min
+  return(v_norm)
 }
 
 tnormalize <- function(v, t) {
@@ -134,6 +136,24 @@ as_tradedate <- function(datetime) {
   )
 }
 
+get_index <- function(symbol, mkt, start_date, end_date) {
+  # date open close high low volume amount
+  getForm(
+    uri = "http://127.0.0.1:8080/api/public/stock_zh_index_daily_em",
+    symbol = paste0(mkt, symbol),
+    start_date = format(start_date, "%Y%m%d"),
+    end_date = format(end_date, "%Y%m%d"),
+    .encoding = "utf-8"
+  ) %>%
+    fromJSON() %>%
+    mutate(
+      date = as_date(date),
+      vol = volume,
+      val = amount
+    ) %>%
+    select(date, open, high, low, close, vol, val)
+}
+
 get_index_comp <- function(symbol) {
   # 日期 指数代码 指数名称 指数英文名称 成分券代码 成分券名称 成分券英文名称 交易所
   # 交易所英文名称 权重
@@ -155,12 +175,11 @@ get_index_comp <- function(symbol) {
     )
 }
 
-get_hist <- function(symbol, period, start_date, end_date, adjust) {
+get_hist <- function(symbol, start_date, end_date, adjust) {
   # 日期 股票代码 开盘 收盘 最高 最低 成交量 成交额 振幅 涨跌幅 涨跌额 换手率
   getForm(
     uri = "http://127.0.0.1:8080/api/public/stock_zh_a_hist",
     symbol = symbol,
-    period = period,
     start_date = format(start_date, "%Y%m%d"),
     end_date = format(end_date, "%Y%m%d"),
     adjust = adjust,
@@ -202,14 +221,14 @@ get_hist_valuation <- function(symbol) {
     )
 }
 
-get_hist_fundflow <- function(symbol, market) {
+get_hist_fundflow <- function(symbol, mkt) {
   # 日期 收盘价 涨跌幅 主力净流入-净额 主力净流入-净占比 超大单净流入-净额
   # 超大单净流入-净占比 大单净流入-净额 大单净流入-净占比 中单净流入-净额 中单净流入-净占比
   # 小单净流入-净额 小单净流入-净占比
   getForm(
     uri = "http://127.0.0.1:8080/api/public/stock_individual_fund_flow",
     stock = symbol,
-    market = market,
+    market = mkt,
     .encoding = "utf-8"
   ) %>%
     fromJSON() %>%

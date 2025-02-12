@@ -31,39 +31,41 @@ nfit <- fit_normal(h$mids, h$density)
 saveRDS(nfit, nfit_path)
 
 # Split data into training & test sets
-ind <- createDataPartition(as.factor(data_comb$date), p = 0.8, list = FALSE)
-train <- slice(data_comb, ind)
+train_ind <- createDataPartition(
+  as.factor(data_comb$date), p = 0.8, list = FALSE
+)
+train <- slice(data_comb, train_ind)
 saveRDS(train, train_path)
 
-test <- slice(data_comb, -ind)
+test <- slice(data_comb, -train_ind)
 saveRDS(test, test_path)
 
 # Evaluate model on test set
-eval_model <- function(model, test, print_table = FALSE, pos = "a", ...) {
+eval_model <- function(model, test, print_table = FALSE, coi = "a", ...) {
   class <- as.factor(c("a", "b", "c", "d", "e"))
 
   # Keep only predictions with p > 0.5
-  res <- predict(model, test)[["predictions"]] %>%
+  compar <- predict(model, test)[["predictions"]] %>%
     as_data_frame() %>%
     mutate(
       prob_max = apply(., 1, function(v) max(v)),
       pred = apply(., 1, function(v) class[match(max(v), v)]),
-      target = test$target
+      target = !!test$target
     ) %>%
     filter(prob_max > 0.5)
 
   # Calculate accuracy & discovery rate (for high return)
-  cm <- confusionMatrix(res$pred, res$target)
+  cm <- confusionMatrix(compar$pred, compar$target)
   if (print_table) print(cm$table)
 
   p_acc <- unname(cm$overall["AccuracyPValue"])
   acc <- ifelse(isTRUE(p_acc < 0.05), unname(cm$overall["Accuracy"]), 0)
 
-  n_true <- sum(sapply(which(class %in% pos), function(n) cm$table[n, n]))
-  n_tdr <- sum(sapply(which(class %in% pos), function(n) cm$table[n, ]))
-  tdr <- ifelse(isTRUE(p_acc < 0.05) & n_tdr != 0, n_true / n_tdr, 0)
+  n_true <- sum(sapply(coi, function(str) cm$table[str, str]))
+  n_coi <- sum(sapply(coi, function(str) cm$table[str, ]))
+  acc_coi <- ifelse(isTRUE(p_acc < 0.05) & n_coi != 0, n_true / n_coi, 0)
 
-  eval <- c(acc = acc, tdr = tdr, n_tdr = n_tdr)
+  eval <- c(acc = acc, acc_coi = acc_coi, n_coi = n_coi)
   return(eval)
 }
 
@@ -90,25 +92,18 @@ tune_mtry <- function(train_folds, mtry_list, verbose = FALSE, ...) {
     # Evaluate model on validation set
     eval <- eval_model(rf, valid_i, ...)
     res <- c(res, list(as.list(c(mtry = mtry, eval))))
-    if (verbose) {
-      glue(
-        "mtry = {mtry}, fold {i}: ",
-        "acc = {round(eval[\"acc\"], 3)}, ",
-        "tdr = {round(eval[\"tdr\"], 3)}, ",
-        "n_tdr = {round(eval[\"n_tdr\"], 3)}.",
-      ) %>%
-        tsprint()
-    }
+    eval_out <- paste(eval, collapse = ", ")
+    if (verbose) tsprint(glue("mtry = {mtry}, fold {i}: {eval_out}."))
   }
 
   # Find best mtry by TDR
   tune <- rbindlist(res) %>%
     group_by(mtry) %>%
     summarise(across(everything(), mean)) %>%
-    filter(round(tdr, 2) == max(round(tdr, 2))) %>%
-    filter(n_tdr == max(n_tdr)) %>%
+    filter(round(acc_coi, 2) == max(round(acc_coi, 2))) %>%
+    filter(n_coi == max(n_coi)) %>%
     filter(round(acc, 2) == max(round(acc, 2))) %>%
-    first() %>%
+    last() %>%
     unlist()
   return(tune)
 }
@@ -117,36 +112,34 @@ tune_mtry <- function(train_folds, mtry_list, verbose = FALSE, ...) {
 select_feat <- function(
   train, feat_base, feat_grid, n_try, do_best = TRUE, ...
 ) {
-  row_list <- seq_len(nrow(feat_grid))
+  row_list <- sample(nrow(feat_grid), n_try)
   best_list <- c()
   n_step <- n_try * (
     sum(sapply(feat_grid, function(v) length(unique(v)))) -
       ncol(feat_grid) + 1
   )
 
-  for (i in seq_len(n_try)) {
+  for (row in row_list) {
     # Create cross-validation folds
     train_folds <- createFolds(as.factor(train$date), k = 5) %>%
       lapply(function(v) select(train, target:last_col()) %>% slice(v))
 
     # Choose one combination as initial condition
-    row <- row_list[sample(length(row_list), 1)]
     init <- unlist(feat_grid[row, ])
-    col_list <- seq_len(ncol(feat_grid))
+    col_list <- sample(ncol(feat_grid))
     res <- c()
 
-    for (j in seq_along(col_list)) {
+    for (col in col_list) {
       # Choose one category in initial condition to optimize
-      col <- col_list[sample(length(col_list), 1)]
-      var_list <- unique(feat_grid[, col])
-      if (j > 1) var_list <- var_list[var_list != init[col]]
+      var_list <- unique(feat_grid[, col]) %>% .[sample(length(.))]
+      if (col != col_list[1]) var_list <- var_list[var_list != init[col]]
 
       # Evaluate all choices in category
-      for (k in seq_along(var_list)) {
-        init[col] <- var_list[k]
-        feat_k <- paste(init, collapse = "|")
+      for (var in var_list) {
+        init[col] <- var
+        feat_i <- paste(init, collapse = "|")
         train_folds_trim <- lapply(
-          train_folds, function(df) select(df, feat_base, matches(feat_k))
+          train_folds, function(df) select(df, feat_base, matches(feat_i))
         )
         mtry <- floor(sqrt(ncol(train_folds_trim[[1]]) - 1))
         tune <- tune_mtry(train_folds_trim, mtry, ...) %>%
@@ -154,29 +147,22 @@ select_feat <- function(
         res <- c(res, list(append(as.list(init), as.list(tune))))
 
         # Report progress
-        n_step1 <- length(res) + n_step * (i - 1) / n_try
-        glue(
-          "Step {n_step1}/{n_step}: ",
-          "acc = {round(tune[\"acc\"], 3)}, ",
-          "tdr = {round(tune[\"tdr\"], 3)}, ",
-          "n_tdr = {round(tune[\"n_tdr\"], 3)}."
-        ) %>%
-          tsprint()
+        n_step1 <- length(res) +
+          n_step * (which(row_list == row) - 1) / length(row_list)
+        tsprint(glue("Step {n_step1}/{n_step}: [{row}, {col}] = {var}."))
       }
 
       # Update initial condition with best choice
       best <- rbindlist(res) %>%
-        filter(round(tdr, 2) == max(round(tdr, 2))) %>%
-        filter(n_tdr == max(n_tdr)) %>%
+        filter(round(acc_coi, 2) == max(round(acc_coi, 2))) %>%
+        filter(n_coi == max(n_coi)) %>%
         filter(round(acc, 2) == max(round(acc, 2))) %>%
-        first() %>%
+        last() %>%
         unlist()
       init <- best[seq_along(init)]
-      col_list <- col_list[col_list != col]
     }
 
     # Remove duplicate combinations
-    row_list <- row_list[row_list != row]
     best_list <- c(best_list, list(as.list(best)))
     feat <- rbindlist(best_list, fill = TRUE) %>% select(seq_along(init))
     if (nrow(distinct(feat)) == nrow(head(feat, -1))) {
@@ -186,18 +172,23 @@ select_feat <- function(
 
     if (!do_best) next
 
-    model_path <- paste0(model_dir, "rf_", nrow(feat), ".rds")
-    eval_path <- paste0(model_dir, "rf_", nrow(feat), "_eval.txt")
-    imp_path <- paste0(model_dir, "rf_", nrow(feat), "_imp.pdf")
+    i <- nrow(feat)
+
+    model_path <- paste0(model_dir, "rf_", i, ".rds")
+    cm_path <- paste0(model_dir, "rf_", i, "_cm.txt")
+    imp_path <- paste0(model_dir, "rf_", i, "_imp.pdf")
 
     # Tune mtry
     feat_i <- paste(init, collapse = "|")
     train_folds_trim <- lapply(
       train_folds, function(df) select(df, feat_base, matches(feat_i))
     )
-    mtry_list <- unique(
-      c(1, floor(1.5 ^ (-2:2) * sqrt(ncol(train_folds_trim[[1]]) - 1)))
-    )
+    mtry_list <- floor(1.5^(-3:3) * sqrt(ncol(train_folds_trim[[1]]) - 1)) %>%
+      sapply(max, 1) %>%
+      sapply(min, ncol(train_folds_trim[[1]]) - 1) %>%
+      c(1) %>%
+      unique() %>%
+      sort()
     mtry_best <- tune_mtry(train_folds_trim, mtry_list, ...) %>%
       .[names(.) == "mtry"] %>%
       unname()
@@ -217,28 +208,25 @@ select_feat <- function(
     cm_table <- capture.output(
       eval <- eval_model(rf, test, print_table = TRUE, ...)
     )
-    best_list[length(best_list)] <- append(
-      as.list(init), as.list(c(model = nrow(feat), mtry = mtry_best, eval))
-    ) %>%
+    best_list[length(best_list)] <- list(model = i) %>%
+      append(as.list(init)) %>%
+      append(c(mtry = mtry_best, eval)) %>%
       list()
-    eval_out <- glue(
-      "mtry = {mtry_best}, ",
-      "acc = {round(eval[\"acc\"], 3)}, ",
-      "tdr = {round(eval[\"tdr\"], 3)}, ",
-      "n_tdr = {round(eval[\"n_tdr\"], 3)}.",
-    )
 
     # Format output
     title <- paste(
-      c(
-        "-------------------- Model ", str_pad(nrow(feat), 2, pad = 0),
-        " --------------------"
-      ),
+      c(rep("-", 25), " Model ", str_pad(i, 2, pad = 0), " ", rep("-", 25)),
       collapse = ""
     )
-    eval <- c(title, cm_table, "", eval_out, "")
-    write(eval, eval_path)
-    writeLines(eval)
+    best_out <- last(best_list) %>%
+      .[names(.) != "model"] %>%
+      lapply(function(x) if (is.numeric(x)) round(x, 3) else x) %>%
+      unlist() %>%
+      cbind(str_pad(names(.), max(str_length(names(.))))) %>%
+      apply(1, function(v) paste(c(v[2], v[1]), collapse = " = "))
+    cm <- c(title, "", cm_table, "", best_out, "")
+    write(cm, cm_path)
+    writeLines(cm)
 
     pdf(imp_path, height = 9.5)
     par(mar = c(5.1, 9, 4.1, 2.1))
@@ -253,7 +241,9 @@ select_feat <- function(
     dev.off()
   }
 
-  return(rbindlist(best_list))
+  feat <- rbindlist(best_list) %>%
+    relocate(model, .before = 1)
+  return(feat)
 }
 
 hold_period <- 10
@@ -288,7 +278,5 @@ feat_base <- names(select(train, target:last_col())) %>%
 n_try <- 30
 
 # Select features with different initial conditions
-feat <- select_feat(train, feat_base, feat_grid, n_try) %>%
-  arrange(desc(tdr * n_tdr))
+feat <- select_feat(train, feat_base, feat_grid, n_try)
 saveRDS(feat, feat_path)
-print(feat)

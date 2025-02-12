@@ -4,6 +4,9 @@ gc()
 
 library(doFuture)
 library(foreach)
+library(RCurl)
+library(jsonlite)
+library(glue)
 library(data.table)
 library(ranger)
 library(tidyverse)
@@ -43,6 +46,7 @@ update_portfolio <- function(
     df = out_list,
     .combine = "append"
   ) %dofuture% {
+    rm(list = c("data", "open1", "stop"))
     data <- data_list[[df$symbol]]
     open1 <- slice(data, which(date == !!df$date) + 1) %>% pull(open)
     stop <- ifelse(
@@ -60,9 +64,10 @@ update_portfolio <- function(
     df = out_list,
     .combine = "append"
   ) %dofuture% {
+    rm(list = c("data", "t", "t_max"))
     data <- data_list[[df$symbol]]
     t <- nrow(data) - which(data$date == df$date)
-    t_max <- ifelse(df$class == "e" & !df$short, 3, 10)
+    t_max <- ifelse(df$pred == "e" & !df$short, 2, 10)
     df <- mutate(
       df,
       action = ifelse(
@@ -81,11 +86,18 @@ update_portfolio <- function(
   return(portfolio)
 }
 
-# date <- as_date("2025-01-14"):as_date(now() - hours(16))
-date <- as_date(now() - hours(16))
+trim_portfolio <- function(..., .portfolio = portfolio) {
+  slice(.portfolio, -c(...))
+}
 
+date <- as_tradedate(ymd(20250221))
 class <- c("a", "b", "c", "d", "e")
-cond_expr <- expression(pred$prob > 0.5 & pred$class == "e")
+cond_expr <- expression(
+  symbol %in% c(
+    "688018", "688332", "000837", "002063", "300232",
+    "300383", "300459", "301308"
+  )
+)
 val_unit <- 20000
 
 plan(multisession, workers = availableCores() - 1)
@@ -94,33 +106,33 @@ new <- foreach(
   data = data_list,
   .combine = "append"
 ) %dofuture% {
-  list(filter(data, date %in% as_tradedate(!!date)))
+  list(filter(data, date %in% !!date))
 } %>%
   rbindlist()
+
+plan(sequential)
 
 pred <- cbind(
   select(new, index:date, close), predict(rf, new)[["predictions"]]
 ) %>%
   mutate(
-    prob = apply(select(., class), 1, function(v) max(v)),
-    class = apply(select(., class), 1, function(v) class[match(max(v), v)]),
-    vol = round(!!val_unit / close / 100) * 100,
+    prob = apply(select(., !!class), 1, function(v) max(v)),
+    pred = apply(
+      select(., !!class), 1, function(v) !!class %>% .[match(max(v), v)]
+    ),
+    vol = apply(
+      select(., symbol, close),
+      1,
+      function(v) {
+        vol_min <- ifelse(grepl("^688", v["symbol"]), 200, 100)
+        max(vol_min, round(!!val_unit / as.numeric(v["close"]) / 100) * 100)
+      }
+    ),
     across(c(!!class, close), ~ NULL)
   )
-out <- filter(pred, eval(cond_expr)) %>% arrange(class, desc(prob))
-print(out)
+out <- filter(pred, eval(cond_expr)) %>% arrange(pred, desc(prob))
+print(out, nrow = Inf)
 
-num_e <- filter(pred, prob > 0.5) %>%
-  split(.$date) %>%
-  sapply(function(df) length(df$class[df$class == "e"]))
-plot(
-  names(num_e) %>% as_date(), num_e,
-  type = "l",
-  xlab = "Date", ylab = "count(e)]"
-)
-
-# portfolio <- update_portfolio(1:2)
+# portfolio <- update_portfolio(1:8)
+# portfolio <- trim_portfolio(1:4)
 # write_csv(portfolio, portfolio_path)
-# print(portfolio)
-
-plan(sequential)

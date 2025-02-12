@@ -18,21 +18,21 @@ plan(multisession, workers = availableCores() - 1)
 
 data_dir <- "data/"
 
-index_comp_path <- paste0(data_dir, "index_comp.csv")
+indcomp_path <- paste0(data_dir, "indcomp.csv")
 stats_path <- paste0(data_dir, "stats.pdf")
 data_list_path <- paste0(data_dir, "data_list.rds")
 
-index_comp <- read_csv(index_comp_path)
+indcomp <- read_csv(indcomp_path)
 
 # Set return period
 hold_period <- 10
 
 # Generate features from downloaded data
 data_list <- foreach(
-  symbol = index_comp$symbol,
+  symbol = indcomp$symbol,
   .combine = "append"
 ) %dofuture% {
-  rm(list = c("data", "data_path", "lst"))
+  rm(list = c("data_path", "data", "indcomp", "lst"))
 
   data_path <- paste0(data_dir, symbol, ".csv")
   if (!file.exists(data_path)) return(NULL)
@@ -41,14 +41,14 @@ data_list <- foreach(
   data <- read_csv(data_path, show_col_types = FALSE)
   if (nrow(data) <= 480) return(NULL)
 
-  index_comp_i <- filter(index_comp, symbol == !!symbol)
+  indcomp_i <- filter(indcomp, symbol == !!symbol)
 
   data <- data %>%
     # Add basic stock info
     mutate(
-      index = !!index_comp_i$index,
+      index = !!indcomp_i$index,
       symbol = !!symbol,
-      name = !!index_comp_i$name,
+      name = !!indcomp_i$name,
       .before = date
     ) %>%
     mutate(
@@ -126,6 +126,7 @@ data_list <- foreach(
   data = data_list,
   .combine = "append"
 ) %dofuture% {
+  rm(list = c("lst"))
   data <- mutate(
     data,
     target = ifelse(r >= !!thr[1], "a", NA) %>%
