@@ -34,13 +34,16 @@ portfolio <- if (nrow(read_csv(portfolio_path)) == 0) {
 }
 
 update_portfolio <- function(
-  ..., short = FALSE, .out = out, .portfolio = portfolio
+  ...,
+  short = FALSE,
+  out = parent.frame()$out,
+  portfolio = parent.frame()$portfolio
 ) {
-  portfolio_list <- .portfolio[complete.cases(.portfolio), ] %>%
+  portfolio_list <- portfolio[complete.cases(portfolio), ] %>%
     split(seq_len(nrow(.)))
-  out_list <- .portfolio[!complete.cases(.portfolio), ] %>%
+  out_list <- portfolio[!complete.cases(portfolio), ] %>%
     split(seq_len(nrow(.))) %>%
-    c(slice(.out, ...) %>% mutate(short = !!short) %>% split(seq_len(nrow(.))))
+    c(slice(out, ...) %>% mutate(short = !!short) %>% split(seq_len(nrow(.))))
 
   out_list <- foreach(
     df = out_list,
@@ -86,18 +89,13 @@ update_portfolio <- function(
   return(portfolio)
 }
 
-trim_portfolio <- function(..., .portfolio = portfolio) {
-  slice(.portfolio, -c(...))
+trim_portfolio <- function(..., portfolio = portfolio) {
+  slice(portfolio, -c(...))
 }
 
-date <- as_tradedate(ymd(20250221))
+date <- as_tradedate(now() - hours(16))
 class <- c("a", "b", "c", "d", "e")
-cond_expr <- expression(
-  symbol %in% c(
-    "688018", "688332", "000837", "002063", "300232",
-    "300383", "300459", "301308"
-  )
-)
+cond_expr <- expression(prob > 0.5 & pred == "a")
 val_unit <- 20000
 
 plan(multisession, workers = availableCores() - 1)
@@ -128,7 +126,7 @@ pred <- cbind(
         max(vol_min, round(!!val_unit / as.numeric(v["close"]) / 100) * 100)
       }
     ),
-    across(c(!!class, close), ~ NULL)
+    across(c(close, !!class), ~ NULL)
   )
 out <- filter(pred, eval(cond_expr)) %>% arrange(pred, desc(prob))
 print(out, nrow = Inf)
