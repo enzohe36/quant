@@ -72,14 +72,11 @@ data_list <- foreach(
       close_tnorm = tnormalize(close, 240)
     ) %>%
     add_mom(c("adx", "adx_diff", "cci", "rsi", "stoch", "boll"), c(5, 10)) %>%
-    add_roc(c("close", "vol"), c(5, 10, 20, 60, 120, 240)) %>%
+    add_roc(c("close"), c(5, 10, 20, 60, 120, 240)) %>%
     add_roc(c("close"), c(hold_period)) %>%
-    add_roc(c("val_main"), c(5, 10, 20)) %>%
-    add_mom(c("close_tnorm", "turnover"), c(5, 10, 20, 60, 120, 240)) %>%
-    add_mom(c("turnover_main"), c(5, 10, 20)) %>%
     add_pctma(c("close", "vol"), c(5, 10, 20, 60, 120, 240)) %>%
     add_pctma(c("val_main"), c(5, 10, 20)) %>%
-    add_ma(c("close_tnorm", "turnover"), c(5, 10, 20, 60, 120, 240)) %>%
+    add_ma(c("close_tnorm", "turnover", "amp"), c(5, 10, 20, 60, 120, 240)) %>%
     add_ma(c("turnover_main"), c(5, 10, 20)) %>%
     add_sd(
       c(paste0("close_roc", hold_period), "vol", "turnover"),

@@ -25,7 +25,7 @@ test_path <- paste0(model_dir, "test.rds")
 feat_path <- paste0(model_dir, "feat.rds")
 
 # Calculate mean & sd of market return
-data_comb <- rbindlist(readRDS(data_list_path)) %>% na.omit()
+data_comb <- readRDS(data_list_path) %>% rbindlist() %>% na.omit()
 h <- hist(data_comb$r, breaks = 1000, plot = FALSE)
 nfit <- fit_normal(h$mids, h$density)
 saveRDS(nfit, nfit_path)
@@ -34,25 +34,28 @@ saveRDS(nfit, nfit_path)
 train_ind <- createDataPartition(
   as.factor(data_comb$date), p = 0.8, list = FALSE
 )
-train <- slice(data_comb, train_ind)
+train <- slice(data_comb, train_ind) %>% slice_sample(n = 1000)
 saveRDS(train, train_path)
 
 test <- slice(data_comb, -train_ind)
 saveRDS(test, test_path)
 
 # Evaluate model on test set
-eval_model <- function(model, test, print_table = FALSE, coi = "a", ...) {
-  class <- as.factor(c("a", "b", "c", "d", "e"))
+eval_model <- function(
+  model, test, print_table = FALSE, coi = "a", prob_thr = 0.5, ...
+) {
+  class <- c("a", "b", "c", "d", "e")
 
   # Keep only predictions with p > 0.5
   compar <- predict(model, test)[["predictions"]] %>%
     as_data_frame() %>%
     mutate(
       prob_max = apply(., 1, function(v) max(v)),
-      pred = apply(., 1, function(v) class[match(max(v), v)]),
+      pred = apply(., 1, function(v) !!class %>% .[match(max(v), v)]) %>%
+        as.factor(),
       target = !!test$target
     ) %>%
-    filter(prob_max > 0.5)
+    filter(prob_max > !!prob_thr)
 
   # Calculate accuracy & discovery rate (for high return)
   cm <- confusionMatrix(compar$pred, compar$target)
@@ -70,7 +73,9 @@ eval_model <- function(model, test, print_table = FALSE, coi = "a", ...) {
 }
 
 # Tune mtry using k-fold cross-validation
-tune_mtry <- function(train_folds, mtry_list, verbose = FALSE, ...) {
+tune_mtry <- function(
+  train_folds, mtry_list, verbose = FALSE, ...
+) {
   res <- c()
 
   for (mtry in mtry_list) for (i in seq_along(train_folds)) {
@@ -92,7 +97,7 @@ tune_mtry <- function(train_folds, mtry_list, verbose = FALSE, ...) {
     # Evaluate model on validation set
     eval <- eval_model(rf, valid_i, ...)
     res <- c(res, list(as.list(c(mtry = mtry, eval))))
-    eval_out <- paste(eval, collapse = ", ")
+    eval_out <- paste(round(eval, 3), collapse = ", ")
     if (verbose) tsprint(glue("mtry = {mtry}, fold {i}: {eval_out}."))
   }
 
@@ -103,7 +108,7 @@ tune_mtry <- function(train_folds, mtry_list, verbose = FALSE, ...) {
     filter(round(acc_coi, 2) == max(round(acc_coi, 2))) %>%
     filter(n_coi == max(n_coi)) %>%
     filter(round(acc, 2) == max(round(acc, 2))) %>%
-    last() %>%
+    first() %>%
     unlist()
   return(tune)
 }
@@ -142,14 +147,17 @@ select_feat <- function(
           train_folds, function(df) select(df, feat_base, matches(feat_i))
         )
         mtry <- floor(sqrt(ncol(train_folds_trim[[1]]) - 1))
-        tune <- tune_mtry(train_folds_trim, mtry, ...) %>%
+        eval <- tune_mtry(train_folds_trim, mtry, ...) %>%
           .[names(.) != "mtry"]
-        res <- c(res, list(append(as.list(init), as.list(tune))))
+        eval_out <- paste(round(eval, 3), collapse = ", ")
+        res <- c(res, list(append(as.list(init), as.list(eval))))
 
         # Report progress
         n_step1 <- length(res) +
           n_step * (which(row_list == row) - 1) / length(row_list)
-        tsprint(glue("Step {n_step1}/{n_step}: [{row}, {col}] = {var}."))
+        tsprint(
+          glue("Step {n_step1}/{n_step}: [{row}, {col}] = {var}; {eval_out}")
+        )
       }
 
       # Update initial condition with best choice
@@ -157,16 +165,16 @@ select_feat <- function(
         filter(round(acc_coi, 2) == max(round(acc_coi, 2))) %>%
         filter(n_coi == max(n_coi)) %>%
         filter(round(acc, 2) == max(round(acc, 2))) %>%
-        last() %>%
-        unlist()
-      init <- best[seq_along(init)]
+        first()
+      init <- unlist(best)[seq_along(init)]
     }
 
     # Remove duplicate combinations
-    best_list <- c(best_list, list(as.list(best)))
+    best_list <- c(best_list, list(best))
     feat <- rbindlist(best_list, fill = TRUE) %>% select(seq_along(init))
     if (nrow(distinct(feat)) == nrow(head(feat, -1))) {
       best_list <- head(best_list, -1)
+      writeLines(c("Skipping duplicate combination...", ""))
       next
     }
 
@@ -206,25 +214,19 @@ select_feat <- function(
 
     # Evaluate model on reserved test set
     cm_table <- capture.output(
-      eval <- eval_model(rf, test, print_table = TRUE, ...)
+      eval <- eval_model(rf, test, print_table = TRUE, prob_thr = 0, ...)
     )
-    best_list[length(best_list)] <- list(model = i) %>%
-      append(as.list(init)) %>%
-      append(c(mtry = mtry_best, eval)) %>%
+    best_list[length(best_list)] <- as.list(init) %>%
+      append(c(model = i, mtry = mtry_best, eval)) %>%
       list()
 
     # Format output
-    title <- paste(
-      c(rep("-", 25), " Model ", str_pad(i, 2, pad = 0), " ", rep("-", 25)),
-      collapse = ""
-    )
     best_out <- last(best_list) %>%
-      .[names(.) != "model"] %>%
       lapply(function(x) if (is.numeric(x)) round(x, 3) else x) %>%
       unlist() %>%
-      cbind(str_pad(names(.), max(str_length(names(.))))) %>%
+      cbind(str_pad(names(.), max(str_length(names(.))), "right")) %>%
       apply(1, function(v) paste(c(v[2], v[1]), collapse = " = "))
-    cm <- c(title, "", cm_table, "", best_out, "")
+    cm <- c(cm_table, "", best_out, "")
     write(cm, cm_path)
     writeLines(cm)
 
@@ -250,21 +252,26 @@ hold_period <- 10
 
 # Define sample space of all feature combinations
 feat_grid <- expand.grid(
-  valuation = c("$^", "^(mktcap|pe|pb|pc|ps)"),
-  mktcost = c("$^", "^(profitable|cr|mktcost_ror)"),
-  trend = c("$^", "^adx($|_mom)", "^adx_diff"),
-  oscillator = c("$^", "^cci", "^rsi", "^stoch", "^boll"),
+  valuation = c(
+    "$^", "^(mktcap|pe|pb|pc|ps)"
+  ),
+  mktcost = c(
+    "$^", "^(profitable|cr|mktcost_ror)"
+  ),
+  trend = c(
+    "$^", "^adx($|_mom)", "^adx_diff"
+  ),
+  oscillator = c(
+    "$^", "^cci", "^rsi", "^stoch", "^boll"
+  ),
   price = c(
-    "$^", "^close_roc[0-9]+$", "^close_pctma",
-    "^close_tnorm($|_mom)", "^close_tnorm($|_ma)"
+    "$^", "^close_roc[0-9]+$", "^close_pctma", "^close_tnorm($|_ma)"
   ),
   vol = c(
-    "$^", "^vol_roc", "^vol_pctma",
-    "^turnover($|_mom)", "^turnover($|_ma[0-9]+$)"
+    "$^", "^vol_pctma", "^turnover($|_ma[0-9]+$)"
   ),
   val_main = c(
-    "$^", "^val_main_roc", "^val_main_pctma",
-    "^turnover_main($|_mom)", "^turnover_main($|_ma)"
+    "$^", "^val_main_pctma", "^turnover_main($|_ma)"
   ),
   volatility = c(
     "$^", "^amp", paste0("^close_roc", hold_period, "_sd"),
@@ -275,7 +282,7 @@ feat_grid <- expand.grid(
 feat_base <- names(select(train, target:last_col())) %>%
   .[!grepl(paste(unique(unlist(feat_grid)), collapse = "|"), .)]
 
-n_try <- 30
+n_try <- 3
 
 # Select features with different initial conditions
 feat <- select_feat(train, feat_base, feat_grid, n_try)
