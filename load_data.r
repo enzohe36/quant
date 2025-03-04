@@ -57,47 +57,42 @@ data_list <- foreach(
     ) %>%
     # Generate potentially useful features (to be optimized)
     mutate(
-      mktcost_ror = get_roc(mktcost, close),
-      adx = get_adx(cbind(high, low, close))[, "adx"],
-      adx_diff = get_adx(cbind(high, low, close))[, "diff"],
-      cci = CCI(cbind(high, low, close)),
-      rsi = RSI(close),
-      stoch = stoch(cbind(high, low, close))[, "fastK"],
-      boll = BBands(cbind(high, low, close))[, "pctB"],
-      amp = (runMax(high, !!hold_period) - runMin(low, !!hold_period)) /
-        lag(close, !!hold_period),
       val_main = val_xl + val_l,
-      turnover = vol * close / mktcap_float,
-      turnover_main = val_main / mktcap_float,
-      close_tnorm = tnormalize(close, 240)
+      .after = val_s
     ) %>%
-    add_mom(c("adx", "adx_diff", "cci", "rsi", "stoch", "boll"), c(5, 10)) %>%
+    mutate(
+      mktcost_ror = get_roc(mktcost, close),
+      .after = mktcost
+    ) %>%
+    mutate(
+      close_tnorm = tnormalize(close, 240),
+      turnover = vol * close / mktcap_float,
+      turnover_main = val_main / mktcap_float
+    ) %>%
     add_roc(c("close"), c(5, 10, 20, 60, 120, 240)) %>%
-    add_roc(c("close"), c(hold_period)) %>%
-    add_pctma(c("close", "vol"), c(5, 10, 20, 60, 120, 240)) %>%
-    add_pctma(c("val_main"), c(5, 10, 20)) %>%
-    add_ma(c("close_tnorm", "turnover", "amp"), c(5, 10, 20, 60, 120, 240)) %>%
-    add_ma(c("turnover_main"), c(5, 10, 20)) %>%
+    add_roc(c("close"), hold_period) %>%
+    add_tnroc(c("close", "vol"), c(5, 10, 20, 60, 120, 240), 240) %>%
+    add_tnroc(c("close"), hold_period, 240) %>%
+    add_pctsma(c("close", "vol"), c(5, 10, 20, 60, 120, 240)) %>%
+    add_pctsma(c("val_main"), c(5, 10, 20)) %>%
+    add_sma(c("close_tnorm", "turnover"), c(1, 5, 10, 20, 60, 120, 240)) %>%
+    add_sma(c("turnover_main"), c(1, 5, 10, 20)) %>%
     add_sd(
       c(paste0("close_roc", hold_period), "vol", "turnover"),
       c(20, 60, 120, 240)
-    ) %>%
-    # Delete irrelevant features
-    select(
-      -c(high, low, vol, matches("^val($|_[a-z]+$)"), mktcost)
-    ) %>%
-    # Keep only last 60 trading days' data
-    filter(date >= today() %m-% months(3))
+    )
 
   lst <- list()
   lst[[symbol]] <- data
   return(lst)
 }
 
+data_comb <- rbindlist(data_list) %>% na.omit()
+end_date <- max(data_comb$date)
+
 pdf(stats_path)
 
 # Calculate mean & sd of market return
-data_comb <- rbindlist(data_list) %>% na.omit()
 h <- hist(data_comb$r, breaks = 1000, plot = FALSE)
 nfit <- fit_normal(h$mids, h$density)
 coeff <- coef(summary(nfit))[, "Estimate"]
@@ -124,6 +119,7 @@ data_list <- foreach(
   .combine = "append"
 ) %dofuture% {
   rm(list = c("lst"))
+
   data <- mutate(
     data,
     target = ifelse(r >= !!thr[1], "a", NA) %>%
@@ -134,7 +130,8 @@ data_list <- foreach(
       as.factor(),
     .after = r
   ) %>%
-    relocate(open, close, .before = target)
+    filter(date >= !!end_date %m-% months(3))
+
   lst <- list()
   lst[[data$symbol[1]]] <- data
   return(lst)

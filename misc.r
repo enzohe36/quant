@@ -3,6 +3,7 @@ Sys.setlocale(locale = "Chinese")
 
 options(warn = -1)
 options(ranger.num.threads = availableCores(omit = 1))
+options(dplyr.summarise.inform = FALSE)
 
 normalize <- function(v, range = c(0, 1), h = NULL) {
   min <- min(v, na.rm = TRUE)
@@ -198,29 +199,6 @@ get_hist <- function(symbol, start_date, end_date, adjust) {
     )
 }
 
-get_hist_valuation <- function(symbol) {
-  # 数据日期 当日收盘价 当日涨跌幅 总市值 流通市值 总股本 流通股本 PE(TTM) PE(静) 市净率
-  # PEG值 市现率 市销率
-  getForm(
-    uri = "http://127.0.0.1:8080/api/public/stock_value_em",
-    symbol = symbol,
-    .encoding = "utf-8"
-  ) %>%
-    fromJSON() %>%
-    mutate(
-      date = as_date(`数据日期`),
-      mktcap = `总市值`,
-      mktcap_float = `流通市值`,
-      pe = `PE(静)`,
-      pe_ttm = `PE(TTM)`,
-      pb = `市净率`,
-      peg = `PEG值`,
-      pc = `市现率`,
-      ps = `市销率`,
-      across(!matches("^[a-z0-9_]+$"), ~NULL)
-    )
-}
-
 get_hist_fundflow <- function(symbol, mkt) {
   # 日期 收盘价 涨跌幅 主力净流入-净额 主力净流入-净占比 超大单净流入-净额
   # 超大单净流入-净占比 大单净流入-净额 大单净流入-净占比 中单净流入-净额 中单净流入-净占比
@@ -239,6 +217,29 @@ get_hist_fundflow <- function(symbol, mkt) {
       val_m = `中单净流入-净额`,
       val_s = `小单净流入-净额`,
       across(!matches("^[a-z0-9_]+$"), ~ NULL)
+    )
+}
+
+get_hist_valuation <- function(symbol) {
+  # 数据日期 当日收盘价 当日涨跌幅 总市值 流通市值 总股本 流通股本 PE(TTM) PE(静) 市净率
+  # PEG值 市现率 市销率
+  getForm(
+    uri = "http://127.0.0.1:8080/api/public/stock_value_em",
+    symbol = symbol,
+    .encoding = "utf-8"
+  ) %>%
+    fromJSON() %>%
+    mutate(
+      date = as_date(`数据日期`),
+      mktcap = `总市值`,
+      mktcap_float = `流通市值`,
+      pe = `PE(静)`,
+      pe_ttm = `PE(TTM)`,
+      peg = `PEG值`,
+      pb = `市净率`,
+      pc = `市现率`,
+      ps = `市销率`,
+      across(!matches("^[a-z0-9_]+$"), ~NULL)
     )
 }
 
@@ -288,33 +289,43 @@ add_roc <- function(data, var_list, lag_list) {
   return(data)
 }
 
-add_ma <- function(data, var_list, lag_list) {
+add_tnroc <- function(data, var_list, lag_list, t) {
   for (var in var_list) {
     for (i in lag_list) {
-      data[, paste0(var, "_ma", i)] <- SMA(data[, var], i)
+      data[, paste0(var, "_tnroc", i)] <- ROC(data[, var], i, "discrete") %>%
+        tnormalize(t)
     }
   }
   return(data)
 }
 
-add_pctma <- function(data, var_list, lag_list) {
+add_sma <- function(data, var_list, lag_list) {
   for (var in var_list) {
     for (i in lag_list) {
-      data[, paste0(var, "_ma", i)] <- SMA(data[, var], i)
+      data[, paste0(var, "_sma", i)] <- SMA(data[, var], i)
+    }
+  }
+  return(data)
+}
+
+add_pctsma <- function(data, var_list, lag_list) {
+  for (var in var_list) {
+    for (i in lag_list) {
+      data[, paste0(var, "_sma", i)] <- SMA(data[, var], i)
     }
     var_combn <- combn(
-      names(data) %>% .[grepl(paste0("^", var, "_ma[0-9]+$"), .)],
+      names(data) %>% .[grepl(paste0("^", var, "_sma[0-9]+$"), .)],
       2,
       simplify = FALSE
     )
     for (var_pair in var_combn) {
       lag1 <- str_extract(var_pair[1], "[0-9]+")
       lag2 <- str_extract(var_pair[2], "[0-9]+")
-      data[, paste0(var, "_pctma", lag1, "_", lag2)] <- get_roc(
+      data[, paste0(var, "_pctsma", lag1, "_", lag2)] <- get_roc(
         data[, var_pair[2]], data[, var_pair[1]]
       )
     }
-    data <- select(data, !matches(paste0("^", var, "_ma[0-9]+$")))
+    data <- select(data, !matches(paste0("^", var, "_sma[0-9]+$")))
   }
   return(data)
 }
@@ -327,6 +338,7 @@ add_sd <- function(data, var_list, lag_list) {
   }
   return(data)
 }
+
 
 fit_normal <- function(x, y) {
   nls(

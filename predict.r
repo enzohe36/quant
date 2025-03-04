@@ -27,10 +27,11 @@ data_list <- readRDS(data_list_path)
 coeff <- coef(summary(readRDS(nfit_path)))[, "Estimate"]
 rf <- readRDS(model_path)
 if (!file.exists(portfolio_path)) file.create(portfolio_path)
-portfolio <- if (nrow(read_csv(portfolio_path)) == 0) {
-  tibble()
+portfolio <- read_csv(portfolio_path)
+if (nrow(portfolio) == 0) {
+  portfolio <- tibble()
 } else {
-  read_csv(portfolio_path, col_types = c(index = "c", symbol = "c"))
+  portfolio <- mutate(portfolio, across(c(index, symbol), as.character))
 }
 
 update_portfolio <- function(
