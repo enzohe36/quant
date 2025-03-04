@@ -35,7 +35,7 @@ predict_thr <- function(
     data_comb <- na.omit(data_comb)
   } else {
     class <- c("a", "b", "c", "d", "e")
-    old <- filter(data_comb, date <= date_train) %>% na.omit()
+    old <- filter(data_comb, date <= date_train)
     new <- filter(data_comb, date > date_train)
     pred <- predict(rf, new)[["predictions"]]
     data_comb <- new %>%
@@ -43,15 +43,16 @@ predict_thr <- function(
         target = apply(!!pred, 1, function(v) !!class %>% .[match(max(v), v)])
       ) %>%
       rbind(old) %>%
-      arrange(date, symbol)
+      arrange(date, symbol) %>%
+      na.omit()
   }
   thr <- split(data_comb, data_comb$date) %>%
     sapply(function(df) nrow(filter(df, target == coi)) / nrow(df))
   return(thr)
 }
 
-data_comb <- rbindlist(readRDS(data_list_path))
-date_train <- max(readRDS(train_path)$date)
+data_comb <- readRDS(data_list_path) %>% rbindlist()
+date_train <- readRDS(train_path) %>% pull(date) %>% max()
 rf <- readRDS(model_path)
 thr_a <- predict_thr("a")
 thr_a_act <- predict_thr("a", actual = TRUE)
