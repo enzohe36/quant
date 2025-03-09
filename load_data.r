@@ -38,7 +38,7 @@ data_list <- foreach(
   if (!file.exists(data_path)) return(NULL)
 
   # Skip stocks with ≤ 540 days of history
-  data <- read_csv(data_path, show_col_types = FALSE)
+  data <- read_csv(data_path)
   if (nrow(data) <= 480) return(NULL)
 
   indcomp_i <- filter(indcomp, symbol == !!symbol)

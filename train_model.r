@@ -100,7 +100,7 @@ tune_rf <- function(
     # Evaluate model on validation set
     eval <- eval_model(rf, valid_i, ...)
     res <- c(res, list(as.list(c(ntree = ntree, mtry = mtry, eval))))
-    eval_out <- paste(round(eval, 2), collapse = ", ")
+    eval_out <- paste(round(eval, 3), collapse = ", ")
     if (verbose) {
       tsprint(glue("ntree = {ntree}, mtry = {mtry}, fold {i}: {eval_out}."))
     }
@@ -155,7 +155,7 @@ select_feat <- function(
         mtry <- floor(sqrt(ncol(train_folds_trim[[1]]) - 1))
         eval <- tune_rf(train_folds_trim, ntree, mtry, ...) %>%
           .[!names(.) %in% c("ntree", "mtry")]
-        eval_out <- paste(round(eval, 2), collapse = ", ")
+        eval_out <- paste(round(eval, 3), collapse = ", ")
         res <- c(res, list(append(as.list(init), as.list(eval))))
 
         # Report progress
@@ -258,7 +258,7 @@ hold_period <- 10
 # Define sample space of all feature combinations
 feat_grid <- expand.grid(
   valuation = c(
-    "$^", "^(mktcap|pe|pb|pc|ps)"
+    "$^", "^(mktcap|pe$|peg|pb|pc|ps)"
   ),
   mktcost = c(
     "$^", "^(profitable|cr|mktcost_ror)"

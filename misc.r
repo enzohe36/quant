@@ -4,6 +4,7 @@ Sys.setlocale(locale = "Chinese")
 options(warn = -1)
 options(ranger.num.threads = availableCores(omit = 1))
 options(dplyr.summarise.inform = FALSE)
+options(readr.show_col_types = FALSE)
 
 normalize <- function(v, range = c(0, 1), h = NULL) {
   min <- min(v, na.rm = TRUE)
@@ -220,29 +221,6 @@ get_hist_fundflow <- function(symbol, mkt) {
     )
 }
 
-get_hist_valuation <- function(symbol) {
-  # 数据日期 当日收盘价 当日涨跌幅 总市值 流通市值 总股本 流通股本 PE(TTM) PE(静) 市净率
-  # PEG值 市现率 市销率
-  getForm(
-    uri = "http://127.0.0.1:8080/api/public/stock_value_em",
-    symbol = symbol,
-    .encoding = "utf-8"
-  ) %>%
-    fromJSON() %>%
-    mutate(
-      date = as_date(`数据日期`),
-      mktcap = `总市值`,
-      mktcap_float = `流通市值`,
-      pe = `PE(静)`,
-      pe_ttm = `PE(TTM)`,
-      peg = `PEG值`,
-      pb = `市净率`,
-      pc = `市现率`,
-      ps = `市销率`,
-      across(!matches("^[a-z0-9_]+$"), ~NULL)
-    )
-}
-
 get_hist_mktcost <- function(symbol, adjust) {
   # 日期 获利比例 平均成本 90成本-低 90成本-高 90集中度 70成本-低 70成本-高 70集中度
   getForm(
@@ -258,6 +236,52 @@ get_hist_mktcost <- function(symbol, adjust) {
       profitable = `获利比例`,
       cr70 = `70集中度`,
       cr90 = `90集中度`,
+      across(!matches("^[a-z0-9_]+$"), ~ NULL)
+    )
+}
+
+get_hist_valuation <- function(symbol) {
+  # 数据日期 当日收盘价 当日涨跌幅 总市值 流通市值 总股本 流通股本 PE(TTM) PE(静) 市净率
+  # PEG值 市现率 市销率
+  getForm(
+    uri = "http://127.0.0.1:8080/api/public/stock_value_em",
+    symbol = symbol,
+    .encoding = "utf-8"
+  ) %>%
+    fromJSON() %>%
+    mutate(
+      date = as_date(`数据日期`),
+      mktcap = `总市值`,
+      mktcap_float = `流通市值`,
+      pe = `PE(TTM)`,
+      peg = `PEG值`,
+      pb = `市净率`,
+      pc = `市现率`,
+      ps = `市销率`,
+      across(!matches("^[a-z0-9_]+$"), ~NULL)
+    )
+}
+
+get_hist_estimate <- function(symbol) {
+  # 序号 股票代码 股票简称 报告名称 东财评级 机构 近一月个股研报数
+  # 2024-盈利预测-收益 2024-盈利预测-市盈率 2025-盈利预测-收益 2025-盈利预测-市盈率
+  # 2026-盈利预测-收益 2026-盈利预测-市盈率 行业 日期
+  getForm(
+    uri = "http://127.0.0.1:8080/api/public/stock_research_report_em",
+    symbol = symbol,
+    .encoding = "utf-8"
+  ) %>%
+    fromJSON() %>%
+    rename_with(
+      ~ paste0("eps_", str_extract(., "[0-9]+")), matches("盈利预测-收益")
+    ) %>%
+    rename_with(
+      ~ paste0("pe_", str_extract(., "[0-9]+")), matches("盈利预测-市盈率")
+    ) %>%
+    mutate(
+      date = as_date(`日期`),
+      industry = `行业`,
+      rating = `东财评级`,
       across(!matches("^[a-z0-9_]+$"), ~ NULL)
     )
 }

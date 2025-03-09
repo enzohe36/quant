@@ -46,24 +46,26 @@ count <- foreach(
   .combine = "c"
 ) %dofuture% {
   rm(list = c("data_path", "last_date", "data"))
+
   data_path <- paste0(data_dir, symbol, ".csv")
   if (file.exists(data_path)) {
-    last_date <- read_csv(data_path, show_col_types = FALSE) %>%
-      pull(date) %>%
-      last()
+    last_date <- last(read_csv(data_path)$date)
     if (end_date == last_date) return(1)
   }
+
   data <- reduce(
     list(
       get_hist(symbol, start_date, end_date, adjust),
       get_hist_fundflow(symbol, indcomp$mkt[indcomp$symbol == symbol]),
+      get_hist_mktcost(symbol, adjust),
       get_hist_valuation(symbol),
-      get_hist_mktcost(symbol, adjust)
+      get_hist_estimate(symbol)
     ),
     left_join,
     by = "date"
   )
   write.csv(data, data_path, quote = FALSE, row.names = FALSE)
+
   return(1)
 } %>%
   sum()
