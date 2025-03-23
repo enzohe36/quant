@@ -23,13 +23,13 @@ data_dir <- "data/"
 index_comp_path <- paste0(data_dir, "index_comp.csv")
 index_path <- paste0(data_dir, "index.csv")
 treasury_path <- paste0(data_dir, "treasury.csv")
+data_comb_path <- paste0(data_dir, "data_comb.rds")
 
 model_dir <- "models/"
 
 dir.create(model_dir)
 
 beta_q_path <- paste0(model_dir, "beta_q.txt")
-data_comb_path <- paste0(model_dir, "data_comb.rds")
 test_path <- paste0(model_dir, "test.rds")
 rf_path <- paste0(model_dir, "rf.rds")
 
@@ -57,8 +57,8 @@ data_comb <- foreach(
 
   # Skip stocks with insufficient history
   data <- read_csv(data_path, show_col_types = FALSE)
-  # if (nrow(data) <= 300) return(NULL)
-  if (nrow(data) <= 420) return(NULL) # For testing only
+  # if (nrow(data) <= 720) return(NULL)
+  if (nrow(data) <= 840) return(NULL) # For testing only
 
   index_comp_i <- filter(index_comp, symb == !!symb)
 
@@ -89,8 +89,8 @@ data_comb <- foreach(
   return(lst)
 } %>%
   rbindlist() %>%
-  # filter(date > max(date) - months(12)) %>%
-  filter(date > max(date) - months(18)) %>% # For testing only
+  # filter(date > max(date) %m-% months(36)) %>%
+  filter(date > max(date) %m-% months(42)) %>% # For testing only
   # Calculate target value
   list(index, treasury) %>%
   reduce(left_join, by = "date") %>%
@@ -128,11 +128,11 @@ saveRDS(data_comb, data_comb_path)
 
 # Split data into training & test sets
 train <- data_comb %>%
-  filter(date <= max(date) - month(7)) %>% # For testing only
+  filter(date <= max(date) %m-% months(7)) %>% # For testing only
   na.omit() %>%
   slice_sample(prop = 0.8, by = c("index", "industry", "date", "target"))
 test <- data_comb %>%
-  filter(date <= max(date) - month(7)) %>% # For testing only
+  filter(date <= max(date) %m-% months(7)) %>% # For testing only
   na.omit() %>%
   anti_join(train, by = c("symb", "date"))
 saveRDS(test, test_path)
@@ -156,34 +156,47 @@ get_cm <- function(rf, test, prob_thr = 0.5) {
     ) %>%
     cbind(select(test, symb:target)) %>%
     filter(prob_max > !!prob_thr)
-  cm <- table(Prediction = compar$pred, Reference = compar$target) %>%
+  cm <- table(Prediction = compar$pred, Target = compar$target) %>%
     confusionMatrix()
   return(cm)
 }
 
 # Evaluate model on test set
-test <- readRDS(test_path)
 cm <- get_cm(rf, test)
 acc <- round(cm$overall["Accuracy"], 3)
-print(glue("t = 0 d, acc = {acc}, n = {nrow(test)}"))
-print(cm$table)
-writeLines("")
+c(
+  paste(rep("-", 40), collapse = ""),
+  glue("t = 0 d, acc = {acc}, n = {nrow(test)}"),
+  "",
+  "Target distribution:",
+  capture.output(table(test$target))[-1],
+  "",
+  "Confusion matrix (P > 0.5 only):",
+  capture.output(cm$table)
+) %>%
+  writeLines()
 
 # Evaluate model on future data (for testing only)
-for (lag in seq(30, 210, 10) %>% rev()) {
+for (lag in seq(40, 210, 10) %>% rev()) {
   test <- data_comb %>%
     filter(
-      date > max(max(date) - months(7), max(date) - days(lag)) &
-        date <= max(date) - days(lag - 10)
+      date > max(max(date) %m-% months(7), max(date) - days(lag)),
+      date <= max(date) - days(lag - 10)
     ) %>%
     na.omit()
   cm <- get_cm(rf, test)
   acc <- round(cm$overall["Accuracy"], 3)
-  print(
-    glue("t = {210 - lag}-{210 - lag + 10} d, acc = {acc}, n = {nrow(test)}")
-  )
-  print(cm$table)
-  writeLines("")
+  c(
+    paste(rep("-", 40), collapse = ""),
+    glue("t = {211 - lag}-{220 - lag} d, acc = {acc}, n = {nrow(test)}"),
+    "",
+    "Target distribution:",
+    capture.output(table(test$target))[-1],
+    "",
+    "Confusion matrix (P > 0.5 only):",
+    capture.output(cm$table)
+  ) %>%
+    writeLines()
 }
 
 plan(sequential)

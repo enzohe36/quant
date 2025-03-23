@@ -53,8 +53,8 @@ tsprint(glue("Found {nrow(index_comp)} stocks."))
 # Define data parameters
 period <- "daily"
 end_date <- as_tradedate(now() - hours(16))
-# start_date <- end_date %m-% months(27)
-start_date <- end_date %m-% months(33) # For testing only
+# start_date <- end_date %m-% months(36)
+start_date <- end_date %m-% months(42) # For testing only
 adjust <- "qfq"
 
 # Use CSI All Share Index as market benchmark
