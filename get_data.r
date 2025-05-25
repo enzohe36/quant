@@ -23,13 +23,13 @@ data_dir <- "data/"
 
 dir.create(data_dir)
 
-industry_list_path <- "industry_list_sw2021.csv"
 index_comp_path <- paste0(data_dir, "index_comp.csv")
-index_path <- paste0(data_dir, "index.csv")
-treasury_path <- paste0(data_dir, "treasury.csv")
 
-# Load list of industries & subindustries
-industry_list <- read_csv(industry_list_path)
+# Define data acquisition parameters
+period <- "daily"
+end_date <- as_tradedate(now() - hours(16))
+start_date_default <- end_date %m-% years(10)
+adjust <- "hfq"
 
 # Download list of stocks
 index_comp <- foreach(
@@ -39,52 +39,39 @@ index_comp <- foreach(
   list(get_index_comp(index))
 } %>%
   rbindlist() %>%
-  list(get_industry()) %>%
-  reduce(left_join, by = "symb") %>%
-  mutate(
-    industry = sapply(
-      industry,
-      function(x) filter(industry_list, symb == x) %>% pull(primary)
-    )
-  )
+  list(get_fundamentals(end_date)) %>%
+  reduce(left_join, by = "symbol")
 write.csv(index_comp, index_comp_path, quote = FALSE, row.names = FALSE)
 tsprint(glue("Found {nrow(index_comp)} stocks."))
 
-# Define data parameters
-period <- "daily"
-end_date <- as_tradedate(now() - hours(16))
-# start_date <- end_date %m-% months(36)
-start_date <- end_date %m-% months(42) # For testing only
-adjust <- "qfq"
-
-# Use CSI All Share Index as market benchmark
-index <- get_index("000985", start_date, end_date)
-write.csv(index, index_path, quote = FALSE, row.names = FALSE)
-
-# Use 10-yr treasury as risk-free benchmark
-treasury <- get_treasury(start_date)
-write.csv(treasury, treasury_path, quote = FALSE, row.names = FALSE)
-
 # Download historical stock data
 count <- foreach(
-  symb = index_comp$symb,
+  symbol = index_comp$symbol,
   .combine = "c"
 ) %dofuture% {
   rm(list = c("data_path", "last_date", "try_error", "data"))
 
-  data_path <- paste0(data_dir, symb, ".csv")
+  data_path <- paste0(data_dir, symbol, ".csv")
   if (file.exists(data_path)) {
     last_date <- read_csv(data_path, show_col_types = FALSE) %>%
       pull(date) %>%
       last()
-    if (end_date == last_date) return(1)
+    if (end_date <= last_date) {
+      return(1)
+    } else {
+      start_date <- last_date + days(1)
+      append_existing <- TRUE
+    }
+  } else {
+    start_date <- start_date_default
+    append_existing <- FALSE
   }
 
   try_error <- try(
     data <- reduce(
       list(
-        get_hist(symb, period, start_date, end_date, adjust),
-        get_val(symb)
+        get_hist(symbol, period, start_date, end_date, adjust),
+        get_val(symbol)
       ),
       left_join,
       by = "date"
@@ -94,7 +81,7 @@ count <- foreach(
   if (inherits(try_error, "try-error")) {
     return(0)
   } else {
-    write.csv(data, data_path, quote = FALSE, row.names = FALSE)
+    write_csv(data, data_path, append = append_existing)
     return(1)
   }
 } %>%

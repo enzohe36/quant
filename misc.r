@@ -16,9 +16,7 @@ normalize <- function(v, range = c(0, 1), h = NULL) {
   return(v_norm)
 }
 
-run_norm <- function(v, n) {
-  (v - runMin(v, n)) / (runMax(v, n) - runMin(v, n))
-}
+run_norm <- function(v, n) (v - runMin(v, n)) / (runMax(v, n) - runMin(v, n))
 
 run_pct <- function(v, n) {
   v <- unlist(v)
@@ -31,13 +29,9 @@ run_pct <- function(v, n) {
   )
 }
 
-get_roc <- function(v1, v2) {
-  (v2 - v1) / abs(v1)
-}
+get_roc <- function(v1, v2) (v2 - v1) / v1
 
-get_rmse <- function(v1, v2) {
-  sqrt(sum((v2 - v1) ^ 2) / length(v1))
-}
+get_rmse <- function(v1, v2) sqrt(sum((v2 - v1) ^ 2) / length(v1))
 
 # http://www.cftsc.com/qushizhibiao/610.html
 get_adx <- function(hlc, n = 14, m = 6) {
@@ -149,11 +143,11 @@ as_tradedate <- function(datetime) {
   )
 }
 
-get_index <- function(symb, start_date, end_date) {
+get_index <- function(symbol, start_date, end_date) {
   # date open close high low volume amount
   getForm(
     uri = "http://127.0.0.1:8080/api/public/stock_zh_index_daily_em",
-    symbol = paste0(ifelse(grepl("^3", symb), "sz", "sh"), symb),
+    symbol = paste0(ifelse(grepl("^3", symbol), "sz", "sh"), symbol),
     start_date = format(start_date, "%Y%m%d"),
     end_date = format(end_date, "%Y%m%d"),
     .encoding = "utf-8"
@@ -167,48 +161,50 @@ get_index <- function(symb, start_date, end_date) {
     select(date, open, high, low, close, vol, amt)
 }
 
-get_index_comp <- function(symb) {
+get_index_comp <- function(symbol) {
   # 日期 指数代码 指数名称 指数英文名称 成分券代码 成分券名称 成分券英文名称 交易所
   # 交易所英文名称 权重
   getForm(
     uri = "http://127.0.0.1:8080/api/public/index_stock_cons_weight_csindex",
-    symbol = symb,
+    symbol = symbol,
     .encoding = "utf-8"
   ) %>%
     fromJSON() %>%
     mutate(
-      symb = `成分券代码`,
+      symbol = `成分券代码`,
       name = `成分券名称`,
-      index = !!symb,
+      index = !!symbol,
       index_weight = `权重` / 100,
       across(!matches("^[a-z0-9_]+$"), ~ NULL)
     )
 }
 
-get_industry <- function() {
-  # symbol start_date industry_code update_time
+get_fundamentals <- function(date) {
+  # 序号 股票代码 股票简称 每股收益 营业总收入-营业总收入 营业总收入-同比增长
+  # 营业总收入-季度环比增长 净利润-净利润 净利润-同比增长 净利润-季度环比增长 每股净资产
+  # 净资产收益率 每股经营现金流量 销售毛利率 所处行业 最新公告日期
   getForm(
-    uri = "http://127.0.0.1:8080/api/public/stock_industry_clf_hist_sw",
+    uri = "http://127.0.0.1:8080/api/public/stock_yjbb_em",
+    date = format(quarter(date %m-% months(3), type = "date_last"), "%Y%m%d"),
     .encoding = "utf-8"
   ) %>%
     fromJSON() %>%
-    mutate(start_date = as_datetime(start_date)) %>%
-    split(.$symbol) %>%
-    lapply(
-      function(df) {
-        filter(df, start_date == max(start_date)) %>%
-          select(symbol, industry_code) %>%
-          `colnames<-`(c("symb", "industry"))
-      }
-    ) %>%
-    rbindlist()
+    mutate(
+      symbol = `股票代码`,
+      eps = `每股收益`,
+      bvps = `每股净资产`,
+      ocfps = `每股经营现金流量`,
+      roe = `净资产收益率`,
+      industry = `所处行业`,
+      across(!matches("^[a-z0-9_]+$"), ~ NULL)
+    )
 }
 
-get_hist <- function(symb, period, start_date, end_date, adjust) {
+get_hist <- function(symbol, period, start_date, end_date, adjust) {
   # 日期 股票代码 开盘 收盘 最高 最低 成交量 成交额 振幅 涨跌幅 涨跌额 换手率
   getForm(
     uri = "http://127.0.0.1:8080/api/public/stock_zh_a_hist",
-    symbol = symb,
+    symbol = symbol,
     period = period,
     start_date = format(start_date, "%Y%m%d"),
     end_date = format(end_date, "%Y%m%d"),
@@ -228,11 +224,11 @@ get_hist <- function(symb, period, start_date, end_date, adjust) {
     )
 }
 
-get_mktcost <- function(symb, adjust) {
+get_mktcost <- function(symbol, adjust) {
   # 日期 获利比例 平均成本 90成本-低 90成本-高 90集中度 70成本-低 70成本-高 70集中度
   getForm(
     uri = "http://127.0.0.1:8080/api/public/stock_cyq_em",
-    symbol = symb,
+    symbol = symbol,
     adjust = adjust,
     .encoding = "utf-8"
   ) %>%
@@ -247,13 +243,13 @@ get_mktcost <- function(symb, adjust) {
     )
 }
 
-get_fundflow <- function(symb, mkt) {
+get_fundflow <- function(symbol, mkt) {
   # 日期 收盘价 涨跌幅 主力净流入-净额 主力净流入-净占比 超大单净流入-净额
   # 超大单净流入-净占比 大单净流入-净额 大单净流入-净占比 中单净流入-净额 中单净流入-净占比
   # 小单净流入-净额 小单净流入-净占比
   getForm(
     uri = "http://127.0.0.1:8080/api/public/stock_individual_fund_flow",
-    stock = symb,
+    stock = symbol,
     market = mkt,
     .encoding = "utf-8"
   ) %>%
@@ -268,34 +264,34 @@ get_fundflow <- function(symb, mkt) {
     )
 }
 
-get_val <- function(symb) {
+get_val <- function(symbol) {
   # 数据日期 当日收盘价 当日涨跌幅 总市值 流通市值 总股本 流通股本 PE(TTM) PE(静) 市净率
   # PEG值 市现率 市销率
   getForm(
     uri = "http://127.0.0.1:8080/api/public/stock_value_em",
-    symbol = symb,
+    symbol = symbol,
     .encoding = "utf-8"
   ) %>%
     fromJSON() %>%
     mutate(
       date = as_date(`数据日期`),
-      mktcap = `总市值` / 10^9,
+      mktcap = `总市值`,
       pe = `PE(TTM)`,
       pb = `市净率`,
       peg = `PEG值`,
-      pcf = `市现率`,
+      pocf = `市现率`,
       ps = `市销率`,
       across(!matches("^[a-z0-9_]+$"), ~NULL)
     )
 }
 
-get_val_est <- function(symb) {
+get_val_est <- function(symbol) {
   # 序号 股票代码 股票简称 报告名称 东财评级 机构 近一月个股研报数
   # 2024-盈利预测-收益 2024-盈利预测-市盈率 2025-盈利预测-收益 2025-盈利预测-市盈率
   # 2026-盈利预测-收益 2026-盈利预测-市盈率 行业 日期
   getForm(
     uri = "http://127.0.0.1:8080/api/public/stock_research_report_em",
-    symbol = symb,
+    symbol = symbol,
     .encoding = "utf-8"
   ) %>%
     fromJSON() %>%
@@ -333,93 +329,48 @@ get_treasury <- function(start_date) {
       date = as_date(date),
       across(where(is.numeric), ~ . / 100),
       across(contains("-"), ~ NULL)
-    ) %>%
-    fill(matches("gdp"))
-}
-
-
-add_rn <- function(data, var_list, lag_list) {
-  for (var in var_list) {
-    for (i in lag_list) {
-      data[, paste0(var, "_rn", i)] <- run_norm(data[, var], i)
-    }
-  }
-  return(data)
-}
-
-add_rp <- function(data, var_list, lag_list) {
-  for (var in var_list) {
-    for (i in lag_list) {
-      data[, paste0(var, "_rp", i)] <- run_pct(data[, var], i)
-    }
-  }
-  return(data)
+    )
 }
 
 add_mom <- function(data, var_list, lag_list) {
-  for (var in var_list) {
-    for (i in lag_list) {
-      data[, paste0(var, "_mom", i)] <- momentum(data[, var], i)
-    }
+  for (i in lag_list) {
+    data <- mutate(
+      data,
+      across(!!var_list, ~ momentum(., i), .names = "{.col}_mom{i}")
+    )
   }
   return(data)
 }
 
 add_roc <- function(data, var_list, lag_list) {
-  for (var in var_list) {
-    for (i in lag_list) {
-      data[, paste0(var, "_roc", i)] <- ROC(data[, var], i, "discrete")
-    }
-  }
-  return(data)
-}
-
-add_rnroc <- function(data, var_list, lag_list, n) {
-  for (var in var_list) {
-    for (i in lag_list) {
-      data[, paste0(var, "_rnroc", i)] <- ROC(data[, var], i, "discrete") %>%
-        run_norm(n)
-    }
+  for (i in lag_list) {
+    data <- mutate(
+      data,
+      across(!!var_list, ~ ROC(., i, "discrete"), .names = "{.col}_roc{i}")
+    )
   }
   return(data)
 }
 
 add_sma <- function(data, var_list, lag_list) {
-  for (var in var_list) {
-    for (i in lag_list) {
-      data[, paste0(var, "_sma", i)] <- SMA(data[, var], i)
-    }
-  }
-  return(data)
-}
-
-add_rocsma <- function(data, var_list, lag_list) {
-  data_temp <- data.frame(matrix(, nrow = nrow(data), ncol = 0))
-  for (var in var_list) {
-    for (i in lag_list) {
-      data_temp[, paste0(var, "_sma", i)] <- SMA(data[, var], i)
-    }
-    var_combn <- combn(names(data_temp), 2, simplify = FALSE)
-    for (var_pair in var_combn) {
-      lag1 <- str_extract(var_pair[1], "[0-9]+")
-      lag2 <- str_extract(var_pair[2], "[0-9]+")
-      data[, paste0(var, "_rocsma", lag1, "_", lag2)] <- get_roc(
-        data_temp[, var_pair[2]], data_temp[, var_pair[1]]
-      )
-    }
+  for (i in lag_list) {
+    data <- mutate(
+      data,
+      across(!!var_list, ~ SMA(., i), .names = "{.col}_sma{i}")
+    )
   }
   return(data)
 }
 
 add_sd <- function(data, var_list, lag_list) {
-  for (var in var_list) {
-    for (i in lag_list) {
-      data[, paste0(var, "_sd", i)] <- runSD(data[, var], i)
-    }
+  for (i in lag_list) {
+    data <- mutate(
+      data,
+      across(!!var_list, ~ runSD(., i), .names = "{.col}_sd{i}")
+    )
   }
   return(data)
 }
-
 
 fit_gaussian <- function(x, y) {
   nls(
