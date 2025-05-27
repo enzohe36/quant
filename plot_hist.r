@@ -1,5 +1,4 @@
 rm(list = ls())
-
 gc()
 
 library(doFuture)

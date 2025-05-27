@@ -276,6 +276,7 @@ get_val <- function(symbol) {
     mutate(
       date = as_date(`数据日期`),
       mktcap = `总市值`,
+      mktcap_float = `流通市值`,
       pe = `PE(TTM)`,
       pb = `市净率`,
       peg = `PEG值`,
@@ -358,6 +359,28 @@ add_sma <- function(data, var_list, lag_list) {
       data,
       across(!!var_list, ~ SMA(., i), .names = "{.col}_sma{i}")
     )
+  }
+  return(data)
+}
+
+add_smaroc <- function(data, var_list, lag_list) {
+  for (var in var_list) {
+    for (i in lag_list) {
+      data[, paste0(var, "_ma", i)] <- SMA(data[, var], i)
+    }
+    var_combn <- combn(
+      names(data) %>% .[grepl(paste0("^", var, "_ma[0-9]+$"), .)],
+      2,
+      simplify = FALSE
+    )
+    for (var_pair in var_combn) {
+      lag1 <- str_extract(var_pair[1], "[0-9]+")
+      lag2 <- str_extract(var_pair[2], "[0-9]+")
+      data[, paste0(var, "_smaroc", lag1, "_", lag2)] <- get_roc(
+        data[, var_pair[2]], data[, var_pair[1]]
+      )
+    }
+    data <- select(data, !matches(paste0("^", var, "_ma[0-9]+$")))
   }
   return(data)
 }

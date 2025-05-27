@@ -1,7 +1,6 @@
 # python -m aktools
 
 rm(list = ls())
-
 gc()
 
 library(doFuture)
@@ -28,7 +27,7 @@ index_comp_path <- paste0(data_dir, "index_comp.csv")
 # Define data acquisition parameters
 period <- "daily"
 end_date <- as_tradedate(now() - hours(16))
-start_date_default <- end_date %m-% years(10)
+start_date_default <- NULL
 adjust <- "hfq"
 
 # Download list of stocks
@@ -49,7 +48,11 @@ count <- foreach(
   symbol = index_comp$symbol,
   .combine = "c"
 ) %dofuture% {
-  rm(list = c("data_path", "last_date", "try_error", "data"))
+  var <- c(
+    "var", "data_path", "last_date", "start_date", "append_existing",
+    "try_error", "data"
+  )
+  rm(list = var)
 
   data_path <- paste0(data_dir, symbol, ".csv")
   if (file.exists(data_path)) {
