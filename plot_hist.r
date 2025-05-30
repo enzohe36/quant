@@ -1,28 +1,14 @@
 rm(list = ls())
+
 gc()
 
-library(doFuture)
-library(foreach)
-library(TTR)
-library(data.table)
-library(glue)
-library(ranger)
-library(caret)
-library(tidyverse)
-
-# Load custom settings & helper functions
-source("misc.r", encoding = "UTF-8")
-
-# ------------------------------------------------------------------------------
+plan(multisession, workers = availableCores() - 1)
 
 data_dir <- "data/"
-
 index_comp_path <- paste0(data_dir, "index_comp.csv")
 data_comb_path <- paste0(data_dir, "data_comb.rds")
 
 index_comp <- read_csv(index_comp_path)
-
-plan(multisession, workers = availableCores() - 1)
 
 data_list <- foreach(
   symbol = index_comp$symbol,
@@ -48,8 +34,6 @@ data_list <- foreach(
   lst[[symbol]] <- data
   return(lst)
 }
-
-plan(sequential)
 
 date_all <- tibble(
   date = lapply(data_list, function(df) df$date) %>%
@@ -143,3 +127,5 @@ for (
 ) {
   query_hist(i)
 }
+
+plan(sequential)

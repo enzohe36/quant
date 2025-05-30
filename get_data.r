@@ -1,27 +1,11 @@
-# python -m aktools
-
 rm(list = ls())
+
 gc()
-
-library(doFuture)
-library(foreach)
-library(RCurl)
-library(jsonlite)
-library(data.table)
-library(glue)
-library(tidyverse)
-
-# Load custom settings & helper functions
-source("misc.r", encoding = "UTF-8")
-
-# ------------------------------------------------------------------------------
 
 plan(multisession, workers = availableCores() - 1)
 
 data_dir <- "data/"
-
 dir.create(data_dir)
-
 index_comp_path <- paste0(data_dir, "index_comp.csv")
 
 # Define data acquisition parameters

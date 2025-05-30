@@ -1,10 +1,21 @@
-Sys.setenv(TZ = "Asia/Shanghai")
 Sys.setlocale(locale = "Chinese")
 
+Sys.setenv(TZ = "Asia/Shanghai")
+
+library(doFuture)
+library(foreach)
+library(RCurl)
+library(jsonlite)
+library(TTR)
+library(data.table)
+library(glue)
+library(tidyverse)
+
 options(warn = -1)
-options(ranger.num.threads = availableCores(omit = 1))
 options(dplyr.summarise.inform = FALSE)
 options(readr.show_col_types = FALSE)
+
+set.seed(123)
 
 normalize <- function(v, range = c(0, 1), h = NULL) {
   min <- min(v, na.rm = TRUE)
@@ -337,7 +348,11 @@ add_mom <- function(data, var_list, lag_list) {
   for (i in lag_list) {
     data <- mutate(
       data,
-      across(!!var_list, ~ momentum(., i), .names = "{.col}_mom{i}")
+      across(
+        !!var_list,
+        ~ momentum(., i),
+        .names = "{.col}_mom{i}"
+      )
     )
   }
   return(data)
@@ -347,7 +362,25 @@ add_roc <- function(data, var_list, lag_list) {
   for (i in lag_list) {
     data <- mutate(
       data,
-      across(!!var_list, ~ ROC(., i, "discrete"), .names = "{.col}_roc{i}")
+      across(
+        !!var_list,
+        ~ ROC(., i, "discrete"),
+        .names = "{.col}_roc{i}"
+      )
+    )
+  }
+  return(data)
+}
+
+add_rocnorm <- function(data, var_list, lag_list, n) {
+  for (i in lag_list) {
+    data <- mutate(
+      data,
+      across(
+        !!var_list,
+        ~ ROC(., i, "discrete") %>% run_norm(n),
+        .names = "{.col}_rocnorm{i}"
+      )
     )
   }
   return(data)
@@ -357,30 +390,12 @@ add_sma <- function(data, var_list, lag_list) {
   for (i in lag_list) {
     data <- mutate(
       data,
-      across(!!var_list, ~ SMA(., i), .names = "{.col}_sma{i}")
-    )
-  }
-  return(data)
-}
-
-add_smaroc <- function(data, var_list, lag_list) {
-  for (var in var_list) {
-    for (i in lag_list) {
-      data[, paste0(var, "_ma", i)] <- SMA(data[, var], i)
-    }
-    var_combn <- combn(
-      names(data) %>% .[grepl(paste0("^", var, "_ma[0-9]+$"), .)],
-      2,
-      simplify = FALSE
-    )
-    for (var_pair in var_combn) {
-      lag1 <- str_extract(var_pair[1], "[0-9]+")
-      lag2 <- str_extract(var_pair[2], "[0-9]+")
-      data[, paste0(var, "_smaroc", lag1, "_", lag2)] <- get_roc(
-        data[, var_pair[2]], data[, var_pair[1]]
+      across(
+        !!var_list,
+        ~ SMA(., i),
+        .names = "{.col}_sma{i}"
       )
-    }
-    data <- select(data, !matches(paste0("^", var, "_ma[0-9]+$")))
+    )
   }
   return(data)
 }
@@ -389,7 +404,11 @@ add_sd <- function(data, var_list, lag_list) {
   for (i in lag_list) {
     data <- mutate(
       data,
-      across(!!var_list, ~ runSD(., i), .names = "{.col}_sd{i}")
+      across(
+        !!var_list,
+        ~ runSD(., i),
+        .names = "{.col}_sd{i}"
+      )
     )
   }
   return(data)
@@ -400,4 +419,17 @@ fit_gaussian <- function(x, y) {
     y ~ 1 / (s * sqrt(2 * pi)) * exp(-1 / 2 * ((x - m) / s) ^ 2),
     start = c(s = 1, m = 0)
   )
+}
+
+predict_probrf <- function(rf, test) {
+  predict(rf, test)[["predictions"]] %>%
+    as_data_frame() %>%
+    mutate(
+      prob_max = apply(., 1, function(v) max(v)),
+      pred = apply(., 1, function(v) names(v) %>% .[match(max(v), v)]) %>%
+        as.factor(),
+      target = !!test$target,
+      symbol = !!test$symbol,
+      date = !!test$date
+    )
 }
