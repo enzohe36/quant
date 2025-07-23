@@ -1,6 +1,19 @@
+# conda activate myenv; pip install aktools --upgrade -i https://pypi.org/simple; pip install akshare --upgrade -i https://pypi.org/simple; python -m aktools
+# conda activate myenv; Rscript get_data.r; Rscript get_data.r
+
 rm(list = ls())
 
 gc()
+
+library(doFuture)
+library(foreach)
+library(RCurl)
+library(jsonlite)
+library(data.table)
+library(glue)
+library(tidyverse)
+
+source("misc.r", encoding = "UTF-8")
 
 plan(multisession, workers = availableCores() - 1)
 
@@ -29,7 +42,7 @@ tsprint(glue("Found {nrow(index_comp)} stocks."))
 
 # Download historical stock data
 count <- foreach(
-  symbol = index_comp$symbol,
+  symbol = pull(index_comp, symbol),
   .combine = "c"
 ) %dofuture% {
   var <- c(

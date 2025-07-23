@@ -1,21 +1,7 @@
 Sys.setlocale(locale = "Chinese")
-
 Sys.setenv(TZ = "Asia/Shanghai")
 
-library(doFuture)
-library(foreach)
-library(RCurl)
-library(jsonlite)
-library(TTR)
-library(data.table)
-library(glue)
-library(tidyverse)
-
 options(warn = -1)
-options(dplyr.summarise.inform = FALSE)
-options(readr.show_col_types = FALSE)
-
-set.seed(123)
 
 normalize <- function(v, range = c(0, 1), h = NULL) {
   min <- min(v, na.rm = TRUE)
