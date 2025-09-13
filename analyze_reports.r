@@ -24,11 +24,8 @@ report_dir <- "reports/"
 name_replacement_path <- paste0(report_dir, "name_replacement.csv")
 prompt_path <- paste0(report_dir, "prompt.txt")
 
-industries <- c("半导体", "电子元件", "通信设备")
-# industries <- c("通用设备", "电池")
-
-concepts <- paste0(c("算力芯片", "AI SoC", "PCB", "光模块"), collapse = "，")
-# concepts <- paste0(c("机器人执行器", "固态电池", "光伏设备"), collapse = "，")
+industries <- c("算力")
+# industries <- c("通用设备", "专用设备", "电池")
 
 # index_comp <- get_index_comp("000985") %>%
 #   list(get_fundamentals(as_tradedate(now() - hours(16)))) %>%
@@ -57,7 +54,7 @@ analysis <- foreach(
   index_comp_trim <- index_comp %>%
     mutate(count = sapply(name, function(x) str_count(report, x))) %>%
     arrange(desc(count)) %>%
-    filter(count > 1)
+    filter(count >= 1)
   return(list(index_comp_trim, report))
 }
 
@@ -73,26 +70,23 @@ index_comp_trim <- rbindlist(analysis[[1]]) %>%
 names <- index_comp_trim %>%
   pull(name) %>%
   paste(collapse = "，") %>%
-  str_replace_all("机器人", "")
+  str_replace_all("机器人", "") %>%
+  str_replace_all("驱动力", "") %>%
+  str_replace_all("比亚迪", "")
 
 report <- analysis[[2]] %>%
   map_chr(~ .x[1]) %>%
   paste(collapse = "\n")
 
 c(
-  "根据以下科技行业研报，从股票池中为下列每个概念板块精选最具代表性的股票。请按以下逻辑思考：",
-  "1. 为每个概念板块找出所有相关的股票，不要限制每个板块的股票数量；",
-  "2. 检查是否有遗漏的股票，并补充进概念板块，不要限制每个板块的股票数量；",
-  "3. 再次检查是否有遗漏的股票，并补充进概念板块，不要限制每个板块的股票数量；",
-  "4. 确认所选股票范围严格限定在股票池内；",
-  "5. 根据推荐频率和重要性，为每个板块中的所有股票从高到低进行排序；",
-  "6. 输出所有符合条件的股票，包含股票名称、简短的推荐理由，并注明是否是重点推荐股票；",
-  "7. 把输出在Artifacts中整理为Markdown表格。",
-  "\n概念板块：",
-  concepts,
+  glue("根据给出的研报节选，为股票池中的所有股票按主营业务分类。要求如下："),
+  "- 确保股票池中的所有股票仅分类在最为相关的细分领域下；",
+  "- 确保所选股票范围严格限定在股票池内；",
+  "- 在Artifacts以Markdown表格的形式输出所有符合条件的股票，包含股票名称、非常简短的推荐理由，优先列出重点推荐股票。",
+  "- 不要使用emoji表情符号。",
   "\n股票池：",
   names,
-  "\n科技行业研报：",
+  "\n研报节选：",
   report
 ) %>%
   writeLines(prompt_path)
