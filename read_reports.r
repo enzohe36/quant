@@ -18,24 +18,24 @@ source("misc.r", encoding = "UTF-8")
 plan(multisession, workers = availableCores() - 1)
 
 data_dir <- "data/"
-index_comp_path <- paste0(data_dir, "index_comp.csv")
+indexcomp_path <- paste0(data_dir, "indexcomp.csv")
 
 report_dir <- "reports/"
-name_replacement_path <- paste0(report_dir, "name_replacement.csv")
+namerepl_path <- "namerepl.csv"
 prompt_path <- paste0(report_dir, "prompt.txt")
 
 industries <- c("算力")
 # industries <- c("通用设备", "专用设备", "电池")
 
-# index_comp <- get_index_comp("000985") %>%
+# indexcomp <- get_indexcomp("000985") %>%
 #   list(get_fundamentals(as_tradedate(now() - hours(16)))) %>%
 #   reduce(left_join, by = "symbol")
-# write.csv(index_comp, index_comp_path, quote = FALSE, row.names = FALSE)
-# tsprint(glue("Found {nrow(index_comp)} stocks."))
+# write.csv(indexcomp, indexcomp_path, quote = FALSE, row.names = FALSE)
+# tsprint(glue("Found {nrow(indexcomp)} stocks."))
 
-index_comp <- read_csv(index_comp_path, show_col_types = FALSE) %>%
+indexcomp <- read_csv(indexcomp_path, show_col_types = FALSE) %>%
   select(symbol, name)
-name_replacement <- read_csv(name_replacement_path, show_col_types = FALSE)
+namerepl <- read_csv(namerepl_path, show_col_types = FALSE)
 
 analysis <- foreach(
   industry = industries,
@@ -47,18 +47,18 @@ analysis <- foreach(
 
   report <- read_file(report_path) %>%
     str_replace_all("\n\n", "\n")
-  report <- name_replacement %>%
+  report <- namerepl %>%
     {setNames(.$replacement, .$search)} %>%
     str_replace_all(string = report, pattern = .)
 
-  index_comp_trim <- index_comp %>%
+  indexcomp_trim <- indexcomp %>%
     mutate(count = sapply(name, function(x) str_count(report, x))) %>%
     arrange(desc(count)) %>%
     filter(count >= 1)
-  return(list(index_comp_trim, report))
+  return(list(indexcomp_trim, report))
 }
 
-index_comp_trim <- rbindlist(analysis[[1]]) %>%
+indexcomp_trim <- rbindlist(analysis[[1]]) %>%
   group_by(symbol) %>%
   summarise(
     symbol = first(symbol),
@@ -67,7 +67,7 @@ index_comp_trim <- rbindlist(analysis[[1]]) %>%
     .groups = "drop"
   )
 
-names <- index_comp_trim %>%
+names <- indexcomp_trim %>%
   pull(name) %>%
   paste(collapse = "，") %>%
   str_replace_all("机器人", "") %>%

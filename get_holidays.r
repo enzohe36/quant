@@ -14,23 +14,31 @@ plan(multisession, workers = availableCores() - 1)
 
 data_dir <- "data/"
 indexcomp_path <- paste0(data_dir, "indexcomp.csv")
-holidays_path <- paste0(data_dir, "holidays.csv")
+holidays_path <- paste0("holidays.csv")
 
-indexcomp <- read_csv(indexcomp_path)
+if (file.exists(indexcomp_path)) {
+  indexcomp <- read_csv(indexcomp_path, show_col_types = FALSE)
 
-tradedates <- foreach(
-  symbol = pull(indexcomp, symbol),
-  .combine = "c"
-) %dofuture% {
-  paste0(data_dir, symbol, ".csv") %>%
-    read_csv(show_col_types = FALSE) %>%
-    pull(date) %>%
-    list()
-} %>%
-  unlist() %>%
-  unique() %>%
-  sort() %>%
-  as_date()
+  tradedates <- foreach(
+    symbol = pull(indexcomp, symbol),
+    .combine = "c"
+  ) %dofuture% {
+    paste0(data_dir, symbol, ".csv") %>%
+      read_csv(show_col_types = FALSE) %>%
+      pull(date) %>%
+      list()
+  } %>%
+    unlist() %>%
+    unique() %>%
+    sort() %>%
+    as_date()
+
+  holidays <- seq(first(tradedates), last(tradedates), by = "1 day") %>%
+    .[!wday(., week_start = 1) %in% 6:7] %>%
+    .[!.%in% tradedates]
+} else {
+  holidays <- as_date(c())
+}
 
 holidays_new <- c(
   mdy("January 1, 2025"),
@@ -47,9 +55,7 @@ holidays_new <- c(
 ) %>%
   .[!wday(., week_start = 1) %in% 6:7]
 
-holidays <- seq(first(tradedates), last(tradedates), by = "1 day") %>%
-  .[!wday(., week_start = 1) %in% 6:7] %>%
-  .[!.%in% tradedates] %>%
+holidays <- holidays %>%
   c(holidays_new[!holidays_new %in% .])
 
 holidays <- tibble(date = holidays)
