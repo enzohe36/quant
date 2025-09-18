@@ -79,9 +79,8 @@ as_tradedate <- function(datetime) {
     date,
     function(date) {
       seq(date - weeks(2), date, "1 day") %>%
-        .[!wday(.) %in% c(1, 7)] %>%
-        .[!. %in% holidays] %>%
-        .[. <= date] %>%
+        .[!wday(., week_start = 1) %in% 6:7] %>%
+        .[!.%in% holidays] %>%
         last()
     }
   ) %>%
@@ -90,22 +89,60 @@ as_tradedate <- function(datetime) {
   return(tradedate)
 }
 
-get_index <- function(symbol, start_date, end_date) {
+get_indexspot <- function() {
+  # 序号 代码 名称 最新价 涨跌幅 涨跌额 成交量 成交额 振幅 最高 最低 今开 昨收 量比
+  list(
+    getForm(
+      uri = "http://127.0.0.1:8080/api/public/stock_zh_index_spot_em",
+      symbol = "上证系列指数",
+      .encoding = "utf-8"
+    ) %>%
+      fromJSON() %>%
+      mutate(market = "sh"),
+    getForm(
+      uri = "http://127.0.0.1:8080/api/public/stock_zh_index_spot_em",
+      symbol = "深证系列指数",
+      .encoding = "utf-8"
+    ) %>%
+      fromJSON() %>%
+      mutate(market = "sz"),
+    getForm(
+      uri = "http://127.0.0.1:8080/api/public/stock_zh_index_spot_em",
+      symbol = "中证系列指数",
+      .encoding = "utf-8"
+    ) %>%
+      fromJSON() %>%
+      mutate(market = "csi")
+  ) %>%
+    rbindlist() %>%
+    mutate(
+      symbol = `代码`,
+      name = `名称`,
+      open = `今开`,
+      high = `最高`,
+      low = `最低`,
+      close = `最新价`,
+      volume = `成交量`,
+      amount = `成交额`
+    ) %>%
+    select(market, symbol, name, open, high, low, close, volume, amount)
+}
+
+get_indexhist <- function(symbol, start_date, end_date) {
   # date open close high low volume amount
   getForm(
     uri = "http://127.0.0.1:8080/api/public/stock_zh_index_daily_em",
-    symbol = paste0(ifelse(grepl("^3", symbol), "sz", "sh"), symbol),
+    symbol = read_csv("indices.csv", show_col_types = FALSE) %>%
+      filter(symbol == !!symbol) %>%
+      pull(market) %>%
+      paste0(symbol),
     start_date = format(start_date, "%Y%m%d"),
     end_date = format(end_date, "%Y%m%d"),
     .encoding = "utf-8"
   ) %>%
     fromJSON() %>%
-    mutate(
-      date = as_date(date),
-      vol = volume,
-      amt = amount
-    ) %>%
-    select(date, open, high, low, close, vol, amt)
+    mutate(date = as_date(date)) %>%
+    select(date, open, high, low, close, volume, amount)
 }
 
 get_indexcomp <- function(symbol) {
@@ -118,23 +155,60 @@ get_indexcomp <- function(symbol) {
   ) %>%
     fromJSON() %>%
     mutate(
+      index = !!symbol,
       symbol = `成分券代码`,
       name = `成分券名称`,
-      index = !!symbol,
-      index_weight = `权重` / 100
+      weight = `权重` / 100
     ) %>%
-    select(symbol, name, index, index_weight)
+    select(index, symbol, name, weight)
 }
 
-get_hist <- function(symbol, start_date, end_date, adjust) {
+get_div <- function(date) {
+  # 代码 名称 送转股份-送转总比例 送转股份-送转比例 送转股份-转股比例 现金分红-现金分红比例
+  # 现金分红-股息率 每股收益 每股净资产 每股公积金 每股未分配利润 净利润同比增长 总股本
+  # 预案公告日 股权登记日 除权除息日 方案进度 最新公告日期
+  getForm(
+    uri = "http://127.0.0.1:8080/api/public/stock_fhps_em",
+    date = format(quarter(date, "date_last"), "%Y%m%d"),
+    .encoding = "utf-8"
+  ) %>%
+    fromJSON() %>%
+    mutate(
+      symbol = `代码`,
+      div = `现金分红-现金分红比例` / 10,
+      exright_date = as_date(`除权除息日`)
+    ) %>%
+    select(symbol, div, exright_date)
+}
+
+get_spot <- function() {
+  # 序号 代码 名称 最新价 涨跌幅 涨跌额 成交量 成交额 振幅 最高 最低 今开 昨收 量比 换手率 市盈率-动态 市净率 总市值 流通市值 涨速 5分钟涨跌 60日涨跌幅 年初至今涨跌幅
+  getForm(
+    uri = "http://127.0.0.1:8080/api/public/stock_zh_a_spot_em",
+    .encoding = "utf-8"
+  ) %>%
+    fromJSON() %>%
+    mutate(
+      symbol = `代码`,
+      name = `名称`,
+      open = `今开`,
+      high = `最高`,
+      low = `最低`,
+      close = `最新价`,
+      volume = `成交量`,
+      amount = `成交额`,
+      turnover = round(`换手率` / 100, 4)
+    ) %>%
+    select(symbol, name, open, high, low, close, volume, amount, turnover)
+}
+
+get_hist <- function(symbol, start_date, end_date) {
   # 日期 股票代码 开盘 收盘 最高 最低 成交量 成交额 振幅 涨跌幅 涨跌额 换手率
   getForm(
     uri = "http://127.0.0.1:8080/api/public/stock_zh_a_hist",
     symbol = symbol,
-    period = "daily",
     start_date = format(start_date, "%Y%m%d"),
     end_date = format(end_date, "%Y%m%d"),
-    adjust = adjust,
     .encoding = "utf-8"
   ) %>%
     fromJSON() %>%
@@ -144,29 +218,46 @@ get_hist <- function(symbol, start_date, end_date, adjust) {
       high = `最高`,
       low = `最低`,
       close = `收盘`,
-      vol = `成交量`,
-      amt = `成交额`
+      volume = `成交量`,
+      amount = `成交额`,
+      turnover = round(`换手率` / 100, 4)
     ) %>%
-    select(date, open, high, low, close, vol, amt)
+    select(date, open, high, low, close, volume, amount, turnover)
 }
 
-get_adjust_factors <- function(symbol, start_date, end_date, adjust) {
-  # date qfq_factor
+get_adjust <- function(symbol) {
+  # date hfq_factor
   getForm(
     uri = "http://127.0.0.1:8080/api/public/stock_zh_a_daily",
     symbol = paste0(ifelse(grepl("^6", symbol), "sh", "sz"), symbol),
-    start_date = format(start_date, "%Y%m%d"),
-    end_date = format(end_date, "%Y%m%d"),
-    adjust = paste0(adjust, "-factor"),
+    adjust = "hfq-factor",
     .encoding = "utf-8"
   ) %>%
     fromJSON() %>%
-    mutate(
-      date = as_date(date),
-      adjust_factor = get(!!paste0(adjust, "_factor"))
-    ) %>%
-    select(date, adjust_factor)
+    mutate(date = as_date(date)) %>%
+    rename(adjust = hfq_factor)
 }
+
+# get_val <- function(symbol) {
+#   # 数据日期 当日收盘价 当日涨跌幅 总市值 流通市值 总股本 流通股本 PE(TTM) PE(静) 市净率
+#   # PEG值 市现率 市销率
+#   getForm(
+#     uri = "http://127.0.0.1:8080/api/public/stock_value_em",
+#     symbol = symbol,
+#     .encoding = "utf-8"
+#   ) %>%
+#     fromJSON() %>%
+#     mutate(
+#       date = as_date(`数据日期`),
+#       mktcap = `流通市值`,
+#       pe = `PE(TTM)`,
+#       pb = `市净率`,
+#       peg = `PEG值`,
+#       pcf = `市现率`,
+#       ps = `市销率`,
+#       across(!matches("^[a-z0-9_]+$"), ~ NULL)
+#     )
+# }
 
 # get_mktcost <- function(symbol, adjust) {
 #   # 日期 获利比例 平均成本 90成本-低 90成本-高 90集中度 70成本-低 70成本-高 70集中度
@@ -187,46 +278,24 @@ get_adjust_factors <- function(symbol, start_date, end_date, adjust) {
 #     )
 # }
 
-# get_fundflow <- function(symbol, mkt) {
+# get_fundflow <- function(symbol, market) {
 #   # 日期 收盘价 涨跌幅 主力净流入-净额 主力净流入-净占比 超大单净流入-净额
 #   # 超大单净流入-净占比 大单净流入-净额 大单净流入-净占比 中单净流入-净额 中单净流入-净占比
 #   # 小单净流入-净额 小单净流入-净占比
 #   getForm(
 #     uri = "http://127.0.0.1:8080/api/public/stock_individual_fund_flow",
 #     stock = symbol,
-#     market = mkt,
+#     market = market,
 #     .encoding = "utf-8"
 #   ) %>%
 #     fromJSON() %>%
 #     mutate(
 #       date = as_date(`日期`),
-#       amt_xl = `超大单净流入-净额`,
-#       amt_l = `大单净流入-净额`,
-#       amt_m = `中单净流入-净额`,
-#       amt_s = `小单净流入-净额`,
+#       amount_xl = `超大单净流入-净额`,
+#       amount_l = `大单净流入-净额`,
+#       amount_m = `中单净流入-净额`,
+#       amount_s = `小单净流入-净额`,
 #       across(!matches("^[a-z0-9_]+$"), ~ NULL)
-#     )
-# }
-
-# get_val <- function(symbol) {
-#   # 数据日期 当日收盘价 当日涨跌幅 总市值 流通市值 总股本 流通股本 PE(TTM) PE(静) 市净率
-#   # PEG值 市现率 市销率
-#   getForm(
-#     uri = "http://127.0.0.1:8080/api/public/stock_value_em",
-#     symbol = symbol,
-#     .encoding = "utf-8"
-#   ) %>%
-#     fromJSON() %>%
-#     mutate(
-#       date = as_date(`数据日期`),
-#       mktcap = `总市值`,
-#       mktcap_float = `流通市值`,
-#       pe = `PE(TTM)`,
-#       pb = `市净率`,
-#       peg = `PEG值`,
-#       pocf = `市现率`,
-#       ps = `市销率`,
-#       across(!matches("^[a-z0-9_]+$"), ~NULL)
 #     )
 # }
 

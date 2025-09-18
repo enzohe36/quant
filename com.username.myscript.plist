@@ -1,0 +1,40 @@
+<!--
+Replace username
+Replace myscript
+Set starting time
+Save file as com.username.myscript.plist
+Run the following commands:
+  chmod +x ~/Documents/quant/myscript.sh
+  mv com.username.myscript.plist ~/Library/LaunchAgents/
+  launchctl unload ~/Library/LaunchAgents/com.username.myscript.plist
+  launchctl load ~/Library/LaunchAgents/com.username.myscript.plist
+-->
+
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.username.myscript</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/open</string>
+    <string>-a</string>
+    <string>Terminal</string>
+    <string>/Users/username/Documents/quant/myscript.sh</string>
+  </array>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>4</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+</dict>
+</plist>

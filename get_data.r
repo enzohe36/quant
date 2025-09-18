@@ -5,7 +5,6 @@ rm(list = ls())
 
 gc()
 
-library(doFuture)
 library(foreach)
 library(RCurl)
 library(jsonlite)
@@ -15,121 +14,165 @@ library(tidyverse)
 
 source("misc.r", encoding = "UTF-8")
 
-# plan(multisession, workers = availableCores() - 1)
-
 data_dir <- "data/"
-dir.create(data_dir)
-
-adjust_factors_dir <- "adjust_factors/"
-dir.create(adjust_factors_dir)
-
+hist_dir <- "data/hist/"
+adjust_dir <- "data/adjust/"
 indexcomp_path <- "indexcomp.csv"
-log_path <- paste0("logs/log_", format(now(), "%Y%m%d_%H%M%S"), ".txt")
+log_path <- paste0("log/log_", format(now(), "%Y%m%d_%H%M%S"), ".log")
 
-# Define data acquisition parameters
-period <- "daily"
+dir.create(data_dir)
+dir.create(hist_dir)
+dir.create(adjust_dir)
+dir.create("log/")
+
 end_date <- as_tradedate(now() - hours(16))
-start_date_default <- NULL
-adjust <- "hfq"
 
-# Download list of stocks
-index <- "000985"
-indexcomp <- get_indexcomp(index) %>%
+# get indexcomp for 000985
+#   filter indexcomp to keep sh & sz stocks
+#   write to files
+indexcomp <- get_indexcomp("000985") %>%
   filter(str_detect(symbol, "^(0|3|6)")) %>%
-  mutate(index_weight = index_weight / sum(index_weight))
-write.csv(indexcomp, indexcomp_path, quote = FALSE, row.names = FALSE)
+  mutate(weight = weight / sum(weight))
+write_csv(indexcomp, indexcomp_path)
 glue("Index contains {nrow(indexcomp)} stocks.") %>%
   tsprint()
 
+# get spot data
+#   filter symbols to keep what's in indexcomp
+#   merge with dividend data
+spot <- get_spot() %>%
+  filter(symbol %in% pull(indexcomp, symbol)) %>%
+  left_join(get_div(end_date), by = "symbol") %>%
+  mutate(date = end_date)
+glue("Retrieved spot data for {nrow(spot)} stocks.") %>%
+  tsprint()
+
+# for each symbol
+i <- 1
 symbols <- pull(indexcomp, symbol)
-glue("Retrieving data for {length(symbols)} stocks.") %>%
-  tsprint()
-
-# TODO: Get dividend
-# TODO: If exright date is between last entry on file and today, update adjust factors
-
-i <- 1
-count <- foreach(
+fail_count <- foreach(
   symbol = symbols,
   .combine = "c"
 ) %dopar% {
-  var <- c(
-    "adjust_factors", "adjust_factors_path", "try_error"
-  )
-  rm(list = var)
+  prog <- glue("{i}/{length(symbols)} {symbol}")
+  fail_count <- 0
+  spot_symbol <- filter(spot, symbol == !!symbol)
 
-  adjust_factors_path <- paste0(adjust_factors_dir, symbol, ".csv")
-  try_error <- try(
-    adjust_factors <- get_adjust_factors(symbol, NULL, NULL, adjust),
-    silent = TRUE
-  )
-  if (inherits(try_error, "try-error")) {
-    glue("{i}/{length(symbols)}: Failed to retrieve adjust factors for {symbol}.") %>%
-      tslog(log_path)
-    i <- i + 1
-    return(1)
-  } else {
-    write_csv(adjust_factors, adjust_factors_path)
-    glue("{i}/{length(symbols)}: Retrieved adjust factors for {symbol}.") %>%
-      tslog(log_path)
-    Sys.sleep(1)
-    i <- i + 1
-    return(0)
-  }
-}
-glue("Finished retrieving adjust factors; skipped {sum(count)} stocks.") %>%
-  tsprint()
-
-# TODO: Get spot data
-# TODO: If the last date in all files is more than one tradeday before today, get historical data
-# TODO: If else, update with spot data
-
-i <- 1
-count <- foreach(
-  symbol = symbols,
-  .combine = "c"
-) %dopar% {
-  var <- c(
-    "append_existing", "data", "data_path", "start_date", "try_error"
-  )
-  rm(list = var)
-
-  data_path <- paste0(data_dir, symbol, ".csv")
-  if (file.exists(data_path)) {
-    last_date <- read_csv(data_path, show_col_types = FALSE) %>%
-      pull(date) %>%
-      last()
-    if (end_date <= last_date) {
-      glue("{i}/{length(symbols)}: {symbol} is already up to date.") %>%
+  # if hist file is present
+  #   if max date is today's tradedate
+  #     no action
+  #   else if max date is one day before today's tradedate
+  #     append spot data to file
+  #   else
+  #     download missing data & append to file
+  # else
+  #   download all data
+  hist_path <- paste0(hist_dir, symbol, ".csv")
+  if (file.exists(hist_path)) {
+    hist <- read_csv(hist_path, show_col_types = FALSE)
+    if (max(pull(hist, date)) >= end_date) {
+      glue("{prog}: Data is up to date.") %>%
         tslog(log_path)
-      i <- i + 1
-      return(1)
+    } else if (max(pull(hist, date)) == as_tradedate(end_date - 1)) {
+      hist <- bind_rows(
+        hist,
+        select(
+          spot_symbol,
+          date, open, high, low, close, volume, amount, turnover
+        )
+      ) %>%
+        arrange(date)
+      write_csv(hist, hist_path)
+      glue("{prog}: Appended spot data.") %>%
+        tslog(log_path)
     } else {
-      start_date <- last_date + days(1)
-      append_existing <- TRUE
+      start_date <- max(pull(hist, date)) + 1
+      try_error <- try(
+        new_data <- get_hist(symbol, start_date, end_date),
+        silent = TRUE
+      )
+      if (inherits(try_error, "try-error")) {
+        glue("{prog}: Failed to append missing hist data.") %>%
+          tslog(log_path)
+        fail_count <- fail_count + 1
+      } else {
+        hist <- bind_rows(hist, new_data) %>%
+          arrange(date)
+        write_csv(hist, hist_path)
+        glue("{prog}: Appended missing hist data.") %>%
+          tslog(log_path)
+      }
+      Sys.sleep(1)
     }
   } else {
-    start_date <- start_date_default
-    append_existing <- FALSE
-  }
-  try_error <- try(
-    data <- get_hist(symbol, start_date, end_date, NULL),
-    # TODO: get valuation data & write to separate files
-    silent = TRUE
-  )
-  if (inherits(try_error, "try-error")) {
-    glue("{i}/{length(symbols)}: Failed to retrieve historical data for {symbol}.") %>%
-      tslog(log_path)
-    i <- i + 1
-    return(1)
-  } else {
-    write_csv(data, data_path, append = append_existing)
-    glue("{i}/{length(symbols)}: Retrieved historical data for {symbol}.") %>%
-      tslog(log_path)
+    try_error <- try(
+      hist <- get_hist(symbol, NULL, end_date),
+      silent = TRUE
+    )
+    if (inherits(try_error, "try-error")) {
+      glue("{prog}: Failed to create new hist file.") %>%
+        tslog(log_path)
+      fail_count <- fail_count + 1
+    } else {
+      write_csv(hist, hist_path)
+      glue("{prog}: Created new hist file.") %>%
+        tslog(log_path)
+    }
     Sys.sleep(1)
-    i <- i + 1
-    return(0)
   }
+
+  # if adjust file is present
+  #   if exright date is no later than today's tradedate
+  #     and exright date is later than max date in adjust file
+  #     download all data
+  #   else
+  #     no action
+  # else
+  #   download all data
+  adjust_path <- paste0(adjust_dir, symbol, ".csv")
+  if (file.exists(adjust_path)) {
+    adjust <- read_csv(adjust_path, show_col_types = FALSE)
+    exright_date <- select(spot_symbol, exright_date) %>% pull()
+    if (
+      isTRUE(exright_date <= end_date & exright_date > max(pull(adjust, date)))
+    ) {
+      try_error <- try(
+        adjust <- get_adjust(symbol),
+        silent = TRUE
+      )
+      if (inherits(try_error, "try-error")) {
+        glue("{prog}: Failed to replace adjust file.") %>%
+          tslog(log_path)
+        fail_count <- fail_count + 1
+      } else {
+        write_csv(adjust, adjust_path)
+        glue("{prog}: Replaced adjust file.") %>%
+          tslog(log_path)
+      }
+      Sys.sleep(1)
+    } else {
+      glue("{prog}: Data is up to date.") %>%
+        tslog(log_path)
+    }
+  } else {
+    try_error <- try(
+      adjust <- get_adjust(symbol),
+      silent = TRUE
+    )
+    if (inherits(try_error, "try-error")) {
+      glue("{prog}: Failed to create new adjust file.") %>%
+        tslog(log_path)
+      fail_count <- fail_count + 1
+    } else {
+      write_csv(adjust, adjust_path)
+      glue("{prog}: Created new adjust file.") %>%
+        tslog(log_path)
+    }
+    Sys.sleep(1)
+  }
+
+  i <- i + 1
+  return(fail_count)
 }
-glue("Finished retrieving historical data; skipped {sum(count)} stocks.") %>%
+glue("Updated {length(symbols) - sum(fail_count)} stocks; {sum(fail_count)} failed.") %>%
   tsprint()

@@ -5,6 +5,7 @@ data*/
 tmp/
 old/
 models*/
+log/
 
 temp*
 *.log*
