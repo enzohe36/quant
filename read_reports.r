@@ -18,7 +18,7 @@ source("misc.r", encoding = "UTF-8")
 plan(multisession, workers = availableCores() - 1)
 
 data_dir <- "data/"
-indexcomp_path <- paste0(data_dir, "indexcomp.csv")
+index_comp_path <- paste0(data_dir, "index_comp.csv")
 
 report_dir <- "reports/"
 namerepl_path <- "namerepl.csv"
@@ -27,13 +27,13 @@ prompt_path <- paste0(report_dir, "prompt.txt")
 industries <- c("算力")
 # industries <- c("通用设备", "专用设备", "电池")
 
-# indexcomp <- get_indexcomp("000985") %>%
+# index_comp <- get_index_comp("000985") %>%
 #   list(get_fundamentals(as_tradedate(now() - hours(16)))) %>%
 #   reduce(left_join, by = "symbol")
-# write.csv(indexcomp, indexcomp_path, quote = FALSE, row.names = FALSE)
-# tsprint(glue("Found {nrow(indexcomp)} stocks."))
+# write.csv(index_comp, index_comp_path, quote = FALSE, row.names = FALSE)
+# tsprint(glue("Found {nrow(index_comp)} stocks."))
 
-indexcomp <- read_csv(indexcomp_path, show_col_types = FALSE) %>%
+index_comp <- read_csv(index_comp_path, show_col_types = FALSE) %>%
   select(symbol, name)
 namerepl <- read_csv(namerepl_path, show_col_types = FALSE)
 
@@ -51,14 +51,14 @@ analysis <- foreach(
     {setNames(.$replacement, .$search)} %>%
     str_replace_all(string = report, pattern = .)
 
-  indexcomp_trim <- indexcomp %>%
+  index_comp_trim <- index_comp %>%
     mutate(count = sapply(name, function(x) str_count(report, x))) %>%
     arrange(desc(count)) %>%
     filter(count >= 1)
-  return(list(indexcomp_trim, report))
+  return(list(index_comp_trim, report))
 }
 
-indexcomp_trim <- rbindlist(analysis[[1]]) %>%
+index_comp_trim <- rbindlist(analysis[[1]]) %>%
   group_by(symbol) %>%
   summarise(
     symbol = first(symbol),
@@ -67,7 +67,7 @@ indexcomp_trim <- rbindlist(analysis[[1]]) %>%
     .groups = "drop"
   )
 
-names <- indexcomp_trim %>%
+names <- index_comp_trim %>%
   pull(name) %>%
   paste(collapse = "，") %>%
   str_replace_all("机器人", "") %>%

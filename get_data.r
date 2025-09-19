@@ -17,7 +17,7 @@ source("misc.r", encoding = "UTF-8")
 data_dir <- "data/"
 hist_dir <- "data/hist/"
 adjust_dir <- "data/adjust/"
-indexcomp_path <- "indexcomp.csv"
+delist_path <- "delist.csv"
 log_path <- paste0("log/log_", format(now(), "%Y%m%d_%H%M%S"), ".log")
 
 dir.create(data_dir)
@@ -27,82 +27,101 @@ dir.create("log/")
 
 end_date <- as_tradedate(now() - hours(16))
 
-# get indexcomp for 000985
-#   filter indexcomp to keep sh & sz stocks
-#   write to files
-indexcomp <- get_indexcomp("000985") %>%
-  filter(str_detect(symbol, "^(0|3|6)")) %>%
-  mutate(weight = weight / sum(weight))
-write_csv(indexcomp, indexcomp_path)
-glue("Index contains {nrow(indexcomp)} stocks.") %>%
-  tsprint()
-
 # get spot data
-#   filter symbols to keep what's in indexcomp
+#   filter to keep sh & sz stocks
 #   merge with dividend data
 spot <- get_spot() %>%
-  filter(symbol %in% pull(indexcomp, symbol)) %>%
+  filter(str_detect(symbol, "^(0|3|6)")) %>%
   left_join(get_div(end_date), by = "symbol") %>%
   mutate(date = end_date)
 glue("Retrieved spot data for {nrow(spot)} stocks.") %>%
   tsprint()
 
-# for each symbol
-i <- 1
-symbols <- pull(indexcomp, symbol)
+# get suspended stocks
+#   filter & keep symbols that are currently suspended
+susp <- get_susp(end_date) %>%
+  filter(susp_start <= end_date & (susp_end >= end_date | is.na(susp_end))) %>%
+  pull(symbol)
+glue("{length(susp)} stocks are suspended.") %>%
+  tsprint()
+
+# get delisted stocks
+# delist <- read_csv(delist_path, show_col_types = FALSE) %>%
+#   pull(symbol)
+delist <- as.character(c())
+glue("{length(delist)} symbols are delisted/not in use.") %>%
+  tsprint()
+
+# generate symbols from spot data
+#   filter out suspended & delisted symbols
+symbols <- sprintf(
+  "%06d",
+  c(
+    000001:(pull(spot, symbol) %>% .[str_detect(., "^00")] %>% max()),
+    300001:(pull(spot, symbol) %>% .[str_detect(., "^30")] %>% max()),
+    600000:(pull(spot, symbol) %>% .[str_detect(., "^60")] %>% max()),
+    688001:(pull(spot, symbol) %>% .[str_detect(., "^68")] %>% max())
+  )
+) %>%
+  .[!. %in% c(susp, delist)]
+glue("Updating {length(symbols)} stocks...") %>%
+  tsprint()
+
+step_count <- 1
 fail_count <- foreach(
   symbol = symbols,
   .combine = "c"
 ) %dopar% {
-  prog <- glue("{i}/{length(symbols)} {symbol}")
+  vars <- c(
+    "adjust", "adjust_path", "exright_date", "fail_count", "hist", "hist_path",
+    "last_adjust", "last_date", "new_data", "prog", "spot_symbol", "try_error"
+  )
+  rm(list = vars)
+
+  prog <- glue("{step_count}/{length(symbols)} {symbol}")
   fail_count <- 0
+  hist_path <- paste0(hist_dir, symbol, ".csv")
+  adjust_path <- paste0(adjust_dir, symbol, ".csv")
   spot_symbol <- filter(spot, symbol == !!symbol)
 
-  # if hist file is present
-  #   if max date is today's tradedate
-  #     no action
-  #   else if max date is one day before today's tradedate
-  #     append spot data to file
+  # if hist file exists
+  #   if last_date >= end_date
+  #     no update
+  #   if last_date = as_tradedate(end_date - 1)
+  #     append spot data
   #   else
-  #     download missing data & append to file
+  #     append hist data
   # else
-  #   download all data
-  hist_path <- paste0(hist_dir, symbol, ".csv")
+  #   create new hist file
   if (file.exists(hist_path)) {
     hist <- read_csv(hist_path, show_col_types = FALSE)
-    if (max(pull(hist, date)) >= end_date) {
-      glue("{prog}: Data is up to date.") %>%
+    last_date <- max(pull(hist, date))
+    if (last_date >= end_date) {
+      glue("{prog}: No update.") %>%
         tslog(log_path)
-    } else if (max(pull(hist, date)) == as_tradedate(end_date - 1)) {
+    } else if (last_date == as_tradedate(end_date - 1)) {
       hist <- bind_rows(
         hist,
-        select(
-          spot_symbol,
-          date, open, high, low, close, volume, amount, turnover
-        )
-      ) %>%
-        arrange(date)
+        select(spot_symbol, date, open, high, low, close, volume, amount, to)
+      )
       write_csv(hist, hist_path)
       glue("{prog}: Appended spot data.") %>%
         tslog(log_path)
     } else {
-      start_date <- max(pull(hist, date)) + 1
       try_error <- try(
-        new_data <- get_hist(symbol, start_date, end_date),
+        new_data <- get_hist(symbol, last_date + 1, end_date),
         silent = TRUE
       )
       if (inherits(try_error, "try-error")) {
-        glue("{prog}: Failed to append missing hist data.") %>%
+        glue("{prog}: Failed to retrieve hist data.") %>%
           tslog(log_path)
         fail_count <- fail_count + 1
       } else {
-        hist <- bind_rows(hist, new_data) %>%
-          arrange(date)
+        hist <- bind_rows(hist, new_data)
         write_csv(hist, hist_path)
-        glue("{prog}: Appended missing hist data.") %>%
+        glue("{prog}: Appended hist data.") %>%
           tslog(log_path)
       }
-      Sys.sleep(1)
     }
   } else {
     try_error <- try(
@@ -110,38 +129,34 @@ fail_count <- foreach(
       silent = TRUE
     )
     if (inherits(try_error, "try-error")) {
-      glue("{prog}: Failed to create new hist file.") %>%
+      glue("{prog}: Failed to retrieve hist data.") %>%
         tslog(log_path)
       fail_count <- fail_count + 1
     } else {
       write_csv(hist, hist_path)
-      glue("{prog}: Created new hist file.") %>%
+      glue("{prog}: Created hist file.") %>%
         tslog(log_path)
     }
-    Sys.sleep(1)
   }
 
-  # if adjust file is present
-  #   if exright date is no later than today's tradedate
-  #     and exright date is later than max date in adjust file
-  #     download all data
+  # if adjust file exists
+  #   if exright_date > last_adjust & exright_date <= end_date
+  #     replace adjust file
   #   else
-  #     no action
+  #     no update
   # else
-  #   download all data
-  adjust_path <- paste0(adjust_dir, symbol, ".csv")
+  #   create adjust file
   if (file.exists(adjust_path)) {
     adjust <- read_csv(adjust_path, show_col_types = FALSE)
+    last_adjust <- max(pull(adjust, date))
     exright_date <- select(spot_symbol, exright_date) %>% pull()
-    if (
-      isTRUE(exright_date <= end_date & exright_date > max(pull(adjust, date)))
-    ) {
+    if (isTRUE(exright_date > last_adjust & exright_date <= end_date)) {
       try_error <- try(
         adjust <- get_adjust(symbol),
         silent = TRUE
       )
       if (inherits(try_error, "try-error")) {
-        glue("{prog}: Failed to replace adjust file.") %>%
+        glue("{prog}: Failed to retrieve adjust data.") %>%
           tslog(log_path)
         fail_count <- fail_count + 1
       } else {
@@ -149,9 +164,8 @@ fail_count <- foreach(
         glue("{prog}: Replaced adjust file.") %>%
           tslog(log_path)
       }
-      Sys.sleep(1)
     } else {
-      glue("{prog}: Data is up to date.") %>%
+      glue("{prog}: No update.") %>%
         tslog(log_path)
     }
   } else {
@@ -160,19 +174,19 @@ fail_count <- foreach(
       silent = TRUE
     )
     if (inherits(try_error, "try-error")) {
-      glue("{prog}: Failed to create new adjust file.") %>%
+      glue("{prog}: Failed to retrieve adjust data.") %>%
         tslog(log_path)
       fail_count <- fail_count + 1
     } else {
       write_csv(adjust, adjust_path)
-      glue("{prog}: Created new adjust file.") %>%
+      glue("{prog}: Created adjust file.") %>%
         tslog(log_path)
     }
-    Sys.sleep(1)
   }
 
-  i <- i + 1
+  step_count <- step_count + 1
   return(fail_count)
-}
-glue("Updated {length(symbols) - sum(fail_count)} stocks; {sum(fail_count)} failed.") %>%
+} %>%
+  sum()
+glue("Finished checking updates; {fail_count} failed.") %>%
   tsprint()

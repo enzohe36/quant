@@ -1,13 +1,12 @@
 <!--
 Replace username
 Replace myscript
-Set starting time
-Save file as com.username.myscript.plist
-Run the following commands:
-  chmod +x ~/Documents/quant/myscript.sh
-  mv com.username.myscript.plist ~/Library/LaunchAgents/
-  launchctl unload ~/Library/LaunchAgents/com.username.myscript.plist
-  launchctl load ~/Library/LaunchAgents/com.username.myscript.plist
+Set time
+com.username.myscript.plist
+chmod +x ~/Documents/quant/myscript.sh;
+mv com.username.myscript.plist ~/Library/LaunchAgents/;
+launchctl unload ~/Library/LaunchAgents/com.username.myscript.plist;
+launchctl load ~/Library/LaunchAgents/com.username.myscript.plist
 -->
 
 <?xml version="1.0" encoding="UTF-8"?>
@@ -29,7 +28,7 @@ Run the following commands:
   <key>StartCalendarInterval</key>
   <dict>
     <key>Hour</key>
-    <integer>4</integer>
+    <integer>8</integer>
     <key>Minute</key>
     <integer>0</integer>
   </dict>
