@@ -15,15 +15,16 @@ library(tidyverse)
 source("misc.r", encoding = "UTF-8")
 
 data_dir <- "data/"
-hist_dir <- "data/hist/"
-adjust_dir <- "data/adjust/"
-delist_path <- "delist.csv"
-log_path <- paste0("log/log_", format(now(), "%Y%m%d_%H%M%S"), ".log")
+hist_dir <- paste0(data_dir, "hist/")
+adjust_dir <- paste0(data_dir, "adjust/")
+delist_path <- paste0(data_dir, "delist.csv")
+log_dir <- "logs/"
+log_path <- paste0(log_dir, format(now(), "%Y%m%d_%H%M%S"), ".log")
 
 dir.create(data_dir)
 dir.create(hist_dir)
 dir.create(adjust_dir)
-dir.create("log/")
+dir.create(log_dir)
 
 end_date <- as_tradedate(now() - hours(16))
 
@@ -39,9 +40,10 @@ glue("Retrieved spot data for {nrow(spot)} stocks.") %>%
 
 # get suspended stocks
 #   filter & keep symbols that are currently suspended
-susp <- get_susp(end_date) %>%
-  filter(susp_start <= end_date & (susp_end >= end_date | is.na(susp_end))) %>%
-  pull(symbol)
+# susp <- get_susp(end_date) %>%
+#   filter(susp_start <= end_date & (susp_end >= end_date | is.na(susp_end))) %>%
+#   pull(symbol)
+susp <- as.character(c())
 glue("{length(susp)} stocks are suspended.") %>%
   tsprint()
 
@@ -74,14 +76,15 @@ fail_count <- foreach(
 ) %dopar% {
   vars <- c(
     "adjust", "adjust_path", "exright_date", "fail_count", "hist", "hist_path",
-    "last_adjust", "last_date", "new_data", "prog", "spot_symbol", "try_error"
+    "last_date", "new_data", "prog", "spot_symbol", "try_error"
   )
   rm(list = vars)
 
-  prog <- glue("{step_count}/{length(symbols)} {symbol}")
-  fail_count <- 0
   hist_path <- paste0(hist_dir, symbol, ".csv")
   adjust_path <- paste0(adjust_dir, symbol, ".csv")
+
+  prog <- glue("{step_count}/{length(symbols)} {symbol}")
+  fail_count <- 0
   spot_symbol <- filter(spot, symbol == !!symbol)
 
   # if hist file exists
@@ -100,10 +103,7 @@ fail_count <- foreach(
       glue("{prog}: No update.") %>%
         tslog(log_path)
     } else if (last_date == as_tradedate(end_date - 1)) {
-      hist <- bind_rows(
-        hist,
-        select(spot_symbol, date, open, high, low, close, volume, amount, to)
-      )
+      hist <- bind_rows(hist, select(spot_symbol, names(hist)))
       write_csv(hist, hist_path)
       glue("{prog}: Appended spot data.") %>%
         tslog(log_path)
@@ -140,7 +140,7 @@ fail_count <- foreach(
   }
 
   # if adjust file exists
-  #   if exright_date > last_adjust & exright_date <= end_date
+  #   if exright_date > last_date & exright_date <= end_date
   #     replace adjust file
   #   else
   #     no update
@@ -148,9 +148,9 @@ fail_count <- foreach(
   #   create adjust file
   if (file.exists(adjust_path)) {
     adjust <- read_csv(adjust_path, show_col_types = FALSE)
-    last_adjust <- max(pull(adjust, date))
+    last_date <- max(pull(adjust, date))
     exright_date <- select(spot_symbol, exright_date) %>% pull()
-    if (isTRUE(exright_date > last_adjust & exright_date <= end_date)) {
+    if (isTRUE(exright_date > last_date & exright_date <= end_date)) {
       try_error <- try(
         adjust <- get_adjust(symbol),
         silent = TRUE
@@ -188,5 +188,6 @@ fail_count <- foreach(
   return(fail_count)
 } %>%
   sum()
+
 glue("Finished checking updates; {fail_count} failed.") %>%
   tsprint()

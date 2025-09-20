@@ -21,7 +21,7 @@ data_dir <- "data/"
 index_comp_path <- paste0(data_dir, "index_comp.csv")
 
 report_dir <- "reports/"
-namerepl_path <- "namerepl.csv"
+name_repl_path <- paste0(report_dir, "name_repl.csv")
 prompt_path <- paste0(report_dir, "prompt.txt")
 
 industries <- c("算力")
@@ -35,7 +35,7 @@ industries <- c("算力")
 
 index_comp <- read_csv(index_comp_path, show_col_types = FALSE) %>%
   select(symbol, name)
-namerepl <- read_csv(namerepl_path, show_col_types = FALSE)
+name_repl <- read_csv(name_repl_path, show_col_types = FALSE)
 
 analysis <- foreach(
   industry = industries,
@@ -47,7 +47,7 @@ analysis <- foreach(
 
   report <- read_file(report_path) %>%
     str_replace_all("\n\n", "\n")
-  report <- namerepl %>%
+  report <- name_repl %>%
     {setNames(.$replacement, .$search)} %>%
     str_replace_all(string = report, pattern = .)
 

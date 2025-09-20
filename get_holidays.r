@@ -12,11 +12,11 @@ source("misc.r", encoding = "UTF-8")
 
 plan(multisession, workers = availableCores() - 1)
 
-hist_dir <- "data/hist/"
-holidays_path <- "holidays.csv"
+data_dir <- "data/"
+hist_dir <- paste0(data_dir, "hist/")
+holidays_path <- paste0(data_dir, "holidays.csv")
 
-symbols <- list.files(hist_dir) %>%
-  str_remove("\\.csv$")
+symbols <- str_remove(list.files(hist_dir), "\\.csv$")
 
 if (length(symbols) > 0) {
   tradedates <- foreach(

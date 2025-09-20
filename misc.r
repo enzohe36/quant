@@ -73,7 +73,7 @@ tslog <- function(v, log_path) write(ts(v), log_path, append = TRUE)
 
 as_tradedate <- function(datetime) {
   date <- as_date(datetime)
-  holidays <- read_csv("holidays.csv", show_col_types = FALSE) %>%
+  holidays <- read_csv("data/holidays.csv", show_col_types = FALSE) %>%
     pull(date)
   tradedate <- lapply(
     date,
@@ -227,7 +227,7 @@ get_spot <- function() {
       close = `最新价`,
       volume = `成交量`,
       amount = `成交额`,
-      to = round(`换手率` / 100, 4),
+      to = `换手率` / 100,
       ffmc = `流通市值`
     ) %>%
     select(symbol, name, open, high, low, close, volume, amount, to, ffmc) %>%
@@ -253,7 +253,7 @@ get_hist <- function(symbol, start_date, end_date) {
       close = `收盘`,
       volume = `成交量`,
       amount = `成交额`,
-      to = round(`换手率` / 100, 4)
+      to = `换手率` / 100
     ) %>%
     select(date, open, high, low, close, volume, amount, to) %>%
     arrange(date)
