@@ -3,4 +3,6 @@ conda activate /opt/anaconda3/envs/myenv
 cd ~/Documents/quant
 Rscript get_data.r
 Rscript get_data.r
-zip -r "data_$(date +%Y%m%d_%H%M%S).zip" data
+ts=$(date +%Y%m%d_%H%M%S)
+zip -rq "data_$ts.zip" data/
+mv "data_$ts.zip" "/Users/ehe/Library/CloudStorage/GoogleDrive-enzohe36@gmail.com/My Drive/quant/"
