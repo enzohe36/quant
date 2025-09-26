@@ -9,7 +9,8 @@ options(warn = -1)
 
 get_index_spot <- function() {
   Sys.sleep(1)
-  list(
+  ts1 <- as_tradedate(now() - hours(16))
+  data <- list(
     # 序号 代码 名称 最新价 涨跌幅 涨跌额 成交量 成交额 振幅 最高 最低 今开 昨收 量比
     getForm(
       uri = "http://127.0.0.1:8080/api/public/stock_zh_index_spot_em",
@@ -32,13 +33,16 @@ get_index_spot <- function() {
     ) %>%
       fromJSON() %>%
       mutate(market = "csi")
-  ) %>%
-    rbindlist() %>%
+  )
+  ts2 <- as_tradedate(now() - hours(9))
+  if (ts1 != ts2) stop(glue("Trade date changed from {ts1} to {ts2}!"))
+  data <- data %>%
+    rbindlist(fill = TRUE) %>%
     mutate(
       symbol = `代码`,
       name = `名称`,
       market = market,
-      date = as_tradedate(now() - hours(16)),
+      date = !!ts1,
       open = `今开`,
       high = `最高`,
       low = `最低`,
@@ -50,6 +54,7 @@ get_index_spot <- function() {
       symbol, name, market, date, open, high, low, close, volume, amount
     ) %>%
     arrange(symbol)
+  return(data)
 }
 
 get_index_hist <- function(symbol, start_date, end_date) {
@@ -57,7 +62,7 @@ get_index_hist <- function(symbol, start_date, end_date) {
   # date open close high low volume amount
   getForm(
     uri = "http://127.0.0.1:8080/api/public/stock_zh_index_daily_em",
-    symbol = read_csv("data/index_spot.csv", show_col_types = FALSE) %>%
+    symbol = read_csv("data/indices.csv", show_col_types = FALSE) %>%
       filter(symbol == !!symbol) %>%
       pull(market) %>%
       paste0(symbol),
@@ -73,27 +78,33 @@ get_index_hist <- function(symbol, start_date, end_date) {
 
 get_index_comp <- function(symbol) {
   Sys.sleep(1)
+  ts1 <- as_tradedate(now() - hours(16))
   # 日期 指数代码 指数名称 指数英文名称 成分券代码 成分券名称 成分券英文名称 交易所
   # 交易所英文名称 权重
-  getForm(
+  data <- getForm(
     uri = "http://127.0.0.1:8080/api/public/index_stock_cons_weight_csindex",
     symbol = symbol,
     .encoding = "utf-8"
   ) %>%
-    fromJSON() %>%
+    fromJSON()
+  ts2 <- as_tradedate(now() - hours(9))
+  if (ts1 != ts2) stop(glue("Trade date changed from {ts1} to {ts2}!"))
+  data <- data %>%
     mutate(
       symbol = `成分券代码`,
-      date = as_date(`日期`),
+      date = !!ts1,
       index = !!symbol,
       index_weight = `权重` / 100
     ) %>%
     select(symbol, date, index, index_weight) %>%
     arrange(symbol)
+  return(data)
 }
 
 get_symbols <- function() {
   Sys.sleep(1)
-  list(
+  ts1 <- as_tradedate(now() - hours(16))
+  data <- list(
     # code name
     getForm(
       uri = "http://127.0.0.1:8080/api/public/stock_info_a_code_name",
@@ -102,10 +113,9 @@ get_symbols <- function() {
       fromJSON() %>%
       mutate(
         symbol = code,
-        date = as_tradedate(now() - hours(16)),
+        name = name,
         delist = FALSE
-      ) %>%
-      select(symbol, date, delist),
+      ),
     # 公司代码 公司简称 上市日期 暂停上市日期
     getForm(
       uri = "http://127.0.0.1:8080/api/public/stock_info_sh_delist",
@@ -114,10 +124,9 @@ get_symbols <- function() {
       fromJSON() %>%
       mutate(
         symbol = `公司代码`,
-        date = as_tradedate(now() - hours(16)),
+        name = `公司简称`,
         delist = TRUE
-      ) %>%
-      select(symbol, date, delist),
+      ),
     # 证券代码 证券简称 上市日期 终止上市日期
     getForm(
       uri = "http://127.0.0.1:8080/api/public/stock_info_sz_delist",
@@ -126,65 +135,149 @@ get_symbols <- function() {
       fromJSON() %>%
       mutate(
         symbol = `证券代码`,
-        date = as_tradedate(now() - hours(16)),
+        name = `证券简称`,
         delist = TRUE
-      ) %>%
-      select(symbol, date, delist)
-  ) %>%
-    rbindlist() %>%
-    unique() %>%
+      )
+  )
+  ts2 <- as_tradedate(now() - hours(9))
+  if (ts1 != ts2) stop(glue("Trade date changed from {ts1} to {ts2}!"))
+  data <- data %>%
+    rbindlist(fill = TRUE) %>%
+    mutate(date = !!ts1) %>%
+    select(symbol, name, date, delist) %>%
     arrange(symbol)
+  return(data)
 }
 
-get_susp <- function(date) {
+get_susp <- function() {
   Sys.sleep(1)
+  ts1 <- as_tradedate(now() - hours(16))
   # 序号 代码 名称 停牌时间 停牌截止时间 停牌期限 停牌原因 所属市场 预计复牌时间
-  getForm(
+  data <- getForm(
     uri = "http://127.0.0.1:8080/api/public/stock_tfp_em",
-    date = format(date, "%Y%m%d"),
+    date = format(ts1, "%Y%m%d"),
     .encoding = "utf-8"
   ) %>%
-    fromJSON() %>%
+    fromJSON()
+  ts2 <- as_tradedate(now() - hours(9))
+  if (ts1 != ts2) stop(glue("Trade date changed from {ts1} to {ts2}!"))
+  data <- data %>%
     mutate(
       symbol = `代码`,
-      date = !!date,
+      date = !!ts1,
       susp = ifelse(
-        `停牌时间` <= !!date & (`停牌截止时间` >= !!date | is.na(`停牌截止时间`)),
+        `停牌时间` <= !!ts1 & (`停牌截止时间` >= !!ts1 | is.na(`停牌截止时间`)),
         TRUE,
         FALSE
       )
     ) %>%
     select(symbol, date, susp) %>%
     arrange(symbol)
+  return(data)
 }
 
 get_spot <- function() {
   Sys.sleep(1)
+  ts1 <- as_tradedate(now() - hours(16))
   # 序号 代码 名称 最新价 涨跌幅 涨跌额 成交量 成交额 振幅 最高 最低 今开 昨收 量比 换手率
   # 市盈率-动态 市净率 总市值 流通市值 涨速 5分钟涨跌 60日涨跌幅 年初至今涨跌幅
-  getForm(
+  data <- getForm(
     uri = "http://127.0.0.1:8080/api/public/stock_zh_a_spot_em",
     .encoding = "utf-8"
   ) %>%
-    fromJSON() %>%
+    fromJSON()
+  ts2 <- as_tradedate(now() - hours(9))
+  if (ts1 != ts2) stop(glue("Trade date changed from {ts1} to {ts2}!"))
+  data <- data %>%
     mutate(
       symbol = `代码`,
-      name = `名称`,
-      date = as_tradedate(now() - hours(16)),
+      date = !!ts1,
       open = `今开`,
       high = `最高`,
       low = `最低`,
       close = `最新价`,
       volume = `成交量`,
-      amount = `成交额`,
-      shares = round(`总市值` / `最新价`),
-      shares_float = round(`流通市值` / `最新价`)
+      amount = `成交额`
     ) %>%
-    select(
-      symbol, name, date, open, high, low, close, volume, amount,
-      shares, shares_float
-    ) %>%
+    select(symbol, date, open, high, low, close, volume, amount) %>%
     arrange(symbol)
+  return(data)
+}
+
+get_div <- function(date) {
+  Sys.sleep(1)
+  ts1 <- as_tradedate(now() - hours(16))
+  # 代码 名称 送转股份-送转总比例 送转股份-送转比例 送转股份-转股比例 现金分红-现金分红比例
+  # 现金分红-股息率 每股收益 每股净资产 每股公积金 每股未分配利润 净利润同比增长 总股本
+  # 预案公告日 股权登记日 除权除息日 方案进度 最新公告日期
+  data <- getForm(
+    uri = "http://127.0.0.1:8080/api/public/stock_fhps_em",
+    date = quarter(date %m-% months(3), "date_last") %>%
+      format("%Y%m%d"),
+    .encoding = "utf-8"
+  ) %>%
+    fromJSON()
+  ts2 <- as_tradedate(now() - hours(9))
+  if (ts1 != ts2) stop(glue("Trade date changed from {ts1} to {ts2}!"))
+  data <- data %>%
+    mutate(
+      symbol = `代码`,
+      date = !!ts1,
+      exright_date = as_date(`除权除息日`),
+      dps = `现金分红-现金分红比例` / 10
+    ) %>%
+    select(symbol, date, exright_date, dps) %>%
+    arrange(symbol)
+  return(data)
+}
+
+get_shares_change <- function() {
+  Sys.sleep(1)
+  ts1 <- as_tradedate(now() - hours(16))
+  # 证券代码 证券简称 交易市场 公告日期 变动日期 变动原因 总股本 已流通股份 已流通比例
+  # 流通受限股份
+  data <- getForm(
+    uri = "http://127.0.0.1:8080/api/public/stock_hold_change_cninfo",
+    symbol = "全部",
+    .encoding = "utf-8"
+  ) %>%
+    fromJSON()
+  ts2 <- as_tradedate(now() - hours(9))
+  if (ts1 != ts2) stop(glue("Trade date changed from {ts1} to {ts2}!"))
+  data <- data %>%
+    mutate(
+      symbol = `证券代码`,
+      date = !!ts1,
+      shares_change_date = as_date(`变动日期`)
+    ) %>%
+    select(symbol, date, shares_change_date) %>%
+    arrange(symbol)
+  return(data)
+}
+
+get_val_change <- function() {
+  Sys.sleep(1)
+  ts1 <- as_tradedate(now() - hours(16))
+  # 序号 股票代码 股票简称 首次预约时间 一次变更日期 二次变更日期 三次变更日期 实际披露时间
+  data <- getForm(
+    uri = "http://127.0.0.1:8080/api/public/stock_yysj_em",
+    symbol = "沪深A股",
+    date = quarter(ts1 %m-% months(3), "date_last") %>%
+      format("%Y%m%d"),
+    .encoding = "utf-8"
+  ) %>%
+    fromJSON()
+  ts2 <- as_tradedate(now() - hours(9))
+  if (ts1 != ts2) stop(glue("Trade date changed from {ts1} to {ts2}!"))
+  data <- data %>%
+    mutate(
+      symbol = `股票代码`,
+      date = !!ts1,
+      val_change_date = as_date(`实际披露时间`)
+    ) %>%
+    select(symbol, date, val_change_date) %>%
+    arrange(symbol)
+  return(data)
 }
 
 get_hist <- function(symbol, start_date, end_date) {
@@ -260,46 +353,6 @@ get_shares <- function(symbol) {
     ) %>%
     select(date, shares, shares_float) %>%
     arrange(date)
-}
-
-get_div <- function(date) {
-  Sys.sleep(1)
-  quarter <- quarter(date %m-% months(3), "date_last")
-  # 代码 名称 送转股份-送转总比例 送转股份-送转比例 送转股份-转股比例 现金分红-现金分红比例
-  # 现金分红-股息率 每股收益 每股净资产 每股公积金 每股未分配利润 净利润同比增长 总股本
-  # 预案公告日 股权登记日 除权除息日 方案进度 最新公告日期
-  getForm(
-    uri = "http://127.0.0.1:8080/api/public/stock_fhps_em",
-    date = format(quarter, "%Y%m%d"),
-    .encoding = "utf-8"
-  ) %>%
-    fromJSON() %>%
-    mutate(
-      symbol = `代码`,
-      quarter = !!quarter,
-      dps = `现金分红-现金分红比例` / 10,
-      exright_date = as_date(`除权除息日`)
-    ) %>%
-    select(symbol, quarter, dps, exright_date) %>%
-    arrange(symbol)
-}
-
-get_shares_change <- function() {
-  Sys.sleep(1)
-  # 证券代码 证券简称 交易市场 公告日期 变动日期 变动原因 总股本 已流通股份 已流通比例
-  # 流通受限股份
-  getForm(
-    uri = "http://127.0.0.1:8080/api/public/stock_hold_change_cninfo",
-    symbol = "全部",
-    .encoding = "utf-8"
-  ) %>%
-    fromJSON() %>%
-    mutate(
-      symbol = `证券代码`,
-      shares_change = as.Date(`变动日期`)
-    ) %>%
-    select(symbol, quarter, dps, exright_date) %>%
-    arrange(symbol)
 }
 
 get_val <- function(symbol) {

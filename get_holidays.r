@@ -16,24 +16,21 @@ data_dir <- "data/"
 hist_dir <- paste0(data_dir, "hist/")
 holidays_path <- paste0(data_dir, "holidays.csv")
 
-symbols <- str_remove(list.files(hist_dir), "\\.csv$")
+files <- list.files(hist_dir)
 
-if (length(symbols) > 0) {
+if (length(files) == 0) {
+  holidays <- as_date(c())
+} else {
   tradedates <- foreach(
-    symbol = symbols,
+    file = files,
     .combine = "c"
   ) %dofuture% {
-    paste0(hist_dir, symbol, ".csv") %>%
-      read_csv(show_col_types = FALSE) %>%
+    read_csv(paste0(hist_dir, file), show_col_types = FALSE) %>%
       pull(date)
-  } %>%
-    unique() %>%
-    sort()
-  holidays <- seq(first(tradedates), last(tradedates), by = "1 day") %>%
+  }
+  holidays <- seq(min(tradedates), max(tradedates), by = "1 day") %>%
     .[!wday(., week_start = 1) %in% 6:7] %>%
     .[!.%in% tradedates]
-} else {
-  holidays <- as_date(c())
 }
 
 new_holidays <- c(
