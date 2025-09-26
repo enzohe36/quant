@@ -33,27 +33,62 @@ dir.create(log_dir)
 
 end_date <- as_tradedate(now() - hours(16))
 
-combine_spot <- function() {
-  get_symbols() %>%
-    left_join(get_susp(), by = c("symbol", "date")) %>%
-    left_join(get_spot(), by = c("symbol", "date")) %>%
-    left_join(get_div(end_date), by = c("symbol", "date")) %>%
-    left_join(get_shares_change(), by = c("symbol", "date")) %>%
-    left_join(get_val_change(), by = c("symbol", "date")) %>%
+loop_get <- function(var, ...) {
+  fail <- TRUE
+  fail_count <- 1
+  while (fail & fail_count < 3) {
+    try_error <- try(
+      data <- get(paste0("get_", var))(...),
+      silent = TRUE
+    )
+    if (inherits(try_error, "try-error")) {
+      glue("Failed to retrieve {var} after {fail_count} tries.") %>%
+        tsprint()
+      fail_count <- fail_count + 1
+    } else {
+      return(data)
+    }
+  }
+}
+
+if (!file.exists(spot_path)) {
+  symbols <- loop_get("symbols")
+  susp <- loop_get("susp")
+  spot <- loop_get("spot")
+  adjust_change <- loop_get("adjust_change")
+  shares_change <- loop_get("shares_change")
+  val_change <- loop_get("val_change")
+  spot <- symbols %>%
+    left_join(susp, by = c("symbol", "date")) %>%
+    left_join(spot, by = c("symbol", "date")) %>%
+    left_join(adjust_change, by = c("symbol", "date")) %>%
+    left_join(shares_change, by = c("symbol", "date")) %>%
+    left_join(val_change, by = c("symbol", "date")) %>%
     mutate(
       delist = coalesce(delist, FALSE),
       susp = coalesce(susp, FALSE)
     )
-}
-
-if (!file.exists(spot_path)) {
-  spot <- combine_spot()
   write_csv(spot, spot_path)
 } else {
   spot <- read_csv(spot_path, show_col_types = FALSE)
   last_date <- max(pull(spot, date))
   if (last_date < end_date) {
-    spot <- combine_spot()
+    symbols <- loop_get("symbols")
+    susp <- loop_get("susp")
+    spot <- loop_get("spot")
+    adjust_change <- loop_get("adjust_change")
+    shares_change <- loop_get("shares_change")
+    val_change <- loop_get("val_change")
+    spot <- symbols %>%
+      left_join(susp, by = c("symbol", "date")) %>%
+      left_join(spot, by = c("symbol", "date")) %>%
+      left_join(adjust_change, by = c("symbol", "date")) %>%
+      left_join(shares_change, by = c("symbol", "date")) %>%
+      left_join(val_change, by = c("symbol", "date")) %>%
+      mutate(
+        delist = coalesce(delist, FALSE),
+        susp = coalesce(susp, FALSE)
+      )
     write_csv(spot, spot_path)
   }
 }
@@ -73,8 +108,9 @@ fail_count <- foreach(
   .combine = "c"
 ) %dopar% {
   vars <- c(
-    "adjust", "adjust_path", "exright_date", "fail_count", "hist", "hist_path",
-    "last_date", "prog", "shares", "shares_path", "spot_symbol", "try_error"
+    "adjust", "adjust_change_date", "adjust_path", "fail_count", "hist",
+    "hist_path", "prog", "shares", "shares_change_date", "shares_path",
+    "spot_symbol", "try_error", "val", "val_change_date", "val_path"
   )
   rm(list = vars)
 
@@ -96,11 +132,9 @@ fail_count <- foreach(
   #     no update
   #   else if last date = end date - 1
   #     append spot to hist
-  #     update hist file
   #   else
   #     retrieve new hist
-  #     append new data to old data
-  #     update hist file
+  #     append new data to hist
   if (!file.exists(hist_path)) {
     try_error <- try(
       hist <- get_hist(symbol, NULL, end_date),
@@ -147,7 +181,7 @@ fail_count <- foreach(
   #   retrieve adjust
   #   create adjust file
   # else
-  #   if last date < exright date <= end date
+  #   if last date < adjust change date <= end date
   #     retrieve adjust
   #     replace adjust file
   #   else
@@ -169,8 +203,10 @@ fail_count <- foreach(
   } else {
     adjust <- read_csv(adjust_path, show_col_types = FALSE)
     last_date <- max(pull(adjust, date))
-    exright_date <- pull(spot_symbol, exright_date)
-    if (isTRUE(last_date < exright_date & exright_date <= end_date)) {
+    adjust_change_date <- pull(spot_symbol, adjust_change_date)
+    if (
+      isTRUE(last_date < adjust_change_date & adjust_change_date <= end_date)
+    ) {
       try_error <- try(
         adjust <- get_adjust(symbol),
         silent = TRUE
@@ -266,7 +302,7 @@ fail_count <- foreach(
       silent = TRUE
     )
     if (inherits(try_error, "try-error")) {
-      glue("{prog}: Failed to retrieve val.") %>%
+      glue("{prog}: Failed to retrieve val change.") %>%
         tslog(log_path)
       fail_count <- fail_count + 1
     } else {
@@ -276,19 +312,17 @@ fail_count <- foreach(
     }
   } else {
     val <- read_csv(val_path, show_col_types = FALSE)
-    last_date <- max(pull(val, date))
-    if (ends_with(last_date, "09-30"))
-
-
+    last_date <- max(pull(val, val_change_date))
     val_change_date <- pull(spot_symbol, val_change_date)
-    end_quarter <- quarter(end_date %m-% months(3), "date_last")
-    if (isTRUE(last_date < quarter(val_change_date %m-% months(3), "date_last") & val_change_date <= end_date)) {
+    if (
+      isTRUE(last_date < val_change_date & val_change_date <= end_date)
+    ) {
       try_error <- try(
         val <- get_val(symbol),
         silent = TRUE
       )
       if (inherits(try_error, "try-error")) {
-        glue("{prog}: Failed to retrieve val.") %>%
+        glue("{prog}: Failed to retrieve val change.") %>%
           tslog(log_path)
         fail_count <- fail_count + 1
       } else {

@@ -16,6 +16,8 @@ data_dir <- "data/"
 hist_dir <- paste0(data_dir, "hist/")
 holidays_path <- paste0(data_dir, "holidays.csv")
 
+dir.create(data_dir)
+
 files <- list.files(hist_dir)
 
 if (length(files) == 0) {
