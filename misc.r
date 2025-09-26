@@ -176,8 +176,10 @@ get_susp <- function() {
   return(data)
 }
 
+# Refresh website if having connection error
+# https://quote.eastmoney.com/center/gridlist.html#hs_a_board
 get_spot <- function() {
-  Sys.sleep(1)
+  Sys.sleep(60)
   ts1 <- as_tradedate(now() - hours(16))
   # 序号 代码 名称 最新价 涨跌幅 涨跌额 成交量 成交额 振幅 最高 最低 今开 昨收 量比 换手率
   # 市盈率-动态 市净率 总市值 流通市值 涨速 5分钟涨跌 60日涨跌幅 年初至今涨跌幅
@@ -255,18 +257,39 @@ get_shares_change <- function() {
   return(data)
 }
 
+# Refresh website if having connection error
+# https://data.eastmoney.com/bbsj/202003/yysj.html
 get_val_change <- function() {
-  Sys.sleep(1)
+  Sys.sleep(60)
   ts1 <- as_tradedate(now() - hours(16))
   # 序号 股票代码 股票简称 首次预约时间 一次变更日期 二次变更日期 三次变更日期 实际披露时间
-  data <- getForm(
-    uri = "http://127.0.0.1:8080/api/public/stock_yysj_em",
-    symbol = "沪深A股",
-    date = quarter(ts1 %m-% months(3), "date_last") %>%
-      format("%Y%m%d"),
-    .encoding = "utf-8"
+  data <- list(
+    getForm(
+      uri = "http://127.0.0.1:8080/api/public/stock_yysj_em",
+      symbol = "沪深A股",
+      date = quarter(ts1 %m-% months(3), "date_last") %>%
+        format("%Y%m%d"),
+      .encoding = "utf-8"
+    ) %>%
+      fromJSON(),
+    getForm(
+      uri = "http://127.0.0.1:8080/api/public/stock_yysj_em",
+      symbol = "沪深A股",
+      date = quarter(ts1 %m-% months(6), "date_last") %>%
+        format("%Y%m%d"),
+      .encoding = "utf-8"
+    ) %>%
+      fromJSON(),
+    getForm(
+      uri = "http://127.0.0.1:8080/api/public/stock_yysj_em",
+      symbol = "沪深A股",
+      date = quarter(ts1 %m-% months(9), "date_last") %>%
+        format("%Y%m%d"),
+      .encoding = "utf-8"
+    ) %>%
+      fromJSON()
   ) %>%
-    fromJSON()
+    rbindlist(fill = TRUE)
   ts2 <- as_tradedate(now() - hours(9))
   if (ts1 != ts2) stop(glue("Trade date changed from {ts1} to {ts2}!"))
   data <- data %>%
@@ -275,7 +298,16 @@ get_val_change <- function() {
       date = !!ts1,
       val_change_date = as_date(`实际披露时间`)
     ) %>%
-    select(symbol, date, val_change_date) %>%
+    summarize(
+      symbol = first(symbol),
+      date = first(date),
+      val_change_date = ifelse(
+        is.infinite(max(val_change_date, na.rm = TRUE)),
+        as_date(NA),
+        max(val_change_date, na.rm = TRUE)
+      ),
+      .by = symbol
+    ) %>%
     arrange(symbol)
   return(data)
 }
@@ -378,15 +410,16 @@ get_val <- function(symbol) {
   ) %>%
     fromJSON() %>%
     mutate(
-      quarter = as_date(REPORT_DATE),
+      date = as_date(REPORT_DATE),
+      val_change_date = as_tradedate(now() - hours(16)),
       revenue = TOTALOPERATEREVE,
       np = PARENTNETPROFIT,
       np_deduct = DEDU_PARENT_PROFIT,
       bvps = BPS,
       cfps = PER_NETCASH
     ) %>%
-    select(quarter, revenue, np, np_deduct, bvps, cfps) %>%
-    arrange(quarter)
+    select(date, val_change_date, revenue, np, np_deduct, bvps, cfps) %>%
+    arrange(date)
 }
 
 ################################################################################
