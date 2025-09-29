@@ -155,7 +155,7 @@ fail_count <- foreach(
     if (isTRUE(last_date >= end_date)) {
       glue("{prog}: No update.") %>%
         tslog(log_path)
-    } else if (isTRUE(last_date == end_date - 1)) {
+    } else if (isTRUE(last_date == as_tradedate(end_date - 1))) {
       hist <- bind_rows(hist, select(spot_symbol, names(hist)))
       write_csv(hist, hist_path)
       glue("{prog}: Appended spot to hist.") %>%

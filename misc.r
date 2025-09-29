@@ -176,7 +176,7 @@ get_susp <- function() {
   return(data)
 }
 
-# Refresh website if having connection error
+# Refresh webpage if having connection error
 # https://quote.eastmoney.com/center/gridlist.html#hs_a_board
 get_spot <- function() {
   Sys.sleep(60)
@@ -256,7 +256,7 @@ get_shares_change <- function() {
   return(data)
 }
 
-# Refresh website if having connection error
+# Refresh webpage if having connection error
 # https://data.eastmoney.com/bbsj/202003/yysj.html
 get_val_change <- function() {
   Sys.sleep(60)
@@ -309,6 +309,8 @@ get_val_change <- function() {
   return(data)
 }
 
+# Refresh webpage if having connection error
+# https://quote.eastmoney.com/concept/sh603777.html?from=classic(示例)
 get_hist <- function(symbol, start_date, end_date) {
   Sys.sleep(1)
   # 日期 股票代码 开盘 收盘 最高 最低 成交量 成交额 振幅 涨跌幅 涨跌额 换手率
@@ -450,21 +452,21 @@ get_roc <- function(v1, v2) (v2 - v1) / v1
 
 get_rmse <- function(v1, v2) sqrt(sum((v2 - v1) ^ 2) / length(v1))
 
-runwhich_min <- function(v, n) {
-  rollapply(
-    v, width = n, align = "right", fill = NA,
-    FUN = function(w) which.min(w)
-  )
-}
-
-runwhich_max <- function(v, n) {
+run_whichmax <- function(v, n) {
   rollapply(
     v, width = n, align = "right", fill = NA,
     FUN = function(w) which.max(w)
   )
 }
 
-runmax_var <- function(x, widths) {
+run_whichmin <- function(v, n) {
+  rollapply(
+    v, width = n, align = "right", fill = NA,
+    FUN = function(w) which.min(w)
+  )
+}
+
+run_varmax <- function(x, widths) {
   stopifnot(length(x) == length(widths))
   sapply(
     seq_along(x), function(i) {
@@ -475,7 +477,7 @@ runmax_var <- function(x, widths) {
   )
 }
 
-runmin_var <- function(x, widths) {
+run_varmin <- function(x, widths) {
   stopifnot(length(x) == length(widths))
   sapply(
     seq_along(x), function(i) {

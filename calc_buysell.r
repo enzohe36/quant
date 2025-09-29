@@ -1,14 +1,3 @@
-# A1:=FORCAST(EMA(CLOSE,5),6);
-# A2:=FORCAST(EMA(CLOSE,8),6);
-# A3:=FORCAST(EMA(CLOSE,11),6);
-# A4:=FORCAST(EMA(CLOSE,14),6);
-# A5:=FORCAST(EMA(CLOSE,17),6);
-# B:=A1+A2+A3+A4-4*A5;
-# TOWERC:=EMA(B,2);
-# STICKLINE(TOWERC>=REF(TOWERC,1),TOWERC,REF(TOWERC,1),1,0),COLORRED;
-# STICKLINE(TOWERC<REF(TOWERC,1),TOWERC,REF(TOWERC,1),1,0),COLORGREEN;
-
-
 rm(list = ls())
 
 gc()
@@ -26,18 +15,38 @@ library(tidyverse)
 
 source("misc.r", encoding = "UTF-8")
 
+plan(multisession, workers = availableCores() - 1)
+
+data_dir <- "data/"
+hist_dir <- paste0(data_dir, "hist/")
+adjust_dir <- paste0(data_dir, "adjust/")
+shares_dir <- paste0(data_dir, "shares/")
+val_dir <- paste0(data_dir, "val/")
+combined_path <- paste0(data_dir, "combined.rds")
+
 end_date <- as_tradedate(now() - hours(16))
 
+# A1:=FORCAST(EMA(CLOSE,5),6);
+# A2:=FORCAST(EMA(CLOSE,8),6);
+# A3:=FORCAST(EMA(CLOSE,11),6);
+# A4:=FORCAST(EMA(CLOSE,14),6);
+# A5:=FORCAST(EMA(CLOSE,17),6);
+# B:=A1+A2+A3+A4-4*A5;
+# TOWERC:=EMA(B,2);
+# STICKLINE(TOWERC>=REF(TOWERC,1),TOWERC,REF(TOWERC,1),1,0),COLORRED;
+# STICKLINE(TOWERC<REF(TOWERC,1),TOWERC,REF(TOWERC,1),1,0),COLORGREEN;
+
 madiff <- function(v, n) 3 * WMA(v, n) - 2 * SMA(v, n)
-dktrend <- function(v) {
+
+get_dk <- function(v) {
   a1 <- madiff(EMA(v, 5), 6)
   a2 <- madiff(EMA(v, 8), 6)
   a3 <- madiff(EMA(v, 11), 6)
   a4 <- madiff(EMA(v, 14), 6)
   a5 <- madiff(EMA(v, 17), 6)
   b <- a1 + a2 + a3 + a4 - 4 * a5
-  c <- EMA(b, 2)
-  return(c)
+  dk <- EMA(b, 2)
+  return(dk)
 }
 
 # N:=30;
@@ -47,8 +56,8 @@ dktrend <- function(v) {
 # 30,COLORRED;
 # -30,COLORGREEN;
 
-maang <- function(h, l, c, n) {
-  a1 <- SMA(c, n)
+maang <- function(h, l, c) {
+  a1 <- SMA(c, 30)
   a2 <- SMA(h - l, 100) * 0.34
   ang <- atan((a1 - lag(a1, 1)) / a2) * 180 / pi
   return(ang)
@@ -57,80 +66,159 @@ maang <- function(h, l, c, n) {
 n <- 20
 roc_threshold <- 0.2
 
-symbols <- list.files("data/hist/") %>%
+symbols <- list.files(hist_dir) %>%
   str_remove("\\.csv$")
 
-# plan(multisession, workers = availableCores() - 1)
+combined <- foreach (
+  symbol = symbols,
+  .combine = "c"
+) %dofuture% {
+  hist_path <- paste0(hist_dir, symbol, ".csv")
+  adjust_path <- paste0(adjust_dir, symbol, ".csv")
+  shares_path <- paste0(shares_dir, symbol, ".csv")
+  val_path <- paste0(val_dir, symbol, ".csv")
 
-# out <- foreach (
-#   symbol = symbols,
-#   .combine = "c"
-# ) %dofuture% {
-#   data <- read_csv(
-#     paste0("data/hist/", symbol, ".csv"), show_col_types = FALSE
-#   ) %>%
-#     full_join(
-#       read_csv(paste0("data/adjust/", symbol, ".csv"), show_col_types = FALSE),
-#       by = "date"
-#     ) %>%
-#     arrange(date) %>%
-#     fill(adjust, .direction = "down") %>%
-#     na.omit() %>%
-#     mutate(
-#       symbol = !!symbol,
-#       across(c(open, high, low, close), ~ .x * adjust),
-#       volume = volume / adjust,
-#       tp = (high + low) / 2,
-#       dk_close = dktrend(close),
-#       dk_volume = dktrend(volume),
-#       max_after_min = n - runwhich_min(close, n),
-#       min_after_max = n - runwhich_max(close, n),
-#       maang = maang(high, low, close, 30),
-#       col = case_when(
-#         dk_close - lag(dk_close) > 0 &
-#           (dk_close - lag(dk_close)) < (lag(dk_close) - lag(dk_close, 2)) &
-#           dk_volume - lag(dk_volume) < 0 &
-#           slide_lgl(
-#             maang, ~ any(.x >= 30, na.rm = TRUE),
-#             .before = n - 1, .complete = FALSE
-#           ) &
-#           runmax_var(close, max_after_min) / runMin(close, n) > 1 +
-#             roc_threshold ~
-#           "green",
-#         dk_close - lag(dk_close) < 0 &
-#           (dk_close - lag(dk_close)) > (lag(dk_close) - lag(dk_close, 2)) &
-#           (
-#             dk_volume - lag(dk_volume, 3) > 0 |
-#               dk_volume == runMin(dk_volume, n * 2)
-#           ) &
-#           runmin_var(close, min_after_max) / runMax(close, n) < 1 -
-#             roc_threshold ~
-#           "red",
-#         TRUE ~ NA
-#       ),
-#       out = case_when(
-#         slide_lgl(
-#           col, ~ any(.x == "green", na.rm = TRUE),
-#           .before = 9, .complete = FALSE
-#         ) ~
-#           "green",
-#         slide_lgl(
-#           col, ~ any(.x == "red", na.rm = TRUE),
-#           .before = 9, .complete = FALSE
-#         ) ~
-#           "red",
-#         TRUE ~ NA
-#       )
-#     ) %>%
-#     filter(date == end_date, !is.na(out)) %>%
-#     try(silent = TRUE)
-#   if (inherits(data, "try-error")) return(NULL) else return(list(data))
-# } %>%
-#   rbindlist()
+  hist <- read_csv(hist_path, show_col_types = FALSE) %>%
+    filter(
+      row_number() >
+        max(row_number()[if_any(everything(), is.na)], na.rm = TRUE)
+    )
+  if (last(SMA(hist$amount, 3)) < 10^9) return(NULL)
 
-# plan(sequential)
+  if (!file.exists(adjust_path)) {
+    return(NULL)
+  } else {
+    adjust <- read_csv(adjust_path, show_col_types = FALSE)
+  }
 
-out <- read_csv("temp_out.csv")
+  if (!file.exists(shares_path)) {
+    return(NULL)
+  } else {
+    shares <- read_csv(shares_path, show_col_types = FALSE)
+  }
+
+  if (!file.exists(val_path)) {
+    return(NULL)
+  } else {
+    try_error <- try(
+      val <- read_csv(val_path, show_col_types = FALSE) %>%
+        full_join(
+          tibble(
+            date = paste0(
+              first(year(.$date)):last(year(.$date)),
+              c("-03-31", "-06-30", "-09-30", "-12-31")
+            ) %>%
+              as_date()
+          ),
+          by = "date"
+        ) %>%
+        arrange(date) %>%
+        filter(
+          row_number() >
+            max(row_number()[if_any(everything(), is.na)], na.rm = TRUE)
+        ) %>%
+        mutate(
+          revenue = runSum(revenue, 4),
+          np = runSum(np, 4),
+          np_deduct = runSum(np_deduct, 4),
+          cfps = runSum(cfps, 4)
+        ),
+      silent = TRUE
+    )
+    if (inherits(try_error, "try-error")) return(NULL)
+  }
+
+  # combine hist, adjust, shares, val by date
+  # arrange by date
+  # fill down adjust, shares
+  # calculate mktcap, equity, cf,
+  # fill down revenue, np, np_deduct, equity, cf
+  # calculate pe, pe_deduct, pb, ps, pcf, roe
+  # adjust ohlcv
+  # add symbol
+  # select symbol, date, ohlcv, amount, pe, pe_deduct, pb, pcf, ps
+  try_error <- try(
+    data <- hist %>%
+      full_join(adjust, by = "date") %>%
+      full_join(shares, by = "date") %>%
+      full_join(val, by = "date") %>%
+      arrange(date) %>%
+      fill(adjust, shares, .direction = "down") %>%
+      mutate(
+        mktcap = close * shares,
+        equity = bvps * shares,
+        cf = cfps * shares
+      ) %>%
+      fill(revenue, np, np_deduct, equity, cf, .direction = "down") %>%
+      mutate(
+        pe = mktcap / np,
+        pe_deduct = mktcap / np_deduct,
+        pb = mktcap / equity,
+        ps = mktcap / revenue,
+        pcf = mktcap / cf,
+        roe = np / equity,
+        across(c(open, high, low, close), ~ .x * adjust),
+        volume = volume / adjust,
+        symbol = !!symbol
+      ) %>%
+      filter(date >= min(hist$date) & date <= max(hist$date)) %>%
+      na.omit() %>%
+      mutate(
+        close_dk = get_dk(close),
+        volume_dk = get_dk(volume),
+        tp = (high + low) / 2,
+        min_window = n - run_whichmax(high, n),
+        max_window = n - run_whichmin(low, n),
+        roc_nmin = run_varmin(low, min_window) / runMax(high, n),
+        roc_nmax = run_varmax(high, max_window) / runMin(low, n),
+        maang = maang(high, low, close),
+        buy = (
+          # close_dk decreases, volume_dk increases
+          close_dk - lag(close_dk) < 0 &
+            close_dk - lag(close_dk) > lag(close_dk - lag(close_dk)) &
+            volume_dk - lag(volume_dk) > 0 &
+            roc_nmin < 1 - roc_threshold
+        ),
+        sell = (
+          # close_dk increases, volume_dk decreases
+          close_dk - lag(close_dk) > 0 &
+            close_dk - lag(close_dk) < lag(close_dk - lag(close_dk)) &
+            volume_dk - lag(volume_dk) < 0 &
+            roc_nmax > 1 + roc_threshold
+        )
+      ) %>%
+      select(
+        symbol, date, close, pe, pe_deduct, pb, ps, pcf, roe, buy, sell
+      ),
+    silent = TRUE
+  )
+  if (inherits(try_error, "try-error")) return(NULL)
+
+  return(list(data))
+} %>%
+  rbindlist()
+saveRDS(combined, combined_path)
+
+# plot(data$date, data$close, type = "l")
+# points(data$date, data$close, col = ifelse(data$buy, "red", NA), pch = 16)
+# points(data$date, data$close, col = ifelse(data$sell, "green", NA), pch = 16)
+
+plan(sequential)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+slide_lgl(maang, ~ any(.x >= 30, na.rm = TRUE), .before = n - 1)
 
 symbols <- out %>%
   filter(amount > 10^9, out == "red") %>%
@@ -161,15 +249,15 @@ for (symbol in symbols) {
       across(c(open, high, low, close), ~ .x * adjust),
       volume = volume / adjust,
       tp = (high + low) / 2,
-      dk_close = dktrend(close),
-      dk_volume = dktrend(volume),
+      close_dk = dk(close),
+      volume_dk = dk(volume),
       max_after_min = n - runwhich_min(close, n),
       min_after_max = n - runwhich_max(close, n),
       maang = maang(high, low, close, 30),
       col = case_when(
-        dk_close - lag(dk_close) > 0 &
-          (dk_close - lag(dk_close)) < (lag(dk_close) - lag(dk_close, 2)) &
-          dk_volume - lag(dk_volume) < 0 &
+        close_dk - lag(close_dk) > 0 &
+          (close_dk - lag(close_dk)) < (lag(close_dk) - lag(close_dk, 2)) &
+          volume_dk - lag(volume_dk) < 0 &
           slide_lgl(
             maang, ~ any(.x >= 30, na.rm = TRUE),
             .before = n - 1, .complete = FALSE
@@ -177,11 +265,11 @@ for (symbol in symbols) {
           runmax_var(close, max_after_min) / runMin(close, n) > 1 +
             roc_threshold ~
           "green",
-        dk_close - lag(dk_close) < 0 &
-          (dk_close - lag(dk_close)) > (lag(dk_close) - lag(dk_close, 2)) &
+        close_dk - lag(close_dk) < 0 &
+          (close_dk - lag(close_dk)) > (lag(close_dk) - lag(close_dk, 2)) &
           (
-            dk_volume - lag(dk_volume, 3) > 0 |
-              dk_volume == runMin(dk_volume, n * 2)
+            volume_dk - lag(volume_dk, 3) > 0 |
+              volume_dk == runMin(volume_dk, n * 2)
           ) &
           runmin_var(close, min_after_max) / runMax(close, n) < 1 -
             roc_threshold ~

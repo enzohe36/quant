@@ -5,4 +5,4 @@ Rscript get_data.r
 Rscript get_data.r
 ts=$(date +%Y%m%d_%H%M%S)
 zip -rq "data_$ts.zip" data/
-mv "data_$ts.zip" "/Users/ehe/Library/CloudStorage/GoogleDrive-enzohe36@gmail.com/My Drive/quant/"
+mv data_$ts.zip ~/Library/CloudStorage/GoogleDrive-enzohe36@gmail.com/My\ Drive/quant/
