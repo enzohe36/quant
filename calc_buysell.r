@@ -20,11 +20,19 @@ plan(multisession, workers = availableCores() - 1)
 data_dir <- "data/"
 hist_dir <- paste0(data_dir, "hist/")
 adjust_dir <- paste0(data_dir, "adjust/")
-shares_dir <- paste0(data_dir, "shares/")
+mktcap_dir <- paste0(data_dir, "mktcap/")
 val_dir <- paste0(data_dir, "val/")
 combined_path <- paste0(data_dir, "combined.rds")
 
 end_date <- as_tradedate(now() - hours(16))
+start_date <- end_date - years(20)
+quarters <- seq(
+  start_date %m-% months(3),
+  end_date %m-% months(3),
+  by = "1 day"
+) %>%
+  quarter("date_last") %>%
+  unique()
 
 # A1:=FORCAST(EMA(CLOSE,5),6);
 # A2:=FORCAST(EMA(CLOSE,8),6);
@@ -36,7 +44,9 @@ end_date <- as_tradedate(now() - hours(16))
 # STICKLINE(TOWERC>=REF(TOWERC,1),TOWERC,REF(TOWERC,1),1,0),COLORRED;
 # STICKLINE(TOWERC<REF(TOWERC,1),TOWERC,REF(TOWERC,1),1,0),COLORGREEN;
 
-madiff <- function(v, n) 3 * WMA(v, n) - 2 * SMA(v, n)
+madiff <- function(v, n) {
+  3 * WMA(v, n) - 2 * SMA(v, n)
+}
 
 get_dk <- function(v) {
   a1 <- madiff(EMA(v, 5), 6)
@@ -73,16 +83,15 @@ combined <- foreach (
   symbol = symbols,
   .combine = "c"
 ) %dofuture% {
+  print(symbol)
+
   hist_path <- paste0(hist_dir, symbol, ".csv")
   adjust_path <- paste0(adjust_dir, symbol, ".csv")
-  shares_path <- paste0(shares_dir, symbol, ".csv")
+  mktcap_path <- paste0(mktcap_dir, symbol, ".csv")
   val_path <- paste0(val_dir, symbol, ".csv")
 
-  hist <- read_csv(hist_path, show_col_types = FALSE) %>%
-    filter(
-      row_number() >
-        max(row_number()[if_any(everything(), is.na)], na.rm = TRUE)
-    )
+  hist <- read_csv(hist_path, show_col_types = FALSE)
+  if (nrow(hist) < max(100, n)) return(NULL)
   if (last(SMA(hist$amount, 3)) < 10^9) return(NULL)
 
   if (!file.exists(adjust_path)) {
@@ -91,108 +100,105 @@ combined <- foreach (
     adjust <- read_csv(adjust_path, show_col_types = FALSE)
   }
 
-  if (!file.exists(shares_path)) {
+  if (!file.exists(mktcap_path)) {
     return(NULL)
   } else {
-    shares <- read_csv(shares_path, show_col_types = FALSE)
+    mktcap <- read_csv(mktcap_path, show_col_types = FALSE)
   }
 
   if (!file.exists(val_path)) {
     return(NULL)
   } else {
-    try_error <- try(
-      val <- read_csv(val_path, show_col_types = FALSE) %>%
-        full_join(
-          tibble(
-            date = paste0(
-              first(year(.$date)):last(year(.$date)),
-              c("-03-31", "-06-30", "-09-30", "-12-31")
-            ) %>%
-              as_date()
-          ),
-          by = "date"
-        ) %>%
-        arrange(date) %>%
-        filter(
-          row_number() >
-            max(row_number()[if_any(everything(), is.na)], na.rm = TRUE)
-        ) %>%
-        mutate(
-          revenue = runSum(revenue, 4),
-          np = runSum(np, 4),
-          np_deduct = runSum(np_deduct, 4),
-          cfps = runSum(cfps, 4)
-        ),
-      silent = TRUE
-    )
-    if (inherits(try_error, "try-error")) return(NULL)
+    val <- read_csv(val_path, show_col_types = FALSE) %>%
+      full_join(tibble(date = !!quarters), by = "date") %>%
+      arrange(date) %>%
+      mutate(
+        revenue = runSum(revenue, 4),
+        np = runSum(np, 4),
+        np_deduct = runSum(np_deduct, 4),
+        cfps = runSum(cfps, 4),
+        quarter = date
+      )
   }
 
-  # combine hist, adjust, shares, val by date
+  # combine hist, adjust, mktcap, val by date
   # arrange by date
-  # fill down adjust, shares
-  # calculate mktcap, equity, cf,
-  # fill down revenue, np, np_deduct, equity, cf
+  # fill down names(hist), names(adjust), names(mktcap)
+  # calculate shares
+  # fill down shares, quarter
+  # calculate mktcap, equity, cf, adjusted ohlcv
+  # group by quarter
+  # fill down np, np_deduct, equity, revenue, cf
+  # ungroup
   # calculate pe, pe_deduct, pb, ps, pcf, roe
-  # adjust ohlcv
   # add symbol
-  # select symbol, date, ohlcv, amount, pe, pe_deduct, pb, pcf, ps
-  try_error <- try(
-    data <- hist %>%
-      full_join(adjust, by = "date") %>%
-      full_join(shares, by = "date") %>%
-      full_join(val, by = "date") %>%
-      arrange(date) %>%
-      fill(adjust, shares, .direction = "down") %>%
-      mutate(
-        mktcap = close * shares,
-        equity = bvps * shares,
-        cf = cfps * shares
-      ) %>%
-      fill(revenue, np, np_deduct, equity, cf, .direction = "down") %>%
-      mutate(
-        pe = mktcap / np,
-        pe_deduct = mktcap / np_deduct,
-        pb = mktcap / equity,
-        ps = mktcap / revenue,
-        pcf = mktcap / cf,
-        roe = np / equity,
-        across(c(open, high, low, close), ~ .x * adjust),
-        volume = volume / adjust,
-        symbol = !!symbol
-      ) %>%
-      filter(date >= min(hist$date) & date <= max(hist$date)) %>%
-      na.omit() %>%
-      mutate(
-        close_dk = get_dk(close),
-        volume_dk = get_dk(volume),
-        tp = (high + low) / 2,
-        min_window = n - run_whichmax(high, n),
-        max_window = n - run_whichmin(low, n),
-        roc_nmin = run_varmin(low, min_window) / runMax(high, n),
-        roc_nmax = run_varmax(high, max_window) / runMin(low, n),
-        maang = maang(high, low, close),
-        buy = (
-          # close_dk decreases, volume_dk increases
-          close_dk - lag(close_dk) < 0 &
-            close_dk - lag(close_dk) > lag(close_dk - lag(close_dk)) &
-            volume_dk - lag(volume_dk) > 0 &
-            roc_nmin < 1 - roc_threshold
-        ),
-        sell = (
-          # close_dk increases, volume_dk decreases
-          close_dk - lag(close_dk) > 0 &
-            close_dk - lag(close_dk) < lag(close_dk - lag(close_dk)) &
-            volume_dk - lag(volume_dk) < 0 &
-            roc_nmax > 1 + roc_threshold
-        )
-      ) %>%
-      select(
-        symbol, date, close, pe, pe_deduct, pb, ps, pcf, roe, buy, sell
+  # select symbol, date, ohlcv, amount, financials
+  # filter by hist dates
+  data <- hist %>%
+    full_join(adjust, by = "date") %>%
+    full_join(mktcap, by = "date") %>%
+    full_join(val, by = "date") %>%
+    arrange(date) %>%
+    fill(names(hist), names(adjust), names(mktcap), .direction = "down") %>%
+    mutate(shares = mktcap / close * 10^8) %>%
+    fill(shares, quarter, .direction = "down") %>%
+    mutate(
+      mktcap = shares * close,
+      equity = bvps * shares,
+      cf = cfps * shares,
+      across(c(open, high, low, close), ~ .x * adjust),
+      volume = volume / adjust
+    ) %>%
+    group_by(quarter) %>%
+    fill(np, np_deduct, equity, revenue, cf, .direction = "down") %>%
+    ungroup() %>%
+    mutate(
+      pe = mktcap / np,
+      pe_deduct = mktcap / np_deduct,
+      pb = mktcap / equity,
+      ps = mktcap / revenue,
+      pcf = mktcap / cf,
+      roe = np / equity,
+      symbol = !!symbol,
+      across(c(open, high, low, close, pe, pe_deduct, pb, ps, pcf), round, 2),
+      volume = round(volume),
+      amount = round(amount / 10^8, 2),
+      roe = round(roe, 4)
+    ) %>%
+    select(symbol, names(hist), pe, pe_deduct, pb, ps, pcf, roe) %>%
+    filter(date %in% hist$date & date >= start_date)
+
+
+
+
+  data <- data %>%
+    mutate(
+      close_dk = get_dk(close),
+      volume_dk = get_dk(volume),
+      tp = (high + low) / 2,
+      min_window = n - run_whichmax(high, n),
+      max_window = n - run_whichmin(low, n),
+      roc_nmin = run_varmin(low, min_window) / runMax(high, n),
+      roc_nmax = run_varmax(high, max_window) / runMin(low, n),
+      # maang = maang(high, low, close),
+      buy = (
+        # close_dk decreases, volume_dk increases
+        close_dk - lag(close_dk) < 0 &
+          close_dk - lag(close_dk) > lag(close_dk - lag(close_dk)) &
+          volume_dk - lag(volume_dk) > 0 &
+          roc_nmin < 1 - roc_threshold
       ),
-    silent = TRUE
-  )
-  if (inherits(try_error, "try-error")) return(NULL)
+      sell = (
+        # close_dk increases, volume_dk decreases
+        close_dk - lag(close_dk) > 0 &
+          close_dk - lag(close_dk) < lag(close_dk - lag(close_dk)) &
+          volume_dk - lag(volume_dk) < 0 &
+          roc_nmax > 1 + roc_threshold
+      )
+    ) %>%
+    select(
+      symbol, date, close, pe, pe_deduct, pb, ps, pcf, roe, buy, sell
+    )
 
   return(list(data))
 } %>%

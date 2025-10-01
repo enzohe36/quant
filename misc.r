@@ -139,7 +139,8 @@ get_symbols <- function() {
         delist = TRUE
       )
   ) %>%
-    rbindlist(fill = TRUE)
+    rbindlist(fill = TRUE) %>%
+    distinct(symbol, .keep_all = TRUE)
   ts2 <- as_tradedate(now() - hours(9))
   if (ts1 != ts2) stop(glue("Trade date changed from {ts1} to {ts2}!"))
   data <- data %>%
@@ -360,29 +361,51 @@ get_adjust <- function(symbol) {
     arrange(date)
 }
 
-get_shares <- function(symbol) {
+# get_shares <- function(symbol, start_date, end_date) {
+#   Sys.sleep(1)
+#   # 证券简称 机构名称 境外法人持股 证券投资基金持股 国家持股-受限 国有法人持股 配售法人股
+#   # 发起人股份 未流通股份 其中：境外自然人持股 其他流通受限股份 其他流通股 外资持股-受限
+#   # 内部职工股 境外上市外资股-H股 其中：境内法人持股 自然人持股 人民币普通股
+#   # 国有法人持股-受限 一般法人持股 控股股东、实际控制人 其中：限售H股 变动原因 公告日期
+#   # 境内法人持股 证券代码 变动日期 战略投资者持股 国家持股 其中：限售B股 其他未流通股
+#   # 流通受限股份 优先股 高管股 总股本 其中：限售高管股 转配股 境内上市外资股-B股
+#   # 其中：境外法人持股 募集法人股 已流通股份 其中：境内自然人持股 其他内资持股-受限
+#   # 变动原因编码
+#   getForm(
+#     uri = "http://127.0.0.1:8080/api/public/stock_share_change_cninfo",
+#     symbol = symbol,
+#     start_date = ifelse(
+#       is.null(start_date), "19000101", format(start_date, "%Y%m%d")
+#     ),
+#     end_date = format(end_date, "%Y%m%d"),
+#     .encoding = "utf-8"
+#   ) %>%
+#     fromJSON() %>%
+#     mutate(
+#       date = as_date(`变动日期`),
+#       shares = `总股本`,
+#       shares_float = `已流通股份`
+#     ) %>%
+#     select(date, shares, shares_float) %>%
+#     arrange(date)
+# }
+
+get_mktcap <- function(symbol) {
   Sys.sleep(1)
-  # 变更日期 总股本 流通受限股份 其他内资持股(受限) 境内法人持股(受限) 境内自然人持股(受限)
-  # 已流通股份 已上市流通A股 变动原因
+  # date value
   getForm(
-    uri = "http://127.0.0.1:8080/api/public/stock_zh_a_gbjg_em",
-    symbol = paste0(
-      symbol,
-      case_when(
-        str_detect(symbol, "^6") ~ ".SH",
-        str_detect(symbol, "^(0|3)") ~ ".SZ",
-        TRUE ~ ".BJ"
-      )
-    ),
+    uri = "http://127.0.0.1:8080/api/public/stock_zh_valuation_baidu",
+    symbol = symbol,
+    indicator = "总市值",
+    period = "全部",
     .encoding = "utf-8"
   ) %>%
     fromJSON() %>%
     mutate(
-      date = as_date(`变更日期`),
-      shares = `总股本`,
-      shares_float = `已上市流通A股`
+      date = as_date(date),
+      mktcap = value
     ) %>%
-    select(date, shares, shares_float) %>%
+    select(date, mktcap) %>%
     arrange(date)
 }
 
@@ -494,6 +517,22 @@ fit_gaussian <- function(x, y) {
     start = c(s = 1, m = 0)
   )
 }
+
+runSum <- function(x, n) {
+  sapply(seq_along(x), function(i) {
+    if (i < n) {
+      return(NA_real_)   # not enough values before current
+    }
+    window <- x[(i - n + 1):i]
+    if (any(is.na(window))) {
+      return(NA_real_)
+    } else {
+      return(sum(window))
+    }
+  })
+}
+
+
 
 ################################################################################
 # Feature engineering functions
