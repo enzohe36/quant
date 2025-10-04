@@ -53,6 +53,7 @@ get_index_spot <- function() {
     select(
       symbol, name, market, date, open, high, low, close, volume, amount
     ) %>%
+    distinct(symbol, .keep_all = TRUE) %>%
     arrange(symbol)
   return(data)
 }
@@ -139,13 +140,13 @@ get_symbols <- function() {
         delist = TRUE
       )
   ) %>%
-    rbindlist(fill = TRUE) %>%
-    distinct(symbol, .keep_all = TRUE)
+    rbindlist(fill = TRUE)
   ts2 <- as_tradedate(now() - hours(9))
   if (ts1 != ts2) stop(glue("Trade date changed from {ts1} to {ts2}!"))
   data <- data %>%
     mutate(date = !!ts1) %>%
     select(symbol, name, date, delist) %>%
+    distinct(symbol, .keep_all = TRUE) %>%
     arrange(symbol)
   return(data)
 }
@@ -361,7 +362,7 @@ get_adjust <- function(symbol) {
     arrange(date)
 }
 
-get_mktcap <- function(symbol) {
+get_mc <- function(symbol) {
   Sys.sleep(1)
   # date value
   getForm(
@@ -373,11 +374,11 @@ get_mktcap <- function(symbol) {
   ) %>%
     fromJSON() %>%
     mutate(
-      date = as_date(date),
-      mktcap = value * 10^8
+      date = as_tradedate(date),
+      mc = value
     ) %>%
+    select(date, mc) %>%
     distinct(date, .keep_all = TRUE) %>%
-    select(date, mktcap) %>%
     arrange(date)
 }
 
@@ -428,15 +429,15 @@ get_val2 <- function(symbol) {
     fromJSON() %>%
     mutate(
       date = as_date(`数据日期`),
-      mktcap = `总市值`,
-      mktcap_float = `流通市值`,
+      mc = `总市值`,
+      mc_float = `流通市值`,
       pe = `PE(TTM)`,
       peg = `PEG值`,
       pb = `市净率`,
       ps = `市现率`,
       pc = `市销率`
     ) %>%
-    select(date, mktcap, mktcap_float, pe, peg, pb, ps, pc) %>%
+    select(date, mc, mc_float, pe, peg, pb, ps, pc) %>%
     arrange(date)
 }
 
