@@ -53,6 +53,7 @@ get_index_spot <- function() {
     select(
       symbol, name, market, date, open, high, low, close, volume, amount
     ) %>%
+    distinct(symbol, .keep_all = TRUE) %>%
     arrange(symbol)
   return(data)
 }
@@ -94,7 +95,7 @@ get_index_comp <- function(symbol) {
       symbol = `成分券代码`,
       date = !!ts1,
       index = !!symbol,
-      index_weight = `权重` / 100
+      index_weight = `权重`
     ) %>%
     select(symbol, date, index, index_weight) %>%
     arrange(symbol)
@@ -139,13 +140,13 @@ get_symbols <- function() {
         delist = TRUE
       )
   ) %>%
-    rbindlist(fill = TRUE) %>%
-    distinct(symbol, .keep_all = TRUE)
+    rbindlist(fill = TRUE)
   ts2 <- as_tradedate(now() - hours(9))
   if (ts1 != ts2) stop(glue("Trade date changed from {ts1} to {ts2}!"))
   data <- data %>%
     mutate(date = !!ts1) %>%
     select(symbol, name, date, delist) %>%
+    distinct(symbol, .keep_all = TRUE) %>%
     arrange(symbol)
   return(data)
 }
@@ -207,28 +208,61 @@ get_spot <- function() {
   return(data)
 }
 
+# Refresh webpage if having connection error
+# https://data.eastmoney.com/yjfp/
 get_adjust_change <- function() {
-  Sys.sleep(1)
+  Sys.sleep(60)
   ts1 <- as_tradedate(now() - hours(16))
   # 代码 名称 送转股份-送转总比例 送转股份-送转比例 送转股份-转股比例 现金分红-现金分红比例
   # 现金分红-股息率 每股收益 每股净资产 每股公积金 每股未分配利润 净利润同比增长 总股本
   # 预案公告日 股权登记日 除权除息日 方案进度 最新公告日期
-  data <- getForm(
-    uri = "http://127.0.0.1:8080/api/public/stock_fhps_em",
-    date = quarter(ts1 %m-% months(3), "date_last") %>%
-      format("%Y%m%d"),
-    .encoding = "utf-8"
+  data <- list(
+    getForm(
+      uri = "http://127.0.0.1:8080/api/public/stock_fhps_em",
+      date = quarter(ts1 %m-% months(3), "date_last") %>%
+        format("%Y%m%d"),
+      .encoding = "utf-8"
+    ) %>%
+      fromJSON(),
+    getForm(
+      uri = "http://127.0.0.1:8080/api/public/stock_fhps_em",
+      date = quarter(ts1 %m-% months(6), "date_last") %>%
+        format("%Y%m%d"),
+      .encoding = "utf-8"
+    ) %>%
+      fromJSON(),
+    getForm(
+      uri = "http://127.0.0.1:8080/api/public/stock_fhps_em",
+      date = quarter(ts1 %m-% months(9), "date_last") %>%
+        format("%Y%m%d"),
+      .encoding = "utf-8"
+    ) %>%
+      fromJSON(),
+    getForm(
+      uri = "http://127.0.0.1:8080/api/public/stock_fhps_em",
+      date = quarter(ts1 %m-% months(12), "date_last") %>%
+        format("%Y%m%d"),
+      .encoding = "utf-8"
+    ) %>%
+      fromJSON()
   ) %>%
-    fromJSON()
+    rbindlist(fill = TRUE)
   ts2 <- as_tradedate(now() - hours(9))
   if (ts1 != ts2) stop(glue("Trade date changed from {ts1} to {ts2}!"))
   data <- data %>%
     mutate(
       symbol = `代码`,
-      date = !!ts1,
       adjust_change_date = as_date(`除权除息日`)
     ) %>%
-    select(symbol, date, adjust_change_date) %>%
+    summarize(
+      date = !!ts1,
+      adjust_change_date = if_else(
+        is.infinite(max(adjust_change_date, na.rm = TRUE)),
+        as_date(NA),
+        max(adjust_change_date, na.rm = TRUE)
+      ),
+      .by = symbol
+    ) %>%
     arrange(symbol)
   return(data)
 }
@@ -284,6 +318,14 @@ get_val_change <- function() {
       uri = "http://127.0.0.1:8080/api/public/stock_yysj_em",
       symbol = "沪深A股",
       date = quarter(ts1 %m-% months(9), "date_last") %>%
+        format("%Y%m%d"),
+      .encoding = "utf-8"
+    ) %>%
+      fromJSON(),
+    getForm(
+      uri = "http://127.0.0.1:8080/api/public/stock_yysj_em",
+      symbol = "沪深A股",
+      date = quarter(ts1 %m-% months(12), "date_last") %>%
         format("%Y%m%d"),
       .encoding = "utf-8"
     ) %>%
@@ -361,7 +403,7 @@ get_adjust <- function(symbol) {
     arrange(date)
 }
 
-get_mktcap <- function(symbol) {
+get_mc <- function(symbol) {
   Sys.sleep(1)
   # date value
   getForm(
@@ -373,11 +415,11 @@ get_mktcap <- function(symbol) {
   ) %>%
     fromJSON() %>%
     mutate(
-      date = as_date(date),
-      mktcap = value * 10^8
+      date = as_tradedate(date),
+      mc = value
     ) %>%
+    select(date, mc) %>%
     distinct(date, .keep_all = TRUE) %>%
-    select(date, mktcap) %>%
     arrange(date)
 }
 
@@ -428,15 +470,15 @@ get_val2 <- function(symbol) {
     fromJSON() %>%
     mutate(
       date = as_date(`数据日期`),
-      mktcap = `总市值`,
-      mktcap_float = `流通市值`,
+      mc = `总市值`,
+      mc_float = `流通市值`,
       pe = `PE(TTM)`,
       peg = `PEG值`,
       pb = `市净率`,
       ps = `市现率`,
       pc = `市销率`
     ) %>%
-    select(date, mktcap, mktcap_float, pe, peg, pb, ps, pc) %>%
+    select(date, mc, mc_float, pe, peg, pb, ps, pc) %>%
     arrange(date)
 }
 

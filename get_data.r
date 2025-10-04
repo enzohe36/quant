@@ -17,7 +17,7 @@ source("misc.r", encoding = "UTF-8")
 data_dir <- "data/"
 hist_dir <- paste0(data_dir, "hist/")
 adjust_dir <- paste0(data_dir, "adjust/")
-mktcap_dir <- paste0(data_dir, "mktcap/")
+mc_dir <- paste0(data_dir, "mc/")
 val_dir <- paste0(data_dir, "val/")
 spot_path <- paste0(data_dir, "spot.csv")
 
@@ -27,7 +27,7 @@ log_path <- paste0(log_dir, format(now(), "%Y%m%d_%H%M%S"), ".log")
 dir.create(data_dir)
 dir.create(hist_dir)
 dir.create(adjust_dir)
-dir.create(mktcap_dir)
+dir.create(mc_dir)
 dir.create(val_dir)
 dir.create(log_dir)
 
@@ -42,7 +42,7 @@ loop_get <- function(var, ...) {
       silent = TRUE
     )
     if (inherits(try_error, "try-error")) {
-      glue("Failed to retrieve {var} after {fail_count} tries.") %>%
+      glue("Error retrieving {var} after {fail_count} try(s).") %>%
         tsprint()
       fail_count <- fail_count + 1
     } else {
@@ -102,24 +102,21 @@ symbols <- spot %>%
 glue("Checking updates for {length(symbols)} symbols...") %>%
   tsprint()
 
-step_count <- 1
-fail_count <- foreach(
+out <- foreach(
   symbol = symbols,
   .combine = "c"
 ) %dopar% {
   vars <- c(
-    "adjust", "adjust_change_date", "adjust_path", "fail_count", "hist",
-    "hist_path", "prog", "mktcap", "shares_change_date", "mktcap_path",
-    "spot_symbol", "try_error", "val", "val_change_date", "val_path"
+    "hist", "hist_path", "adjust", "adjust_path", "adjust_change_date",
+    "mc", "mc_path", "shares_change_date",
+    "val", "val_path", "val_change_date", "spot_symbol",
+    "try_error", "last_date"
   )
   rm(list = vars)
 
-  prog <- glue("{step_count}/{length(symbols)} {symbol}")
-  fail_count <- 0
-
   hist_path <- paste0(hist_dir, symbol, ".csv")
   adjust_path <- paste0(adjust_dir, symbol, ".csv")
-  mktcap_path <- paste0(mktcap_dir, symbol, ".csv")
+  mc_path <- paste0(mc_dir, symbol, ".csv")
   val_path <- paste0(val_dir, symbol, ".csv")
 
   spot_symbol <- filter(spot, symbol == !!symbol)
@@ -129,7 +126,7 @@ fail_count <- foreach(
   #   create hist file
   # else
   #   if last date >= end date
-  #     no update
+  #     no action
   #   else if last date = end date - 1
   #     append spot to hist
   #   else
@@ -139,34 +136,33 @@ fail_count <- foreach(
     if (!file.exists(hist_path)) {
       hist <- get_hist(symbol, NULL, end_date)
       write_csv(hist, hist_path)
-      glue("{prog}: Created hist file.") %>%
+      glue("{symbol}: Created hist file.") %>%
         tslog(log_path)
     } else {
       hist <- read_csv(hist_path, show_col_types = FALSE)
       last_date <- max(pull(hist, date))
       if (
-        isTRUE(last_date >= end_date | spot_symbol$delist | spot_symbol$susp)
+        last_date >= end_date |
+          pull(spot_symbol, delist) |
+          pull(spot_symbol, susp)
       ) {
-        glue("{prog}: No update.") %>%
-          tslog(log_path)
       } else if (isTRUE(last_date == as_tradedate(end_date - 1))) {
         hist <- bind_rows(hist, select(spot_symbol, names(hist)))
         write_csv(hist, hist_path)
-        glue("{prog}: Appended spot to hist.") %>%
+        glue("{symbol}: Appended spot to hist.") %>%
           tslog(log_path)
       } else {
         hist <- bind_rows(hist, get_hist(symbol, last_date + 1, end_date))
         write_csv(hist, hist_path)
-        glue("{prog}: Appended new data to hist.") %>%
+        glue("{symbol}: Appended new data to hist.") %>%
           tslog(log_path)
       }
     },
     silent = TRUE
   )
   if (inherits(try_error, "try-error")) {
-    glue("{prog}: Failed to retrieve hist.") %>%
+    glue("{symbol}: Error retrieving hist.") %>%
       tslog(log_path)
-    fail_count <- fail_count + 1
   }
 
   # if adjust file does not exist
@@ -177,12 +173,12 @@ fail_count <- foreach(
   #     retrieve adjust
   #     replace adjust file
   #   else
-  #     no update
+  #     no action
   try_error <- try(
     if (!file.exists(adjust_path)) {
       adjust <- get_adjust(symbol)
       write_csv(adjust, adjust_path)
-      glue("{prog}: Created adjust file.") %>%
+      glue("{symbol}: Created adjust file.") %>%
         tslog(log_path)
     } else {
       adjust <- read_csv(adjust_path, show_col_types = FALSE)
@@ -193,58 +189,50 @@ fail_count <- foreach(
       ) {
         adjust <- get_adjust(symbol)
         write_csv(adjust, adjust_path)
-        glue("{prog}: Replaced adjust file.") %>%
-          tslog(log_path)
-      } else {
-        glue("{prog}: No update.") %>%
+        glue("{symbol}: Replaced adjust file.") %>%
           tslog(log_path)
       }
     },
     silent = TRUE
   )
   if (inherits(try_error, "try-error")) {
-    glue("{prog}: Failed to retrieve adjust.") %>%
+    glue("{symbol}: Error retrieving adjust.") %>%
       tslog(log_path)
-    fail_count <- fail_count + 1
   }
 
-  # if mktcap file does not exist
-  #   retrieve mktcap
-  #   create mktcap file
+  # if mc file does not exist
+  #   retrieve mc
+  #   create mc file
   # else
-  #   if last date < mktcap change date <= end date
-  #     retrieve mktcap
-  #     replace mktcap file
+  #   if last date < mc change date <= end date
+  #     retrieve mc
+  #     replace mc file
   #   else
-  #     no update
+  #     no action
   try_error <- try(
-    if (!file.exists(mktcap_path)) {
-      mktcap <- get_mktcap(symbol)
-      write_csv(mktcap, mktcap_path)
-      glue("{prog}: Created mktcap file.") %>%
+    if (!file.exists(mc_path)) {
+      mc <- get_mc(symbol)
+      write_csv(mc, mc_path)
+      glue("{symbol}: Created mc file.") %>%
         tslog(log_path)
     } else {
-      mktcap <- read_csv(mktcap_path, show_col_types = FALSE)
-      last_date <- max(pull(mktcap, date))
+      mc <- read_csv(mc_path, show_col_types = FALSE)
+      last_date <- max(pull(mc, date))
       shares_change_date <- pull(spot_symbol, shares_change_date)
       if (
         isTRUE(last_date < shares_change_date & shares_change_date <= end_date)
       ) {
-        mktcap <- get_mktcap(symbol)
-        write_csv(mktcap, mktcap_path)
-        glue("{prog}: Replaced mktcap file.") %>%
-          tslog(log_path)
-      } else {
-        glue("{prog}: No update.") %>%
+        mc <- get_mc(symbol)
+        write_csv(mc, mc_path)
+        glue("{symbol}: Replaced mc file.") %>%
           tslog(log_path)
       }
     },
     silent = TRUE
   )
   if (inherits(try_error, "try-error")) {
-    glue("{prog}: Failed to retrieve mktcap.") %>%
+    glue("{symbol}: Error retrieving mc.") %>%
       tslog(log_path)
-    fail_count <- fail_count + 1
   }
 
   # if val file does not exist
@@ -255,12 +243,12 @@ fail_count <- foreach(
   #     retrieve val
   #     replace val file
   #   else
-  #     no update
+  #     no action
   try_error <- try(
     if (!file.exists(val_path)) {
       val <- get_val(symbol)
       write_csv(val, val_path)
-      glue("{prog}: Created val file.") %>%
+      glue("{symbol}: Created val file.") %>%
         tslog(log_path)
     } else {
       val <- read_csv(val_path, show_col_types = FALSE)
@@ -271,25 +259,15 @@ fail_count <- foreach(
       ) {
         val <- get_val(symbol)
         write_csv(val, val_path)
-        glue("{prog}: Replaced val file.") %>%
-          tslog(log_path)
-      } else {
-        glue("{prog}: No update.") %>%
+        glue("{symbol}: Replaced val file.") %>%
           tslog(log_path)
       }
     },
     silent = TRUE
   )
   if (inherits(try_error, "try-error")) {
-    glue("{prog}: Failed to retrieve val.") %>%
+    glue("{symbol}: Error retrieving val.") %>%
       tslog(log_path)
-    fail_count <- fail_count + 1
   }
-
-  step_count <- step_count + 1
-  return(fail_count)
 } %>%
   sum()
-
-glue("Finished checking updates; {fail_count} failed.") %>%
-  tsprint()

@@ -20,9 +20,14 @@ plan(multisession, workers = availableCores() - 1)
 data_dir <- "data/"
 hist_dir <- paste0(data_dir, "hist/")
 adjust_dir <- paste0(data_dir, "adjust/")
-mktcap_dir <- paste0(data_dir, "mktcap/")
+mc_dir <- paste0(data_dir, "mc/")
 val_dir <- paste0(data_dir, "val/")
 combined_path <- paste0(data_dir, "combined.rds")
+
+log_dir <- "logs/"
+log_path <- paste0(log_dir, format(now(), "%Y%m%d_%H%M%S"), ".log")
+
+dir.create(log_dir)
 
 end_date <- as_tradedate(now() - hours(16))
 start_date <- end_date - years(20)
@@ -83,71 +88,98 @@ combined <- foreach (
   symbol = symbols,
   .combine = "c"
 ) %dofuture% {
-  print(symbol)
+  vars <- c(
+    "hist", "hist_path", "adjust", "adjust_path",
+    "mc", "mc_path", "val", "val_path",
+    "data", "try_error"
+  )
+  rm(list = vars)
 
   hist_path <- paste0(hist_dir, symbol, ".csv")
   adjust_path <- paste0(adjust_dir, symbol, ".csv")
-  mktcap_path <- paste0(mktcap_dir, symbol, ".csv")
+  mc_path <- paste0(mc_dir, symbol, ".csv")
   val_path <- paste0(val_dir, symbol, ".csv")
 
   hist <- read_csv(hist_path, show_col_types = FALSE)
 
   if (!file.exists(adjust_path)) {
+    glue("{symbol} Missing adjust file.") %>%
+      tslog(log_path)
     return(NULL)
   } else {
     adjust <- read_csv(adjust_path, show_col_types = FALSE)
   }
 
-  if (!file.exists(mktcap_path)) {
+  if (!file.exists(mc_path)) {
+    glue("{symbol} Missing mc file.") %>%
+      tslog(log_path)
     return(NULL)
   } else {
-    mktcap <- read_csv(mktcap_path, show_col_types = FALSE)
+    mc <- read_csv(mc_path, show_col_types = FALSE)
   }
 
-  if (!file.exists(val_path)) {
+  try_error <- try(
+    if (!file.exists(val_path)) {
+      glue("{symbol} Missing val file.") %>%
+        tslog(log_path)
+      return(NULL)
+    } else {
+      val <- read_csv(val_path, show_col_types = FALSE) %>%
+        full_join(tibble(date = !!quarters), by = "date") %>%
+        arrange(date) %>%
+        mutate(
+          revenue = runSum(revenue, 4),
+          np = runSum(np, 4),
+          np_deduct = runSum(np_deduct, 4),
+          cfps = runSum(cfps, 4),
+          quarter = date
+        )
+    },
+    silent = TRUE
+  )
+  if (inherits(try_error, "try-error")) {
+    glue("{symbol} Error reading val file.") %>%
+      tslog(log_path)
     return(NULL)
-  } else {
-    val <- read_csv(val_path, show_col_types = FALSE) %>%
-      full_join(tibble(date = !!quarters), by = "date") %>%
+  }
+
+  try_error <- try(
+    data <- hist %>%
+      full_join(adjust, by = "date") %>%
+      full_join(mc, by = "date") %>%
+      full_join(val, by = "date") %>%
       arrange(date) %>%
+      fill(names(hist), .direction = "down") %>%
+      mutate(shares = mc * 10^8 / close) %>%
+      fill(adjust, shares, quarter, .direction = "down") %>%
       mutate(
-        revenue = runSum(revenue, 4),
-        np = runSum(np, 4),
-        np_deduct = runSum(np_deduct, 4),
-        cfps = runSum(cfps, 4),
-        quarter = date
-      )
+        mc = close * shares,
+        equity = bvps * shares,
+        cf = cfps * shares,
+        across(c(open, high, low, close), ~ .x * adjust),
+        volume = volume / adjust
+      ) %>%
+      group_by(quarter) %>%
+      fill(np, np_deduct, equity, revenue, cf, .direction = "down") %>%
+      ungroup() %>%
+      mutate(
+        pe = mc / np,
+        pe_deduct = mc / np_deduct,
+        pb = mc / equity,
+        ps = mc / revenue,
+        pcf = mc / cf,
+        roe = np / equity,
+        symbol = !!symbol
+      ) %>%
+      select(symbol, names(hist), pe, pe_deduct, pb, ps, pcf, roe) %>%
+      filter(date %in% pull(hist, date)),
+    silent = TRUE
+  )
+  if (inherits(try_error, "try-error")) {
+    glue("{symbol} Error calculating val.") %>%
+      tslog(log_path)
+    return(NULL)
   }
-
-  data <- hist %>%
-    full_join(adjust, by = "date") %>%
-    full_join(mktcap, by = "date") %>%
-    full_join(val, by = "date") %>%
-    arrange(date) %>%
-    fill(names(hist), .direction = "down") %>%
-    mutate(shares = mktcap / close) %>%
-    fill(adjust, shares, quarter, .direction = "down") %>%
-    mutate(
-      mktcap = close * shares,
-      equity = bvps * shares,
-      cf = cfps * shares,
-      across(c(open, high, low, close), ~ .x * adjust),
-      volume = volume / adjust
-    ) %>%
-    group_by(quarter) %>%
-    fill(np, np_deduct, equity, revenue, cf, .direction = "down") %>%
-    ungroup() %>%
-    mutate(
-      pe = mktcap / np,
-      pe_deduct = mktcap / np_deduct,
-      pb = mktcap / equity,
-      ps = mktcap / revenue,
-      pcf = mktcap / cf,
-      roe = np / equity,
-      symbol = !!symbol
-    ) %>%
-    select(symbol, names(hist), pe, pe_deduct, pb, ps, pcf, roe) %>%
-    filter(date %in% hist$date)
 
   # select(data, date, pe) %>%
   #   left_join(select(get_val2(symbol), date, pe), by = "date") %>%
@@ -155,41 +187,42 @@ combined <- foreach (
   #   filter(diff != 0) %>%
   #   print(n = Inf)
 
-  data <- data %>%
-    mutate(
-      close_dk = get_dk(close),
-      volume_dk = get_dk(volume),
-      min_window = n - run_whichmax(high, n),
-      max_window = n - run_whichmin(low, n),
-      roc_nmin = run_varmin(low, min_window) / runMax(high, n),
-      roc_nmax = run_varmax(high, max_window) / runMin(low, n),
-      # maang = maang(high, low, close),
-      buy = (
-        # close_dk decreases, volume_dk increases
-        close_dk - lag(close_dk) < 0 &
-          close_dk - lag(close_dk) > lag(close_dk - lag(close_dk)) &
-          volume_dk - lag(volume_dk) > 0 &
-          roc_nmin < 1 - roc_threshold
-      ),
-      sell = (
-        # close_dk increases, volume_dk decreases
-        close_dk - lag(close_dk) > 0 &
-          close_dk - lag(close_dk) < lag(close_dk - lag(close_dk)) &
-          volume_dk - lag(volume_dk) < 0 &
-          roc_nmax > 1 + roc_threshold
-      ),
-    ) %>%
-    mutate(
-      amount = amount / 10^8,
-      across(c(close, amount), round),
-      across(c(pe, pe_deduct, pb, ps, pcf), round, 2),
-      roe = round(roe, 4)
-    ) %>%
-    select(
-      symbol, date, close, amount, buy, sell, pe, pe_deduct, pb, ps, pcf, roe
-    ) %>%
-    filter(date >= start_date & date <= end_date)
-
+  try_error <- try(
+    data <- data %>%
+      mutate(
+        close_dk = get_dk(close),
+        volume_dk = get_dk(volume),
+        min_window = n - run_whichmax(high, n),
+        max_window = n - run_whichmin(low, n),
+        roc_nmin = run_varmin(low, min_window) / runMax(high, n),
+        roc_nmax = run_varmax(high, max_window) / runMin(low, n),
+        # maang = maang(high, low, close),
+        buy = (
+          # close_dk decreases, volume_dk increases
+          close_dk - lag(close_dk) < 0 &
+            close_dk - lag(close_dk) > lag(close_dk - lag(close_dk)) &
+            volume_dk - lag(volume_dk) > 0 &
+            roc_nmin < 1 - roc_threshold
+        ),
+        sell = (
+          # close_dk increases, volume_dk decreases
+          close_dk - lag(close_dk) > 0 &
+            close_dk - lag(close_dk) < lag(close_dk - lag(close_dk)) &
+            volume_dk - lag(volume_dk) < 0 &
+            roc_nmax > 1 + roc_threshold
+        ),
+      ) %>%
+      select(
+        symbol, date, close, amount, buy, sell, pe, pe_deduct, pb, ps, pcf, roe
+      ) %>%
+      filter(date >= start_date & date <= end_date),
+    silent = TRUE
+  )
+  if (inherits(try_error, "try-error")) {
+    glue("{symbol} Error calculating buy/sell.") %>%
+      tslog(log_path)
+    return(NULL)
+  }
   return(list(data))
 } %>%
   rbindlist()
