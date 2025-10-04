@@ -361,35 +361,6 @@ get_adjust <- function(symbol) {
     arrange(date)
 }
 
-# get_shares <- function(symbol, start_date, end_date) {
-#   Sys.sleep(1)
-#   # 证券简称 机构名称 境外法人持股 证券投资基金持股 国家持股-受限 国有法人持股 配售法人股
-#   # 发起人股份 未流通股份 其中：境外自然人持股 其他流通受限股份 其他流通股 外资持股-受限
-#   # 内部职工股 境外上市外资股-H股 其中：境内法人持股 自然人持股 人民币普通股
-#   # 国有法人持股-受限 一般法人持股 控股股东、实际控制人 其中：限售H股 变动原因 公告日期
-#   # 境内法人持股 证券代码 变动日期 战略投资者持股 国家持股 其中：限售B股 其他未流通股
-#   # 流通受限股份 优先股 高管股 总股本 其中：限售高管股 转配股 境内上市外资股-B股
-#   # 其中：境外法人持股 募集法人股 已流通股份 其中：境内自然人持股 其他内资持股-受限
-#   # 变动原因编码
-#   getForm(
-#     uri = "http://127.0.0.1:8080/api/public/stock_share_change_cninfo",
-#     symbol = symbol,
-#     start_date = ifelse(
-#       is.null(start_date), "19000101", format(start_date, "%Y%m%d")
-#     ),
-#     end_date = format(end_date, "%Y%m%d"),
-#     .encoding = "utf-8"
-#   ) %>%
-#     fromJSON() %>%
-#     mutate(
-#       date = as_date(`变动日期`),
-#       shares = `总股本`,
-#       shares_float = `已流通股份`
-#     ) %>%
-#     select(date, shares, shares_float) %>%
-#     arrange(date)
-# }
-
 get_mktcap <- function(symbol) {
   Sys.sleep(1)
   # date value
@@ -403,8 +374,9 @@ get_mktcap <- function(symbol) {
     fromJSON() %>%
     mutate(
       date = as_date(date),
-      mktcap = value
+      mktcap = value * 10^8
     ) %>%
+    distinct(date, .keep_all = TRUE) %>%
     select(date, mktcap) %>%
     arrange(date)
 }
@@ -441,6 +413,30 @@ get_val <- function(symbol) {
       cfps = PER_NETCASH
     ) %>%
     select(date, val_change_date, revenue, np, np_deduct, bvps, cfps) %>%
+    arrange(date)
+}
+
+get_val2 <- function(symbol) {
+  Sys.sleep(1)
+  # 数据日期 当日收盘价 当日涨跌幅 总市值 流通市值 总股本 流通股本 PE(TTM) PE(静) 市净率
+  # PEG值 市现率 市销率
+  getForm(
+    uri = "http://127.0.0.1:8080/api/public/stock_value_em",
+    symbol = symbol,
+    .encoding = "utf-8"
+  ) %>%
+    fromJSON() %>%
+    mutate(
+      date = as_date(`数据日期`),
+      mktcap = `总市值`,
+      mktcap_float = `流通市值`,
+      pe = `PE(TTM)`,
+      peg = `PEG值`,
+      pb = `市净率`,
+      ps = `市现率`,
+      pc = `市销率`
+    ) %>%
+    select(date, mktcap, mktcap_float, pe, peg, pb, ps, pc) %>%
     arrange(date)
 }
 
@@ -660,14 +656,13 @@ as_tradedate <- function(datetime) {
   tradedate <- lapply(
     date,
     function(date) {
-      seq(date - weeks(2), date, "1 day") %>%
+      seq(date - weeks(3), date, "1 day") %>%
         .[!wday(., week_start = 1) %in% 6:7] %>%
         .[!.%in% holidays] %>%
         last()
     }
   ) %>%
-    reduce(c) %>%
-    unique()
+    reduce(c)
   return(tradedate)
 }
 

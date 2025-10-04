@@ -91,8 +91,6 @@ combined <- foreach (
   val_path <- paste0(val_dir, symbol, ".csv")
 
   hist <- read_csv(hist_path, show_col_types = FALSE)
-  if (nrow(hist) < max(100, n)) return(NULL)
-  if (last(SMA(hist$amount, 3)) < 10^9) return(NULL)
 
   if (!file.exists(adjust_path)) {
     return(NULL)
@@ -121,29 +119,16 @@ combined <- foreach (
       )
   }
 
-  # combine hist, adjust, mktcap, val by date
-  # arrange by date
-  # fill down names(hist), names(adjust), names(mktcap)
-  # calculate shares
-  # fill down shares, quarter
-  # calculate mktcap, equity, cf, adjusted ohlcv
-  # group by quarter
-  # fill down np, np_deduct, equity, revenue, cf
-  # ungroup
-  # calculate pe, pe_deduct, pb, ps, pcf, roe
-  # add symbol
-  # select symbol, date, ohlcv, amount, financials
-  # filter by hist dates
   data <- hist %>%
     full_join(adjust, by = "date") %>%
     full_join(mktcap, by = "date") %>%
     full_join(val, by = "date") %>%
     arrange(date) %>%
-    fill(names(hist), names(adjust), names(mktcap), .direction = "down") %>%
-    mutate(shares = mktcap / close * 10^8) %>%
-    fill(shares, quarter, .direction = "down") %>%
+    fill(names(hist), .direction = "down") %>%
+    mutate(shares = mktcap / close) %>%
+    fill(adjust, shares, quarter, .direction = "down") %>%
     mutate(
-      mktcap = shares * close,
+      mktcap = close * shares,
       equity = bvps * shares,
       cf = cfps * shares,
       across(c(open, high, low, close), ~ .x * adjust),
@@ -159,23 +144,21 @@ combined <- foreach (
       ps = mktcap / revenue,
       pcf = mktcap / cf,
       roe = np / equity,
-      symbol = !!symbol,
-      across(c(open, high, low, close, pe, pe_deduct, pb, ps, pcf), round, 2),
-      volume = round(volume),
-      amount = round(amount / 10^8, 2),
-      roe = round(roe, 4)
+      symbol = !!symbol
     ) %>%
     select(symbol, names(hist), pe, pe_deduct, pb, ps, pcf, roe) %>%
-    filter(date %in% hist$date & date >= start_date)
+    filter(date %in% hist$date)
 
-
-
+  # select(data, date, pe) %>%
+  #   left_join(select(get_val2(symbol), date, pe), by = "date") %>%
+  #   mutate(diff = round(pe.x - pe.y, 2)) %>%
+  #   filter(diff != 0) %>%
+  #   print(n = Inf)
 
   data <- data %>%
     mutate(
       close_dk = get_dk(close),
       volume_dk = get_dk(volume),
-      tp = (high + low) / 2,
       min_window = n - run_whichmax(high, n),
       max_window = n - run_whichmin(low, n),
       roc_nmin = run_varmin(low, min_window) / runMax(high, n),
@@ -194,11 +177,18 @@ combined <- foreach (
           close_dk - lag(close_dk) < lag(close_dk - lag(close_dk)) &
           volume_dk - lag(volume_dk) < 0 &
           roc_nmax > 1 + roc_threshold
-      )
+      ),
+    ) %>%
+    mutate(
+      amount = amount / 10^8,
+      across(c(close, amount), round),
+      across(c(pe, pe_deduct, pb, ps, pcf), round, 2),
+      roe = round(roe, 4)
     ) %>%
     select(
-      symbol, date, close, pe, pe_deduct, pb, ps, pcf, roe, buy, sell
-    )
+      symbol, date, close, amount, buy, sell, pe, pe_deduct, pb, ps, pcf, roe
+    ) %>%
+    filter(date >= start_date & date <= end_date)
 
   return(list(data))
 } %>%
@@ -224,89 +214,89 @@ plan(sequential)
 
 
 
-slide_lgl(maang, ~ any(.x >= 30, na.rm = TRUE), .before = n - 1)
+# slide_lgl(maang, ~ any(.x >= 30, na.rm = TRUE), .before = n - 1)
 
-symbols <- out %>%
-  filter(amount > 10^9, out == "red") %>%
-  pull(symbol)
+# symbols <- out %>%
+#   filter(amount > 10^9, out == "red") %>%
+#   pull(symbol)
 
-names <- read_csv("data/symbols.csv", show_col_types = FALSE) %>%
-  filter(symbol %in% symbols) %>%
-  pull(name)
+# names <- read_csv("data/symbols.csv", show_col_types = FALSE) %>%
+#   filter(symbol %in% symbols) %>%
+#   pull(name)
 
-print(data.frame(symbol = symbols, name = names))
+# print(data.frame(symbol = symbols, name = names))
 
-for (symbol in symbols) {
-  name <- read_csv("data/symbols.csv", show_col_types = FALSE) %>%
-    filter(symbol == !!symbol) %>%
-    pull(name)
-  data <- read_csv(
-    paste0("data/hist/", symbol, ".csv"), show_col_types = FALSE
-  ) %>%
-    full_join(
-      read_csv(paste0("data/adjust/", symbol, ".csv"), show_col_types = FALSE),
-      by = "date"
-    ) %>%
-    arrange(date) %>%
-    fill(adjust, .direction = "down") %>%
-    na.omit() %>%
-    mutate(
-      symbol = !!symbol,
-      across(c(open, high, low, close), ~ .x * adjust),
-      volume = volume / adjust,
-      tp = (high + low) / 2,
-      close_dk = dk(close),
-      volume_dk = dk(volume),
-      max_after_min = n - runwhich_min(close, n),
-      min_after_max = n - runwhich_max(close, n),
-      maang = maang(high, low, close, 30),
-      col = case_when(
-        close_dk - lag(close_dk) > 0 &
-          (close_dk - lag(close_dk)) < (lag(close_dk) - lag(close_dk, 2)) &
-          volume_dk - lag(volume_dk) < 0 &
-          slide_lgl(
-            maang, ~ any(.x >= 30, na.rm = TRUE),
-            .before = n - 1, .complete = FALSE
-          ) &
-          runmax_var(close, max_after_min) / runMin(close, n) > 1 +
-            roc_threshold ~
-          "green",
-        close_dk - lag(close_dk) < 0 &
-          (close_dk - lag(close_dk)) > (lag(close_dk) - lag(close_dk, 2)) &
-          (
-            volume_dk - lag(volume_dk, 3) > 0 |
-              volume_dk == runMin(volume_dk, n * 2)
-          ) &
-          runmin_var(close, min_after_max) / runMax(close, n) < 1 -
-            roc_threshold ~
-          "red",
-        TRUE ~ NA
-      )
-    ) %>%
-    tail(240) %>%
-    mutate(close = (close / first(close) - 1) * 100)
-  plot(
-    data$date, data$close, col = "black", type = "l",
-    main = glue("{symbol} {name}")
-  )
-  points(data$date, data$close, col = data$col, pch = 16)
-  readline(prompt = "Next?")
-}
+# for (symbol in symbols) {
+#   name <- read_csv("data/symbols.csv", show_col_types = FALSE) %>%
+#     filter(symbol == !!symbol) %>%
+#     pull(name)
+#   data <- read_csv(
+#     paste0("data/hist/", symbol, ".csv"), show_col_types = FALSE
+#   ) %>%
+#     full_join(
+#       read_csv(paste0("data/adjust/", symbol, ".csv"), show_col_types = FALSE),
+#       by = "date"
+#     ) %>%
+#     arrange(date) %>%
+#     fill(adjust, .direction = "down") %>%
+#     na.omit() %>%
+#     mutate(
+#       symbol = !!symbol,
+#       across(c(open, high, low, close), ~ .x * adjust),
+#       volume = volume / adjust,
+#       tp = (high + low) / 2,
+#       close_dk = dk(close),
+#       volume_dk = dk(volume),
+#       max_after_min = n - runwhich_min(close, n),
+#       min_after_max = n - runwhich_max(close, n),
+#       maang = maang(high, low, close, 30),
+#       col = case_when(
+#         close_dk - lag(close_dk) > 0 &
+#           (close_dk - lag(close_dk)) < (lag(close_dk) - lag(close_dk, 2)) &
+#           volume_dk - lag(volume_dk) < 0 &
+#           slide_lgl(
+#             maang, ~ any(.x >= 30, na.rm = TRUE),
+#             .before = n - 1, .complete = FALSE
+#           ) &
+#           runmax_var(close, max_after_min) / runMin(close, n) > 1 +
+#             roc_threshold ~
+#           "green",
+#         close_dk - lag(close_dk) < 0 &
+#           (close_dk - lag(close_dk)) > (lag(close_dk) - lag(close_dk, 2)) &
+#           (
+#             volume_dk - lag(volume_dk, 3) > 0 |
+#               volume_dk == runMin(volume_dk, n * 2)
+#           ) &
+#           runmin_var(close, min_after_max) / runMax(close, n) < 1 -
+#             roc_threshold ~
+#           "red",
+#         TRUE ~ NA
+#       )
+#     ) %>%
+#     tail(240) %>%
+#     mutate(close = (close / first(close) - 1) * 100)
+#   plot(
+#     data$date, data$close, col = "black", type = "l",
+#     main = glue("{symbol} {name}")
+#   )
+#   points(data$date, data$close, col = data$col, pch = 16)
+#   readline(prompt = "Next?")
+# }
 
-symbols <- symbols[responses == "y"]
-writeLines(
-  symbols,
-  "/Users/anzhouhe/Library/Containers/com.zszq.Mac2020/Data/Documents/user_guest/MR.blk"
-)
-writeLines(
-  c(
-    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
-    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">",
-    "<plist version=\"1.0\">",
-    "<dict>",
-    paste0("	<key>", symbols, "</key>\n	<string>20250921|1.00</string>"),
-    "</dict>",
-    "</plist>"
-  ),
-  "/Users/anzhouhe/Library/Containers/com.zszq.Mac2020/Data/Documents/user_guest/MR.blkdict"
-)
+# symbols <- symbols[responses == "y"]
+# writeLines(
+#   symbols,
+#   "/Users/anzhouhe/Library/Containers/com.zszq.Mac2020/Data/Documents/user_guest/MR.blk"
+# )
+# writeLines(
+#   c(
+#     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+#     "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">",
+#     "<plist version=\"1.0\">",
+#     "<dict>",
+#     paste0("	<key>", symbols, "</key>\n	<string>20250921|1.00</string>"),
+#     "</dict>",
+#     "</plist>"
+#   ),
+#   "/Users/anzhouhe/Library/Containers/com.zszq.Mac2020/Data/Documents/user_guest/MR.blkdict"
+# )
