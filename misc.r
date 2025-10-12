@@ -3,6 +3,8 @@ Sys.setenv(TZ = "Asia/Shanghai")
 
 options(warn = -1)
 
+set.seed(42)
+
 aktools_path <- "http://127.0.0.1:8080/api/public/"
 
 ################################################################################
@@ -488,6 +490,21 @@ get_val2 <- function(symbol) {
 # Math functions
 ################################################################################
 
+# Redefines TTR::runSum
+runSum <- function(x, n) {
+  sapply(seq_along(x), function(i) {
+    if (i < n) {
+      return(NA_real_)   # not enough values before current
+    }
+    window <- x[(i - n + 1):i]
+    if (any(is.na(window))) {
+      return(NA_real_)
+    } else {
+      return(sum(window))
+    }
+  })
+}
+
 normalize <- function(v, range = c(0, 1), h = NULL) {
   min <- min(v, na.rm = TRUE)
   max <- max(v, na.rm = TRUE)
@@ -499,17 +516,6 @@ normalize <- function(v, range = c(0, 1), h = NULL) {
 }
 
 run_norm <- function(v, n) (v - runMin(v, n)) / (runMax(v, n) - runMin(v, n))
-
-run_pct <- function(v, n) {
-  v <- unlist(v)
-  sapply(
-    seq_len(length(v)),
-    function(i) {
-      if (i < n) return(NaN)
-      v[(i - n + 1):i] %>% percent_rank() %>% last()
-    }
-  )
-}
 
 get_roc <- function(v1, v2) (v2 - v1) / v1
 
@@ -558,34 +564,18 @@ fit_gaussian <- function(x, y) {
   )
 }
 
-runSum <- function(x, n) {
-  sapply(seq_along(x), function(i) {
-    if (i < n) {
-      return(NA_real_)   # not enough values before current
-    }
-    window <- x[(i - n + 1):i]
-    if (any(is.na(window))) {
-      return(NA_real_)
-    } else {
-      return(sum(window))
-    }
-  })
-}
-
-
-
 ################################################################################
 # Feature engineering functions
 ################################################################################
 
+# Redefines TTR::ADX
 # http://www.cftsc.com/qushizhibiao/610.html
-get_adx <- function(hlc, n = 14, m = 6) {
+ADX <- function(hlc, n = 14, m = 6) {
+  hlc <- as.matrix(hlc)
   h <- hlc[, 1]
   l <- hlc[, 2]
   c <- hlc[, 3]
-  tr <- runSum(
-    apply(cbind(h - l, abs(h - lag(c, 1)), abs(l - lag(c, 1))), 1, max), n
-  )
+  tr <- runSum(TR(hlc), n)
   dh <- h - lag(h, 1)
   dl <- lag(l, 1) - l
   dmp <- runSum(ifelse(dh > 0 & dh > dl, dh, 0), n)
@@ -595,89 +585,75 @@ get_adx <- function(hlc, n = 14, m = 6) {
   adx <- SMA(abs(dip - din) / (dip + din), m)
   adxr <- (adx + lag(adx, m)) / 2
   diff <- abs(adx - adxr)
-  out <- data.frame(adx = adx, adxr = adxr, diff = diff)
-  return(out)
+  result <- cbind(adx, adxr)
+  colnames(result) <- c("adx", "adxr")
+  return(result)
 }
 
-add_mom <- function(data, var_list, lag_list) {
-  for (i in lag_list) {
-    data <- mutate(
-      data,
-      across(
-        !!var_list,
-        ~ momentum(., i),
-        .names = "{.col}_mom{i}"
-      )
-    )
-  }
-  return(data)
+# Redefines TTR::TR
+TR <- function(hlc, w = 1) {
+  hlc <- as.matrix(hlc)
+  h <- hlc[, 1]
+  l <- hlc[, 2]
+  c <- hlc[, 3]
+  trueHigh <- pmax(runMax(h, w), lag(c, w), na.rm = TRUE)
+  trueLow <- pmin(runMin(l, w), lag(c, w), na.rm = TRUE)
+  tr <- trueHigh - trueLow
+  result <- cbind(tr, trueHigh, trueLow)
+  colnames(result) <- c("tr", "trueHigh", "trueLow")
+  return(result)
 }
 
-add_roc <- function(data, var_list, lag_list) {
-  for (i in lag_list) {
-    data <- mutate(
-      data,
-      across(
-        !!var_list,
-        ~ ROC(., i, "discrete"),
-        .names = "{.col}_roc{i}"
-      )
-    )
+# Redefines TTR::ATR
+ATR <- function(hlc, n = 14, maType, ..., w = 1) {
+  tr <- TR(hlc, w)
+  maArgs <- list(n = n, ...)
+  if (missing(maType)) {
+    maType <- "EMA"
+    if (is.null(maArgs$wilder)) maArgs$wilder <- TRUE
   }
-  return(data)
+  atr <- do.call(maType, c(list(tr[, 1]), maArgs))
+  result <- cbind(tr[, 1], atr, tr[, 2:3])
+  colnames(result) <- c("tr", "atr", "trueHigh", "trueLow")
+  return(result)
 }
 
-add_rocnorm <- function(data, var_list, lag_list, n) {
-  for (i in lag_list) {
-    data <- mutate(
-      data,
-      across(
-        !!var_list,
-        ~ ROC(., i, "discrete") %>% run_norm(n),
-        .names = "{.col}_rocnorm{i}"
-      )
-    )
-  }
-  return(data)
+# https://www.gupang.com/201207/0F31H1H012.html
+get_trend <- function(v) {
+  get_madiff <- function(v, n) 3 * WMA(v, n) - 2 * SMA(v, n)
+  k1 <- get_madiff(EMA(v, 5), 6)
+  k2 <- get_madiff(EMA(v, 8), 6)
+  k3 <- get_madiff(EMA(v, 11), 6)
+  k4 <- get_madiff(EMA(v, 14), 6)
+  k5 <- get_madiff(EMA(v, 17), 6)
+  k6 <- k1 + k2 + k3 + k4 - 4 * k5
+  EMA(k6, 2)
 }
 
-add_sma <- function(data, var_list, lag_list) {
-  for (i in lag_list) {
-    data <- mutate(
-      data,
-      across(
-        !!var_list,
-        ~ SMA(., i),
-        .names = "{.col}_sma{i}"
-      )
-    )
-  }
-  return(data)
+# https://www.cnblogs.com/long136/p/18345060
+get_maang <- function(hlc) {
+  hlc <- as.matrix(hlc)
+  h <- hlc[, 1]
+  l <- hlc[, 2]
+  c <- hlc[, 3]
+  k1 <- SMA(c, 30)
+  k2 <- SMA(h - l, 100) * 0.34
+  atan((k1 - lag(k1, 1)) / k2) * 180 / pi
 }
 
-add_sd <- function(data, var_list, lag_list) {
-  for (i in lag_list) {
-    data <- mutate(
-      data,
-      across(
-        !!var_list,
-        ~ runSD(., i),
-        .names = "{.col}_sd{i}"
-      )
-    )
-  }
-  return(data)
+add_roc <- function(df, col = "close", periods = 1:20) {
+  roc_matrix <- sapply(
+    periods,
+    function(n) (df[[col]] - lag(df[[col]], n)) / lag(df[[col]], n)
+  )
+  roc_df <- as.data.frame(roc_matrix)
+  colnames(roc_df) <- paste0(col, "_roc", periods)
+  cbind(df, roc_df)
 }
 
 ################################################################################
 # Utility functions
 ################################################################################
-
-# https://stackoverflow.com/a/25110203
-unregister_dopar <- function() {
-  env <- foreach:::.foreachGlobals
-  rm(list = ls(name = env), pos = env)
-}
 
 # https://stackoverflow.com/a/19801108
 multiout <- function(lst1, ...) {
@@ -708,17 +684,4 @@ as_tradedate <- function(datetime) {
   ) %>%
     reduce(c)
   return(tradedate)
-}
-
-predict_probrf <- function(rf, test) {
-  predict(rf, test)[["predictions"]] %>%
-    as_data_frame() %>%
-    mutate(
-      prob_max = apply(., 1, function(v) max(v)),
-      pred = apply(., 1, function(v) names(v) %>% .[match(max(v), v)]) %>%
-        as.factor(),
-      target = !!test$target,
-      symbol = !!test$symbol,
-      date = !!test$date
-    )
 }

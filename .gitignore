@@ -1,11 +1,12 @@
-# Mac
 .DS_Store
 
 data/
 logs/
+models/
 reports/
 
 temp*
+old*
 *.log*
 *.pdf
 *.zip
