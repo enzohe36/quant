@@ -3,6 +3,8 @@ Sys.setenv(TZ = "Asia/Shanghai")
 
 options(warn = -1)
 
+aktools_path <- "http://127.0.0.1:8080/api/public/"
+
 ################################################################################
 # Data update functions
 ################################################################################
@@ -13,21 +15,21 @@ get_index_spot <- function() {
   data <- list(
     # 序号 代码 名称 最新价 涨跌幅 涨跌额 成交量 成交额 振幅 最高 最低 今开 昨收 量比
     getForm(
-      uri = "http://127.0.0.1:8080/api/public/stock_zh_index_spot_em",
+      uri = paste0(aktools_path, "stock_zh_index_spot_em"),
       symbol = "上证系列指数",
       .encoding = "utf-8"
     ) %>%
       fromJSON() %>%
       mutate(market = "sh"),
     getForm(
-      uri = "http://127.0.0.1:8080/api/public/stock_zh_index_spot_em",
+      uri = paste0(aktools_path, "stock_zh_index_spot_em"),
       symbol = "深证系列指数",
       .encoding = "utf-8"
     ) %>%
       fromJSON() %>%
       mutate(market = "sz"),
     getForm(
-      uri = "http://127.0.0.1:8080/api/public/stock_zh_index_spot_em",
+      uri = paste0(aktools_path, "stock_zh_index_spot_em"),
       symbol = "中证系列指数",
       .encoding = "utf-8"
     ) %>%
@@ -62,7 +64,7 @@ get_index_hist <- function(symbol, start_date, end_date) {
   Sys.sleep(1)
   # date open close high low volume amount
   getForm(
-    uri = "http://127.0.0.1:8080/api/public/stock_zh_index_daily_em",
+    uri = paste0(aktools_path, "stock_zh_index_daily_em"),
     symbol = read_csv("data/indices.csv", show_col_types = FALSE) %>%
       filter(symbol == !!symbol) %>%
       pull(market) %>%
@@ -83,7 +85,7 @@ get_index_comp <- function(symbol) {
   # 日期 指数代码 指数名称 指数英文名称 成分券代码 成分券名称 成分券英文名称 交易所
   # 交易所英文名称 权重
   data <- getForm(
-    uri = "http://127.0.0.1:8080/api/public/index_stock_cons_weight_csindex",
+    uri = paste0(aktools_path, "index_stock_cons_weight_csindex"),
     symbol = symbol,
     .encoding = "utf-8"
   ) %>%
@@ -108,7 +110,7 @@ get_symbols <- function() {
   data <- list(
     # code name
     getForm(
-      uri = "http://127.0.0.1:8080/api/public/stock_info_a_code_name",
+      uri = paste0(aktools_path, "stock_info_a_code_name"),
       .encoding = "utf-8"
     ) %>%
       fromJSON() %>%
@@ -119,7 +121,7 @@ get_symbols <- function() {
       ),
     # 公司代码 公司简称 上市日期 暂停上市日期
     getForm(
-      uri = "http://127.0.0.1:8080/api/public/stock_info_sh_delist",
+      uri = paste0(aktools_path, "stock_info_sh_delist"),
       .encoding = "utf-8"
     ) %>%
       fromJSON() %>%
@@ -130,7 +132,7 @@ get_symbols <- function() {
       ),
     # 证券代码 证券简称 上市日期 终止上市日期
     getForm(
-      uri = "http://127.0.0.1:8080/api/public/stock_info_sz_delist",
+      uri = paste0(aktools_path, "stock_info_sz_delist"),
       .encoding = "utf-8"
     ) %>%
       fromJSON() %>%
@@ -156,7 +158,7 @@ get_susp <- function() {
   ts1 <- as_tradedate(now() - hours(16))
   # 序号 代码 名称 停牌时间 停牌截止时间 停牌期限 停牌原因 所属市场 预计复牌时间
   data <- getForm(
-    uri = "http://127.0.0.1:8080/api/public/stock_tfp_em",
+    uri = paste0(aktools_path, "stock_tfp_em"),
     date = format(ts1, "%Y%m%d"),
     .encoding = "utf-8"
   ) %>%
@@ -186,7 +188,7 @@ get_spot <- function() {
   # 序号 代码 名称 最新价 涨跌幅 涨跌额 成交量 成交额 振幅 最高 最低 今开 昨收 量比 换手率
   # 市盈率-动态 市净率 总市值 流通市值 涨速 5分钟涨跌 60日涨跌幅 年初至今涨跌幅
   data <- getForm(
-    uri = "http://127.0.0.1:8080/api/public/stock_zh_a_spot_em",
+    uri = paste0(aktools_path, "stock_zh_a_spot_em"),
     .encoding = "utf-8"
   ) %>%
     fromJSON()
@@ -218,28 +220,28 @@ get_adjust_change <- function() {
   # 预案公告日 股权登记日 除权除息日 方案进度 最新公告日期
   data <- list(
     getForm(
-      uri = "http://127.0.0.1:8080/api/public/stock_fhps_em",
+      uri = paste0(aktools_path, "stock_fhps_em"),
       date = quarter(ts1 %m-% months(3), "date_last") %>%
         format("%Y%m%d"),
       .encoding = "utf-8"
     ) %>%
       fromJSON(),
     getForm(
-      uri = "http://127.0.0.1:8080/api/public/stock_fhps_em",
+      uri = paste0(aktools_path, "stock_fhps_em"),
       date = quarter(ts1 %m-% months(6), "date_last") %>%
         format("%Y%m%d"),
       .encoding = "utf-8"
     ) %>%
       fromJSON(),
     getForm(
-      uri = "http://127.0.0.1:8080/api/public/stock_fhps_em",
+      uri = paste0(aktools_path, "stock_fhps_em"),
       date = quarter(ts1 %m-% months(9), "date_last") %>%
         format("%Y%m%d"),
       .encoding = "utf-8"
     ) %>%
       fromJSON(),
     getForm(
-      uri = "http://127.0.0.1:8080/api/public/stock_fhps_em",
+      uri = paste0(aktools_path, "stock_fhps_em"),
       date = quarter(ts1 %m-% months(12), "date_last") %>%
         format("%Y%m%d"),
       .encoding = "utf-8"
@@ -273,7 +275,7 @@ get_shares_change <- function() {
   # 证券代码 证券简称 交易市场 公告日期 变动日期 变动原因 总股本 已流通股份 已流通比例
   # 流通受限股份
   data <- getForm(
-    uri = "http://127.0.0.1:8080/api/public/stock_hold_change_cninfo",
+    uri = paste0(aktools_path, "stock_hold_change_cninfo"),
     symbol = "全部",
     .encoding = "utf-8"
   ) %>%
@@ -299,7 +301,7 @@ get_val_change <- function() {
   # 序号 股票代码 股票简称 首次预约时间 一次变更日期 二次变更日期 三次变更日期 实际披露时间
   data <- list(
     getForm(
-      uri = "http://127.0.0.1:8080/api/public/stock_yysj_em",
+      uri = paste0(aktools_path, "stock_yysj_em"),
       symbol = "沪深A股",
       date = quarter(ts1 %m-% months(3), "date_last") %>%
         format("%Y%m%d"),
@@ -307,7 +309,7 @@ get_val_change <- function() {
     ) %>%
       fromJSON(),
     getForm(
-      uri = "http://127.0.0.1:8080/api/public/stock_yysj_em",
+      uri = paste0(aktools_path, "stock_yysj_em"),
       symbol = "沪深A股",
       date = quarter(ts1 %m-% months(6), "date_last") %>%
         format("%Y%m%d"),
@@ -315,7 +317,7 @@ get_val_change <- function() {
     ) %>%
       fromJSON(),
     getForm(
-      uri = "http://127.0.0.1:8080/api/public/stock_yysj_em",
+      uri = paste0(aktools_path, "stock_yysj_em"),
       symbol = "沪深A股",
       date = quarter(ts1 %m-% months(9), "date_last") %>%
         format("%Y%m%d"),
@@ -323,7 +325,7 @@ get_val_change <- function() {
     ) %>%
       fromJSON(),
     getForm(
-      uri = "http://127.0.0.1:8080/api/public/stock_yysj_em",
+      uri = paste0(aktools_path, "stock_yysj_em"),
       symbol = "沪深A股",
       date = quarter(ts1 %m-% months(12), "date_last") %>%
         format("%Y%m%d"),
@@ -358,7 +360,7 @@ get_hist <- function(symbol, start_date, end_date) {
   Sys.sleep(1)
   # 日期 股票代码 开盘 收盘 最高 最低 成交量 成交额 振幅 涨跌幅 涨跌额 换手率
   getForm(
-    uri = "http://127.0.0.1:8080/api/public/stock_zh_a_hist",
+    uri = paste0(aktools_path, "stock_zh_a_hist"),
     symbol = symbol,
     start_date = format(start_date, "%Y%m%d"),
     end_date = format(end_date, "%Y%m%d"),
@@ -382,7 +384,7 @@ get_adjust <- function(symbol) {
   Sys.sleep(1)
   # date hfq_factor
   getForm(
-    uri = "http://127.0.0.1:8080/api/public/stock_zh_a_daily",
+    uri = paste0(aktools_path, "stock_zh_a_daily"),
     symbol = paste0(
       case_when(
         str_detect(symbol, "^6") ~ "sh",
@@ -407,7 +409,7 @@ get_mc <- function(symbol) {
   Sys.sleep(1)
   # date value
   getForm(
-    uri = "http://127.0.0.1:8080/api/public/stock_zh_valuation_baidu",
+    uri = paste0(aktools_path, "stock_zh_valuation_baidu"),
     symbol = symbol,
     indicator = "总市值",
     period = "全部",
@@ -432,7 +434,7 @@ get_val <- function(symbol) {
   # YYZSRGDHBZC NETPROFITRPHBZC KFJLRGDHBZC ROE_DILUTED JROA GROSS_PROFIT_RATIO
   # NET_PROFIT_RATIO SEASON_LABEL
   getForm(
-    uri = "http://127.0.0.1:8080/api/public/stock_financial_analysis_indicator_em",
+    uri = paste0(aktools_path, "stock_financial_analysis_indicator_em"),
     symbol = paste0(
       symbol,
       case_when(
@@ -463,7 +465,7 @@ get_val2 <- function(symbol) {
   # 数据日期 当日收盘价 当日涨跌幅 总市值 流通市值 总股本 流通股本 PE(TTM) PE(静) 市净率
   # PEG值 市现率 市销率
   getForm(
-    uri = "http://127.0.0.1:8080/api/public/stock_value_em",
+    uri = paste0(aktools_path, "stock_value_em"),
     symbol = symbol,
     .encoding = "utf-8"
   ) %>%

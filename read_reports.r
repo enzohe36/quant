@@ -1,5 +1,4 @@
 # conda activate myenv; pip install aktools --upgrade -i https://pypi.org/simple; pip install akshare --upgrade -i https://pypi.org/simple; python -m aktools
-# conda activate myenv; Rscript get_data.r; Rscript get_data.r
 
 rm(list = ls())
 
@@ -14,6 +13,8 @@ library(glue)
 library(tidyverse)
 
 source("misc.r", encoding = "UTF-8")
+
+################################################################################
 
 plan(multisession, workers = availableCores() - 1)
 

@@ -1,3 +1,5 @@
+# conda activate myenv; pip install aktools --upgrade -i https://pypi.org/simple; pip install akshare --upgrade -i https://pypi.org/simple; python -m aktools
+
 rm(list = ls())
 
 gc()
@@ -9,6 +11,8 @@ library(glue)
 library(tidyverse)
 
 source("misc.r", encoding = "UTF-8")
+
+################################################################################
 
 data_dir <- "data/"
 indices_path <- paste0(data_dir, "indices.csv")
