@@ -655,6 +655,7 @@ add_roc <- function(df, col = "close", periods = 1:20) {
 # Utility functions
 ################################################################################
 
+# .combine = "multiout", .multicombine = TRUE, .init = list(list(), list(), ...)
 # https://stackoverflow.com/a/19801108
 multiout <- function(lst1, ...) {
   lapply(

@@ -26,6 +26,7 @@ val_dir <- paste0(data_dir, "val/")
 model_dir <- "models/"
 data_combined_path <- paste0(model_dir, "data_combined.rds")
 features_path <- paste0(model_dir, "features.rds")
+labels_path <- paste0(model_dir, "labels.rds")
 
 log_dir <- "logs/"
 log_path <- paste0(log_dir, format(now(), "%Y%m%d_%H%M%S"), ".log")
@@ -34,6 +35,7 @@ dir.create(model_dir)
 dir.create(log_dir)
 
 end_date <- as_tradedate(now() - hours(16))
+start_date <- end_date %m-% years(10)
 quarters <- seq(
   as_date("1990-01-01"),
   end_date %m-% months(3),
@@ -145,8 +147,6 @@ data_combined <- foreach (
 } %>%
   rbindlist()
 
-saveRDS(data_combined, data_combined_path)
-
 features <- foreach (
   data = split(data_combined, by = "symbol"),
   .combine = "c"
@@ -155,26 +155,26 @@ features <- foreach (
   try_error <- try(
     data <- data %>%
       mutate(
-        close_trend = get_trend(close),
-        volume_trend = get_trend(volume),
         close_mom20 = close - lag(close, 20),
         atr20 = ATR(select(data, high, low, close), n = 100, w = 20)[, 2],
         label = case_when(
-          close_mom20 > atr20 ~ 1,
-          close_mom20 < -atr20 ~ -1,
-          close_mom20 <= atr20 & close_mom20 >= -atr20 ~ 0,
+          close_mom20 > atr20 ~ 2,
+          close_mom20 <= atr20 & close_mom20 >= -atr20 ~ 1,
+          close_mom20 < -atr20 ~ 0,
           TRUE ~ NA_real_
-        ) %>%
-          as.factor()
+        ),
+        close_trend = get_trend(close),
+        volume_trend = get_trend(volume),
       ) %>%
       add_roc("close_trend") %>%
       add_roc("volume_trend") %>%
-      select(date, matches("^(close|volume)_trend_roc[0-9]+$"), label) %>%
-      na.omit(),
+      select(date, label, matches("^(close|volume)_trend_roc[0-9]+$")) %>%
+      na.omit() %>%
+      filter(date >= start_date),
     silent = TRUE
   )
   if (inherits(try_error, "try-error")) {
-    glue("{symbol} Error calculating buy/sell.") %>%
+    glue("{symbol} Error generating features.") %>%
       tslog(log_path)
     return(NULL)
   }
@@ -183,6 +183,8 @@ features <- foreach (
 } %>%
   rbindlist()
 
-saveRDS(features, features_path)
+saveRDS(data_combined, data_combined_path)
+saveRDS(select(features, -label), features_path)
+saveRDS(pull(features, label), labels_path)
 
 plan(sequential)
