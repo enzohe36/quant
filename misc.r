@@ -212,10 +212,8 @@ get_spot <- function() {
   return(data)
 }
 
-# Refresh webpage if having connection error
-# https://data.eastmoney.com/yjfp/
 get_adjust_change <- function() {
-  Sys.sleep(60)
+  Sys.sleep(1)
   ts1 <- as_tradedate(now() - hours(16))
   # 代码 名称 送转股份-送转总比例 送转股份-送转比例 送转股份-转股比例 现金分红-现金分红比例
   # 现金分红-股息率 每股收益 每股净资产 每股公积金 每股未分配利润 净利润同比增长 总股本
@@ -295,10 +293,8 @@ get_shares_change <- function() {
   return(data)
 }
 
-# Refresh webpage if having connection error
-# https://data.eastmoney.com/bbsj/202003/yysj.html
 get_val_change <- function() {
-  Sys.sleep(60)
+  Sys.sleep(1)
   ts1 <- as_tradedate(now() - hours(16))
   # 序号 股票代码 股票简称 首次预约时间 一次变更日期 二次变更日期 三次变更日期 实际披露时间
   data <- list(
@@ -501,6 +497,36 @@ runSum <- function(x, n) {
       return(NA_real_)
     } else {
       return(sum(window))
+    }
+  })
+}
+
+# Redefines TTR::runMax
+runMax <- function(x, n) {
+  sapply(seq_along(x), function(i) {
+    if (i < n) {
+      return(NA_real_)   # not enough values before current
+    }
+    window <- x[(i - n + 1):i]
+    if (any(is.na(window))) {
+      return(NA_real_)
+    } else {
+      return(max(window))
+    }
+  })
+}
+
+# Redefines TTR::runMin
+runMin <- function(x, n) {
+  sapply(seq_along(x), function(i) {
+    if (i < n) {
+      return(NA_real_)   # not enough values before current
+    }
+    window <- x[(i - n + 1):i]
+    if (any(is.na(window))) {
+      return(NA_real_)
+    } else {
+      return(min(window))
     }
   })
 }

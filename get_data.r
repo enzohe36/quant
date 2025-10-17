@@ -37,7 +37,7 @@ end_date <- as_tradedate(now() - hours(16))
 loop_get <- function(var, ...) {
   fail <- TRUE
   fail_count <- 1
-  while (fail & fail_count < 3) {
+  while (fail & fail_count <= 3) {
     try_error <- try(
       data <- get(paste0("get_", var))(...),
       silent = TRUE
@@ -50,6 +50,7 @@ loop_get <- function(var, ...) {
       return(data)
     }
   }
+  stop()
 }
 
 if (!file.exists(spot_path)) {
