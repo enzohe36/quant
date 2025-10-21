@@ -2,18 +2,18 @@ rm(list = ls())
 
 gc()
 
+source("r_settings.r", encoding = "UTF-8")
+
+scripts <- c("misc.r")
+load_pkgs(scripts) # No tidyverse
 library(foreach)
 library(doFuture)
-library(RCurl)
-library(jsonlite)
-library(data.table)
 library(glue)
-library(TTR)
 library(tidyverse)
 
-source("misc.r", encoding = "UTF-8")
+source_scripts(scripts)
 
-################################################################################
+# ============================================================================
 
 plan(multisession, workers = availableCores() - 1)
 
@@ -23,17 +23,16 @@ adjust_dir <- paste0(data_dir, "adjust/")
 mc_dir <- paste0(data_dir, "mc/")
 val_dir <- paste0(data_dir, "val/")
 
-model_dir <- "models/"
-data_combined_path <- paste0(model_dir, "data_combined.rds")
+backtest_dir <- "backtest/"
+data_combined_path <- paste0(backtest_dir, "data_combined.rds")
 
 log_dir <- "logs/"
 log_path <- paste0(log_dir, format(now(), "%Y%m%d_%H%M%S"), ".log")
 
-dir.create(model_dir)
+dir.create(backtest_dir)
 dir.create(log_dir)
 
 end_date <- as_tradedate(now() - hours(16))
-start_date <- end_date %m-% years(20)
 quarters <- seq(
   as_date("1990-01-01"),
   end_date %m-% months(3),
@@ -51,7 +50,8 @@ data_combined <- foreach (
 ) %dofuture% {
   vars <- c(
     "hist_path", "adjust_path", "mc_path", "val_path",
-    "hist", "adjust", "mc", "val", "data", "try_error"
+    "hist", "adjust", "mc", "val",
+    "data", "try_error", "my_list"
   )
   rm(list = vars)
 
@@ -63,28 +63,31 @@ data_combined <- foreach (
   hist <- read_csv(hist_path, show_col_types = FALSE)
 
   if (!file.exists(adjust_path)) {
-    glue("{symbol} Missing adjust file.") %>%
-      tslog(log_path)
+    tsprint(glue("{symbol}: Missing adjust file."), log_path)
     return(NULL)
   } else {
-    adjust <- read_csv(adjust_path, show_col_types = FALSE) %>%
-      mutate(adjust = adjust / last(adjust))
+    try_error <- try(
+      adjust <- read_csv(adjust_path, show_col_types = FALSE) %>%
+        mutate(adjust = adjust / last(adjust)),
+      silent = TRUE
+    )
+    if (inherits(try_error, "try-error")) {
+      tsprint(glue("{symbol}: Error reading adjust file."), log_path)
+    }
   }
 
   if (!file.exists(mc_path)) {
-    glue("{symbol} Missing mc file.") %>%
-      tslog(log_path)
+    tsprint(glue("{symbol}: Missing mc file."), log_path)
     return(NULL)
   } else {
     mc <- read_csv(mc_path, show_col_types = FALSE)
   }
 
-  try_error <- try(
-    if (!file.exists(val_path)) {
-      glue("{symbol} Missing val file.") %>%
-        tslog(log_path)
-      return(NULL)
-    } else {
+  if (!file.exists(val_path)) {
+    tsprint(glue("{symbol}: Missing val file."), log_path)
+    return(NULL)
+  } else {
+    try_error <- try(
       val <- read_csv(val_path, show_col_types = FALSE) %>%
         full_join(tibble(date = !!quarters), by = "date") %>%
         arrange(date) %>%
@@ -94,14 +97,12 @@ data_combined <- foreach (
           np_deduct = runSum(np_deduct, 4),
           cfps = runSum(cfps, 4),
           quarter = date
-        )
-    },
-    silent = TRUE
-  )
-  if (inherits(try_error, "try-error")) {
-    glue("{symbol} Error reading val file.") %>%
-      tslog(log_path)
-    return(NULL)
+        ),
+      silent = TRUE
+    )
+    if (inherits(try_error, "try-error")) {
+      tsprint(glue("{symbol}: Error reading val file."), log_path)
+    }
   }
 
   try_error <- try(
@@ -131,16 +132,14 @@ data_combined <- foreach (
         pcf = mc / cf,
         roe = np / equity,
         npm = np / revenue,
-        symbol = !!symbol,
-        across(c(amount, mc), ~ .x / 10^8)
+        symbol = !!symbol
       ) %>%
       select(symbol, names(hist), mc, pe, pe_deduct, pb, ps, pcf, roe, npm) %>%
-      filter(date %in% pull(hist, date) & date >= !!start_date),
+      filter(date %in% pull(hist, date)),
     silent = TRUE
   )
   if (inherits(try_error, "try-error")) {
-    glue("{symbol} Error calculating val.") %>%
-      tslog(log_path)
+    tsprint(glue("{symbol}: Error combining data."), log_path)
     return(NULL)
   }
 
