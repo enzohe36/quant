@@ -1,16 +1,17 @@
-Sys.setlocale(locale = "Chinese")
-Sys.setenv(TZ = "Asia/Shanghai")
-
-options(warn = -1)
-
-set.seed(42)
+# library(RCurl)
+# library(jsonlite)
+# library(data.table)
+# library(glue)
+# library(tidyverse)
 
 aktools_path <- "http://127.0.0.1:8080/api/public/"
+indices <- read_csv("data/indices.csv", show_col_types = FALSE)
 
-################################################################################
-# Data update functions
-################################################################################
+# ============================================================================
+# Index Data Retrievers
+# ============================================================================
 
+# https://quote.eastmoney.com/center/gridlist.html#index_sz
 get_index_spot <- function() {
   Sys.sleep(1)
   ts1 <- as_tradedate(now() - hours(16))
@@ -62,15 +63,13 @@ get_index_spot <- function() {
   return(data)
 }
 
+# http://quote.eastmoney.com/center/hszs.html
 get_index_hist <- function(symbol, start_date, end_date) {
   Sys.sleep(1)
   # date open close high low volume amount
   getForm(
     uri = paste0(aktools_path, "stock_zh_index_daily_em"),
-    symbol = read_csv("data/indices.csv", show_col_types = FALSE) %>%
-      filter(symbol == !!symbol) %>%
-      pull(market) %>%
-      paste0(symbol),
+    symbol = paste0(filter(indices, symbol == !!symbol)$market, symbol),
     start_date = format(start_date, "%Y%m%d"),
     end_date = format(end_date, "%Y%m%d"),
     .encoding = "utf-8"
@@ -81,6 +80,7 @@ get_index_hist <- function(symbol, start_date, end_date) {
     arrange(date)
 }
 
+# http://www.csindex.com.cn/zh-CN/indices/index-detail/000300
 get_index_comp <- function(symbol) {
   Sys.sleep(1)
   ts1 <- as_tradedate(now() - hours(16))
@@ -106,6 +106,14 @@ get_index_comp <- function(symbol) {
   return(data)
 }
 
+# ============================================================================
+# Stock Data Retrievers
+# ============================================================================
+
+# https://www.sse.com.cn/assortment/stock/list/share/
+# https://www.szse.cn/market/product/stock/list/index.html
+# https://www.bse.cn/nq/listedcompany.html
+# https://www.sse.com.cn/assortment/stock/list/delisting/
 get_symbols <- function() {
   Sys.sleep(1)
   ts1 <- as_tradedate(now() - hours(16))
@@ -155,6 +163,7 @@ get_symbols <- function() {
   return(data)
 }
 
+# https://data.eastmoney.com/tfpxx/
 get_susp <- function() {
   Sys.sleep(1)
   ts1 <- as_tradedate(now() - hours(16))
@@ -182,10 +191,9 @@ get_susp <- function() {
   return(data)
 }
 
-# Refresh webpage if having connection error
 # https://quote.eastmoney.com/center/gridlist.html#hs_a_board
 get_spot <- function() {
-  Sys.sleep(60)
+  Sys.sleep(1)
   ts1 <- as_tradedate(now() - hours(16))
   # 序号 代码 名称 最新价 涨跌幅 涨跌额 成交量 成交额 振幅 最高 最低 今开 昨收 量比 换手率
   # 市盈率-动态 市净率 总市值 流通市值 涨速 5分钟涨跌 60日涨跌幅 年初至今涨跌幅
@@ -212,43 +220,20 @@ get_spot <- function() {
   return(data)
 }
 
-get_adjust_change <- function() {
+# https://data.eastmoney.com/yjfp/
+get_div <- function(date) {
   Sys.sleep(1)
   ts1 <- as_tradedate(now() - hours(16))
   # 代码 名称 送转股份-送转总比例 送转股份-送转比例 送转股份-转股比例 现金分红-现金分红比例
   # 现金分红-股息率 每股收益 每股净资产 每股公积金 每股未分配利润 净利润同比增长 总股本
   # 预案公告日 股权登记日 除权除息日 方案进度 最新公告日期
-  data <- list(
-    getForm(
-      uri = paste0(aktools_path, "stock_fhps_em"),
-      date = quarter(ts1 %m-% months(3), "date_last") %>%
-        format("%Y%m%d"),
-      .encoding = "utf-8"
-    ) %>%
-      fromJSON(),
-    getForm(
-      uri = paste0(aktools_path, "stock_fhps_em"),
-      date = quarter(ts1 %m-% months(6), "date_last") %>%
-        format("%Y%m%d"),
-      .encoding = "utf-8"
-    ) %>%
-      fromJSON(),
-    getForm(
-      uri = paste0(aktools_path, "stock_fhps_em"),
-      date = quarter(ts1 %m-% months(9), "date_last") %>%
-        format("%Y%m%d"),
-      .encoding = "utf-8"
-    ) %>%
-      fromJSON(),
-    getForm(
-      uri = paste0(aktools_path, "stock_fhps_em"),
-      date = quarter(ts1 %m-% months(12), "date_last") %>%
-        format("%Y%m%d"),
-      .encoding = "utf-8"
-    ) %>%
-      fromJSON()
+  data <- getForm(
+    uri = paste0(aktools_path, "stock_fhps_em"),
+    date = quarter(date %m-% months(3), "date_last") %>%
+      format("%Y%m%d"),
+    .encoding = "utf-8"
   ) %>%
-    rbindlist(fill = TRUE)
+    fromJSON()
   ts2 <- as_tradedate(now() - hours(9))
   if (ts1 != ts2) stop(glue("Trade date changed from {ts1} to {ts2}!"))
   data <- data %>%
@@ -256,6 +241,24 @@ get_adjust_change <- function() {
       symbol = `代码`,
       adjust_change_date = as_date(`除权除息日`)
     ) %>%
+    select(symbol, adjust_change_date) %>%
+    arrange(symbol)
+  return(data)
+}
+
+get_adjust_change <- function() {
+  Sys.sleep(1)
+  ts1 <- as_tradedate(now() - hours(16))
+  data <- list(
+    get_div(ts1),
+    get_div(ts1 %m-% months(3)),
+    get_div(ts1 %m-% months(6)),
+    get_div(ts1 %m-% months(9))
+  ) %>%
+    rbindlist(fill = TRUE)
+  ts2 <- as_tradedate(now() - hours(9))
+  if (ts1 != ts2) stop(glue("Trade date changed from {ts1} to {ts2}!"))
+  data <- data %>%
     summarize(
       date = !!ts1,
       adjust_change_date = if_else(
@@ -264,11 +267,11 @@ get_adjust_change <- function() {
         max(adjust_change_date, na.rm = TRUE)
       ),
       .by = symbol
-    ) %>%
-    arrange(symbol)
+    )
   return(data)
 }
 
+# https://webapi.cninfo.com.cn/#/thematicStatistics
 get_shares_change <- function() {
   Sys.sleep(1)
   ts1 <- as_tradedate(now() - hours(16))
@@ -293,45 +296,19 @@ get_shares_change <- function() {
   return(data)
 }
 
-get_val_change <- function() {
+# https://data.eastmoney.com/bbsj/202003/yysj.html
+get_earnings_calendar <- function(date) {
   Sys.sleep(1)
   ts1 <- as_tradedate(now() - hours(16))
   # 序号 股票代码 股票简称 首次预约时间 一次变更日期 二次变更日期 三次变更日期 实际披露时间
-  data <- list(
-    getForm(
-      uri = paste0(aktools_path, "stock_yysj_em"),
-      symbol = "沪深A股",
-      date = quarter(ts1 %m-% months(3), "date_last") %>%
-        format("%Y%m%d"),
-      .encoding = "utf-8"
-    ) %>%
-      fromJSON(),
-    getForm(
-      uri = paste0(aktools_path, "stock_yysj_em"),
-      symbol = "沪深A股",
-      date = quarter(ts1 %m-% months(6), "date_last") %>%
-        format("%Y%m%d"),
-      .encoding = "utf-8"
-    ) %>%
-      fromJSON(),
-    getForm(
-      uri = paste0(aktools_path, "stock_yysj_em"),
-      symbol = "沪深A股",
-      date = quarter(ts1 %m-% months(9), "date_last") %>%
-        format("%Y%m%d"),
-      .encoding = "utf-8"
-    ) %>%
-      fromJSON(),
-    getForm(
-      uri = paste0(aktools_path, "stock_yysj_em"),
-      symbol = "沪深A股",
-      date = quarter(ts1 %m-% months(12), "date_last") %>%
-        format("%Y%m%d"),
-      .encoding = "utf-8"
-    ) %>%
-      fromJSON()
+  data <- getForm(
+    uri = paste0(aktools_path, "stock_yysj_em"),
+    symbol = "沪深A股",
+    date = quarter(date %m-% months(3), "date_last") %>%
+      format("%Y%m%d"),
+    .encoding = "utf-8"
   ) %>%
-    rbindlist(fill = TRUE)
+    fromJSON()
   ts2 <- as_tradedate(now() - hours(9))
   if (ts1 != ts2) stop(glue("Trade date changed from {ts1} to {ts2}!"))
   data <- data %>%
@@ -339,6 +316,25 @@ get_val_change <- function() {
       symbol = `股票代码`,
       val_change_date = as_date(`实际披露时间`)
     ) %>%
+    select(symbol, val_change_date) %>%
+    arrange(symbol)
+  return(data)
+}
+
+get_val_change <- function() {
+  Sys.sleep(1)
+  ts1 <- as_tradedate(now() - hours(16))
+  # 序号 股票代码 股票简称 首次预约时间 一次变更日期 二次变更日期 三次变更日期 实际披露时间
+  data <- list(
+    get_earnings_calendar(ts1),
+    get_earnings_calendar(ts1 %m-% months(3)),
+    get_earnings_calendar(ts1 %m-% months(6)),
+    get_earnings_calendar(ts1 %m-% months(9))
+  ) %>%
+    rbindlist(fill = TRUE)
+  ts2 <- as_tradedate(now() - hours(9))
+  if (ts1 != ts2) stop(glue("Trade date changed from {ts1} to {ts2}!"))
+  data <- data %>%
     summarize(
       date = !!ts1,
       val_change_date = if_else(
@@ -347,12 +343,10 @@ get_val_change <- function() {
         max(val_change_date, na.rm = TRUE)
       ),
       .by = symbol
-    ) %>%
-    arrange(symbol)
+    )
   return(data)
 }
 
-# Refresh webpage if having connection error
 # https://quote.eastmoney.com/concept/sh603777.html?from=classic(示例)
 get_hist <- function(symbol, start_date, end_date) {
   Sys.sleep(1)
@@ -378,6 +372,7 @@ get_hist <- function(symbol, start_date, end_date) {
     arrange(date)
 }
 
+# https://finance.sina.com.cn/realstock/company/sh600006/nc.shtml(示例)
 get_adjust <- function(symbol) {
   Sys.sleep(1)
   # date hfq_factor
@@ -403,6 +398,7 @@ get_adjust <- function(symbol) {
     arrange(date)
 }
 
+# https://gushitong.baidu.com/stock/ab-002044
 get_mc <- function(symbol) {
   Sys.sleep(1)
   # date value
@@ -423,6 +419,7 @@ get_mc <- function(symbol) {
     arrange(date)
 }
 
+# https://emweb.securities.eastmoney.com/pc_hsf10/pages/index.html?type=web&code=SZ301389&color=b#/cwfx
 get_val <- function(symbol) {
   Sys.sleep(1)
   # SECUCODE SECURITY_CODE SECURITY_NAME_ABBR ORG_CODE REPORT_DATE
@@ -458,6 +455,7 @@ get_val <- function(symbol) {
     arrange(date)
 }
 
+# https://data.eastmoney.com/gzfx/detail/300766.html
 get_val2 <- function(symbol) {
   Sys.sleep(1)
   # 数据日期 当日收盘价 当日涨跌幅 总市值 流通市值 总股本 流通股本 PE(TTM) PE(静) 市净率
@@ -480,235 +478,4 @@ get_val2 <- function(symbol) {
     ) %>%
     select(date, mc, mc_float, pe, peg, pb, ps, pc) %>%
     arrange(date)
-}
-
-################################################################################
-# Math functions
-################################################################################
-
-# Redefines TTR::runSum
-runSum <- function(x, n) {
-  sapply(seq_along(x), function(i) {
-    if (i < n) {
-      return(NA_real_)   # not enough values before current
-    }
-    window <- x[(i - n + 1):i]
-    if (any(is.na(window))) {
-      return(NA_real_)
-    } else {
-      return(sum(window))
-    }
-  })
-}
-
-# Redefines TTR::runMax
-runMax <- function(x, n) {
-  sapply(seq_along(x), function(i) {
-    if (i < n) {
-      return(NA_real_)   # not enough values before current
-    }
-    window <- x[(i - n + 1):i]
-    if (any(is.na(window))) {
-      return(NA_real_)
-    } else {
-      return(max(window))
-    }
-  })
-}
-
-# Redefines TTR::runMin
-runMin <- function(x, n) {
-  sapply(seq_along(x), function(i) {
-    if (i < n) {
-      return(NA_real_)   # not enough values before current
-    }
-    window <- x[(i - n + 1):i]
-    if (any(is.na(window))) {
-      return(NA_real_)
-    } else {
-      return(min(window))
-    }
-  })
-}
-
-normalize <- function(v, range = c(0, 1), h = NULL) {
-  min <- min(v, na.rm = TRUE)
-  max <- max(v, na.rm = TRUE)
-  range_min <- min(range, na.rm = TRUE)
-  range_max <- max(range, na.rm = TRUE)
-  if (!is.null(h)) v <- h
-  v_norm <- (v - min) / (max - min) * (range_max - range_min) + range_min
-  return(v_norm)
-}
-
-run_norm <- function(v, n) (v - runMin(v, n)) / (runMax(v, n) - runMin(v, n))
-
-get_roc <- function(v1, v2) (v2 - v1) / v1
-
-get_rmse <- function(v1, v2) sqrt(sum((v2 - v1) ^ 2) / length(v1))
-
-run_whichmax <- function(v, n) {
-  rollapply(
-    v, width = n, align = "right", fill = NA,
-    FUN = function(w) which.max(w)
-  )
-}
-
-run_whichmin <- function(v, n) {
-  rollapply(
-    v, width = n, align = "right", fill = NA,
-    FUN = function(w) which.min(w)
-  )
-}
-
-run_varmax <- function(x, widths) {
-  stopifnot(length(x) == length(widths))
-  sapply(
-    seq_along(x), function(i) {
-      w <- widths[i]
-      if (i < w | is.na(i < w)) return(NA)
-      max(x[(i - w + 1):i], na.rm = TRUE)
-    }
-  )
-}
-
-run_varmin <- function(x, widths) {
-  stopifnot(length(x) == length(widths))
-  sapply(
-    seq_along(x), function(i) {
-      w <- widths[i]
-      if (i < w | is.na(i < w)) return(NA)
-      min(x[(i - w + 1):i], na.rm = TRUE)
-    }
-  )
-}
-
-fit_gaussian <- function(x, y) {
-  nls(
-    y ~ 1 / (s * sqrt(2 * pi)) * exp(-1 / 2 * ((x - m) / s) ^ 2),
-    start = c(s = 1, m = 0)
-  )
-}
-
-################################################################################
-# Feature engineering functions
-################################################################################
-
-# Redefines TTR::ADX
-# http://www.cftsc.com/qushizhibiao/610.html
-ADX <- function(hlc, n = 14, m = 6) {
-  hlc <- as.matrix(hlc)
-  h <- hlc[, 1]
-  l <- hlc[, 2]
-  c <- hlc[, 3]
-  tr <- runSum(TR(hlc), n)
-  dh <- h - lag(h, 1)
-  dl <- lag(l, 1) - l
-  dmp <- runSum(ifelse(dh > 0 & dh > dl, dh, 0), n)
-  dmn <- runSum(ifelse(dl > 0 & dl > dh, dl, 0), n)
-  dip <- dmp / tr
-  din <- dmn / tr
-  adx <- SMA(abs(dip - din) / (dip + din), m)
-  adxr <- (adx + lag(adx, m)) / 2
-  diff <- abs(adx - adxr)
-  result <- cbind(adx, adxr)
-  colnames(result) <- c("adx", "adxr")
-  return(result)
-}
-
-# Redefines TTR::TR
-TR <- function(hlc, w = 1) {
-  hlc <- as.matrix(hlc)
-  h <- hlc[, 1]
-  l <- hlc[, 2]
-  c <- hlc[, 3]
-  trueHigh <- pmax(runMax(h, w), lag(c, w), na.rm = TRUE)
-  trueLow <- pmin(runMin(l, w), lag(c, w), na.rm = TRUE)
-  tr <- trueHigh - trueLow
-  result <- cbind(tr, trueHigh, trueLow)
-  colnames(result) <- c("tr", "trueHigh", "trueLow")
-  return(result)
-}
-
-# Redefines TTR::ATR
-ATR <- function(hlc, n = 14, maType, ..., w = 1) {
-  tr <- TR(hlc, w)
-  maArgs <- list(n = n, ...)
-  if (missing(maType)) {
-    maType <- "EMA"
-    if (is.null(maArgs$wilder)) maArgs$wilder <- TRUE
-  }
-  atr <- do.call(maType, c(list(tr[, 1]), maArgs))
-  result <- cbind(tr[, 1], atr, tr[, 2:3])
-  colnames(result) <- c("tr", "atr", "trueHigh", "trueLow")
-  return(result)
-}
-
-# https://www.gupang.com/201207/0F31H1H012.html
-get_trend <- function(v) {
-  get_madiff <- function(v, n) 3 * WMA(v, n) - 2 * SMA(v, n)
-  k1 <- get_madiff(EMA(v, 5), 6)
-  k2 <- get_madiff(EMA(v, 8), 6)
-  k3 <- get_madiff(EMA(v, 11), 6)
-  k4 <- get_madiff(EMA(v, 14), 6)
-  k5 <- get_madiff(EMA(v, 17), 6)
-  k6 <- k1 + k2 + k3 + k4 - 4 * k5
-  EMA(k6, 2)
-}
-
-# https://www.cnblogs.com/long136/p/18345060
-get_maang <- function(hlc) {
-  hlc <- as.matrix(hlc)
-  h <- hlc[, 1]
-  l <- hlc[, 2]
-  c <- hlc[, 3]
-  k1 <- SMA(c, 30)
-  k2 <- SMA(h - l, 100) * 0.34
-  atan((k1 - lag(k1, 1)) / k2) * 180 / pi
-}
-
-add_roc <- function(df, col = "close", periods = 1:20) {
-  roc_matrix <- sapply(
-    periods,
-    function(n) (df[[col]] - lag(df[[col]], n)) / lag(df[[col]], n)
-  )
-  roc_df <- as.data.frame(roc_matrix)
-  colnames(roc_df) <- paste0(col, "_roc", periods)
-  cbind(df, roc_df)
-}
-
-################################################################################
-# Utility functions
-################################################################################
-
-# .combine = "multiout", .multicombine = TRUE, .init = list(list(), list(), ...)
-# https://stackoverflow.com/a/19801108
-multiout <- function(lst1, ...) {
-  lapply(
-    seq_along(lst1),
-    function(i) c(lst1[[i]], lapply(list(...), function(lst2) lst2[[i]]))
-  )
-}
-
-ts <- function(v) paste0("[", format(now(), "%H:%M:%S"), "] ", v)
-
-tsprint <- function(v) writeLines(ts(v))
-
-tslog <- function(v, log_path) write(ts(v), log_path, append = TRUE)
-
-as_tradedate <- function(datetime) {
-  date <- as_date(datetime)
-  holidays <- read_csv("data/holidays.csv", show_col_types = FALSE) %>%
-    pull(date)
-  tradedate <- lapply(
-    date,
-    function(date) {
-      seq(date - weeks(3), date, "1 day") %>%
-        .[!wday(., week_start = 1) %in% 6:7] %>%
-        .[!.%in% holidays] %>%
-        last()
-    }
-  ) %>%
-    reduce(c)
-  return(tradedate)
 }
