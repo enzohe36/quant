@@ -41,58 +41,6 @@ dir.create(log_dir)
 end_date <- as_tradedate(now() - hours(16))
 
 # ============================================================================
-# Helper Functions
-# ============================================================================
-
-loop_get <- function(var) {
-  fail <- TRUE
-  fail_count <- 1
-  while (fail & fail_count <= 3) {
-    try_error <- try(
-      data <- get(paste0("get_", var))(),
-      silent = TRUE
-    )
-    if (inherits(try_error, "try-error")) {
-      tsprint(glue("Error retrieving {var} after {fail_count} try(s)."))
-      fail_count <- fail_count + 1
-      Sys.sleep(60)
-    } else {
-      tsprint(glue("Retrieved {var}."))
-      return(data)
-    }
-  }
-  stop()
-}
-
-combine_spot <- function() {
-  vars <- c(
-    "symbols", "susp", "spot", "adjust_change", "shares_change", "val_change"
-  )
-  out <- sapply(
-    vars,
-    function(var) {
-      if (!exists(paste0("spot_", var))) {
-        assign(paste0("spot_", var), loop_get(var), envir = .GlobalEnv)
-      } else {
-        tsprint(glue("{var} already exists."))
-      }
-    }
-  )
-  spot_combined <- get(paste0("spot_", vars[1]))
-  for (var in vars[-1]) {
-    spot_combined <- left_join(
-      spot_combined, get(paste0("spot_", var)), by = c("symbol", "date")
-    )
-  }
-  spot_combined <- mutate(
-    spot_combined,
-    delist = replace_na(delist, FALSE),
-    susp = replace_na(susp, FALSE)
-  )
-  return(spot_combined)
-}
-
-# ============================================================================
 # Spot Data Update
 # ============================================================================
 
