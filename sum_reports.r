@@ -1,36 +1,27 @@
 # conda activate myenv; pip install aktools --upgrade -i https://pypi.org/simple; pip install akshare --upgrade -i https://pypi.org/simple; python -m aktools
 
-rm(list = ls())
-
-gc()
+# =============================== PRESET ==================================
 
 source_scripts(
   scripts = c("misc", "data_retrievers"),
   packages = c("foreach", "doFuture", "data.table", "tidyverse")
 )
 
-################################################################################
-
-plan(multisession, workers = availableCores() - 1)
-
 data_dir <- "data/"
-index_comp_path <- paste0(data_dir, "index_comp.csv")
+spot_combined_path <- paste0(data_dir, "spot_combined.csv")
+
+resource_dir <- "resources/"
+name_repl_path <- paste0(resource_dir, "name_repl.csv")
 
 report_dir <- "reports/"
-name_repl_path <- paste0(report_dir, "name_repl.csv")
 prompt_path <- paste0(report_dir, "prompt.txt")
 
 industries <- c("算力")
-# industries <- c("通用设备", "专用设备", "电池")
 
-# index_comp <- get_index_comp("000985") %>%
-#   list(get_fundamentals(as_tradeday(now() - hours(16)))) %>%
-#   reduce(left_join, by = "symbol")
-# write.csv(index_comp, index_comp_path, quote = FALSE, row.names = FALSE)
-# tsprint(str_glue("Found {nrow(index_comp)} stocks."))
+# ============================= MAIN SCRIPT ===============================
 
-index_comp <- read_csv(index_comp_path, show_col_types = FALSE) %>%
-  select(symbol, name)
+plan(multisession, workers = availableCores() - 1)
+
 name_repl <- read_csv(name_repl_path, show_col_types = FALSE)
 
 analysis <- foreach(
@@ -47,14 +38,14 @@ analysis <- foreach(
     {setNames(.$replacement, .$search)} %>%
     str_replace_all(string = report, pattern = .)
 
-  index_comp_trim <- index_comp %>%
+  spot_combined_trim <- spot_combined %>%
     mutate(count = sapply(name, function(x) str_count(report, x))) %>%
     arrange(desc(count)) %>%
     filter(count >= 1)
-  return(list(index_comp_trim, report))
+  return(list(spot_combined_trim, report))
 }
 
-index_comp_trim <- rbindlist(analysis[[1]]) %>%
+spot_combined_trim <- rbindlist(analysis[[1]]) %>%
   group_by(symbol) %>%
   summarise(
     symbol = first(symbol),
@@ -63,7 +54,7 @@ index_comp_trim <- rbindlist(analysis[[1]]) %>%
     .groups = "drop"
   )
 
-names <- index_comp_trim %>%
+names <- spot_combined_trim %>%
   pull(name) %>%
   paste(collapse = "，") %>%
   str_replace_all("机器人", "") %>%

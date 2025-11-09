@@ -1,15 +1,9 @@
-rm(list = ls())
-
-gc()
+# =============================== PRESET ==================================
 
 source_scripts(
   scripts = c("misc"),
   packages = c("foreach", "doFuture", "tidyverse")
 )
-
-# ============================================================================
-
-plan(multisession, workers = availableCores() - 1)
 
 data_dir <- "data/"
 hist_dir <- paste0(data_dir, "hist/")
@@ -22,6 +16,10 @@ data_combined_path <- paste0(backtest_dir, "data_combined.rds")
 
 log_dir <- "logs/"
 log_path <- paste0(log_dir, format(now(), "%Y%m%d_%H%M%S"), ".log")
+
+# ============================= MAIN SCRIPT ===============================
+
+plan(multisession, workers = availableCores() - 1)
 
 dir.create(backtest_dir)
 dir.create(log_dir)

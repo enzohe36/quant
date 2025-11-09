@@ -1,10 +1,10 @@
 <!--
-Replace username
-Replace myscript
-Set time
-com.username.myscript.plist
-chmod +x ~/Documents/quant/myscript.sh;
-mv com.username.myscript.plist ~/Library/LaunchAgents/;
+REPLACE username
+REPLACE myscript
+SET time
+RENAME AS com.username.myscript.plist
+chmod +x myscript.sh;
+mv ./resources/com.username.myscript.plist ~/Library/LaunchAgents/;
 launchctl unload ~/Library/LaunchAgents/com.username.myscript.plist;
 launchctl load ~/Library/LaunchAgents/com.username.myscript.plist
 -->

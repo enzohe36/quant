@@ -1,31 +1,26 @@
 # conda activate myenv; pip install aktools --upgrade -i https://pypi.org/simple; pip install akshare --upgrade -i https://pypi.org/simple; python -m aktools
 
-rm(list = ls())
-
-gc()
+# =============================== PRESET ==================================
 
 source_scripts(
   scripts = c("misc", "data_retrievers"),
   packages = c("foreach", "tidyverse")
 )
 
-# ============================================================================
-# Paths and Parameters
-# ============================================================================
-
 data_dir <- "data/"
+spot_combined_path <- paste0(data_dir, "spot_combined.csv")
+
 hist_dir <- paste0(data_dir, "hist/")
 adjust_dir <- paste0(data_dir, "adjust/")
 mc_dir <- paste0(data_dir, "mc/")
 val_dir <- paste0(data_dir, "val/")
 
-holidays_path <- paste0(data_dir, "holidays.csv")
-indices_path <- paste0(data_dir, "indices.csv")
-spot_combined_path <- paste0(data_dir, "spot_combined.csv")
-
 log_dir <- "logs/"
-
 log_path <- paste0(log_dir, format(now(), "%Y%m%d_%H%M%S"), ".log")
+
+end_date <- as_tradeday(now() - hours(16))
+
+# ============================== SPOT DATA ================================
 
 dir.create(data_dir)
 dir.create(hist_dir)
@@ -34,11 +29,7 @@ dir.create(mc_dir)
 dir.create(val_dir)
 dir.create(log_dir)
 
-end_date <- as_tradeday(now() - hours(16))
-
-# ============================================================================
-# Spot Data Update
-# ============================================================================
+source("get_indices.r", encoding = "UTF-8")
 
 if (!file.exists(spot_combined_path)) {
   spot_combined <- combine_spot()
@@ -51,15 +42,9 @@ if (!file.exists(spot_combined_path)) {
     write_csv(spot_combined, spot_combined_path)
   }
 }
-tsprint(str_glue("Retrieved spot data for {nrow(spot_combined)} symbols."))
+tsprint(str_glue("Retrieved spot data for {nrow(spot_combined)} stocks."))
 
-# indices <- select(get_index_spot(), c(symbol, name, market))
-# write_csv(indices, indices_path)
-# tsprint(str_glue("Updated {nrow(indices)} indices."))
-
-# ============================================================================
-# Historical Data Update
-# ============================================================================
+# =========================== HISTORICAL DATA =============================
 
 symbols <- spot_combined %>%
   filter(str_detect(symbol, "^(0|3|6)")) %>%
@@ -185,8 +170,6 @@ out <- foreach(
   }
 }
 
-tsprint(str_glue("Updated {length(symbols)} symbols."))
+tsprint(str_glue("Updated {length(symbols)} stocks."))
 
-holidays <- get_holidays(hist_dir)
-write_csv(tibble(date = holidays), paste0(data_dir, "holidays.csv"))
-tsprint(str_glue("Updated holidays from {min(holidays)} to {max(holidays)}."))
+source("get_holidays", encoding = "UTF-8")

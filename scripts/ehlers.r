@@ -2,6 +2,8 @@
 # https://www.tradingview.com/script/e8DZtqQL/
 # https://www.tradingview.com/script/559mGm7c/
 
+# =============================== PRESET ==================================
+
 # library(xts)
 # library(DSTrading)
 # library(patchwork)
@@ -9,9 +11,7 @@
 # library(doFuture)
 # library(tidyverse)
 
-# ============================================================================
-# Helper Functions
-# ============================================================================
+# ========================== HELPER FUNCTIONS =============================
 
 supersmoother <- function(src, length) {
   a1 <- exp(-sqrt(2) * pi / length)
@@ -90,9 +90,7 @@ calculate_smoothing_coefs <- function(lowpass_cutoff) {
   return(list(sc1 = sc1, sc2 = sc2, sc3 = sc3))
 }
 
-# ============================================================================
-# SuperSmoother MA Oscillator
-# ============================================================================
+# ===================== SUPERSMOOTHER MA OSCILLATOR =======================
 
 calculate_supersmoother_oscillator <- function(
   data,
@@ -134,9 +132,7 @@ calculate_supersmoother_oscillator <- function(
   ))
 }
 
-# ============================================================================
-# KAMA
-# ============================================================================
+# ================================ KAMA ===================================
 
 calculate_kama <- function(
   data,
@@ -162,9 +158,7 @@ calculate_kama <- function(
   ))
 }
 
-# ============================================================================
-# Ehlers Loops
-# ============================================================================
+# ============================ EHLERS LOOPS ===============================
 
 calculate_ehlers_loops <- function(
   data,
@@ -258,9 +252,7 @@ calculate_ehlers_loops <- function(
   ))
 }
 
-# ============================================================================
-# Bullish Condition Test
-# ============================================================================
+# ======================= BULLISH CONDITION TEST ==========================
 
 if_bullish <- function(
   result,
@@ -345,9 +337,7 @@ if_bullish <- function(
   return(result)
 }
 
-# ============================================================================
-# Feature Generation
-# ============================================================================
+# ========================= FEATURE GENERATION ============================
 
 generate_features <- function(
   data_combined,
@@ -459,9 +449,7 @@ generate_features <- function(
   return(data_combined)
 }
 
-# ============================================================================
-# Plotting
-# ============================================================================
+# ============================== PLOTTING =================================
 
 plot_supersmoother_indicator <- function(data, result, spot) {
   # Extract symbol and name
@@ -643,9 +631,7 @@ plot_supersmoother_indicator <- function(data, result, spot) {
   return(combined_plot)
 }
 
-# ============================================================================
-# Usage Example
-# ============================================================================
+# ============================ USAGE EXAMPLE ==============================
 
 # symbol <- "300378"
 # end_date <- today()

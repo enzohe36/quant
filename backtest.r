@@ -1,20 +1,15 @@
-# Backtesting Script: Support + Volume Entry with Multi-Indicator Exit
-# Using foreach and doFuture for Parallel Processing
-# ======================================================================
+# =============================== PRESET ==================================
 
-library(TTR)        # For technical indicators
-library(foreach)    # For parallel loops
-library(doFuture)   # For parallel backend
-library(future)     # For parallel processing setup
-library(data.table) # For rbindlist
-library(tidyverse)
+source_scripts(
+  scripts = c("misc"),
+  packages = c("TTR", "foreach", "doFuture", "data.table", "tidyverse")
+)
 
-set.seed(123)  # For reproducibility
+set.seed(123)
 
-# Helper Functions
-# ================
+# ========================== HELPER FUNCTIONS =============================
 
-#' Calculate Technical Indicators
+# Calculate Technical Indicators
 calculate_indicators <- function(df) {
   df %>%
     arrange(date) %>%
@@ -58,8 +53,7 @@ calculate_indicators <- function(df) {
     select(-macd_obj)  # Remove the MACD object column
 }
 
-
-#' Identify Entry Signals (Strategy 2: Support + Volume)
+# Identify Entry Signals (Strategy 2: Support + Volume)
 identify_entry_signals <- function(df) {
   df %>%
     mutate(
@@ -85,8 +79,7 @@ identify_entry_signals <- function(df) {
     )
 }
 
-
-#' Identify Exit Signals (Multi-Indicator Confirmation)
+# Identify Exit Signals (Multi-Indicator Confirmation)
 identify_exit_signals <- function(df) {
   df %>%
     mutate(
@@ -112,8 +105,7 @@ identify_exit_signals <- function(df) {
     )
 }
 
-
-#' Simulate Trades
+# Simulate Trades
 simulate_trades <- function(df, initial_capital = 10000, commission = 0.001) {
 
   # Initialize tracking variables
@@ -174,10 +166,7 @@ simulate_trades <- function(df, initial_capital = 10000, commission = 0.001) {
   bind_rows(trades)
 }
 
-
-
-
-#' Calculate Performance Metrics
+# Calculate Performance Metrics
 calculate_performance <- function(trades_df) {
 
   if (nrow(trades_df) == 0) {
@@ -220,9 +209,8 @@ calculate_performance <- function(trades_df) {
   )
 }
 
+# ============================= MAIN SCRIPT ===============================
 
-# Main Backtesting Function
-# ==========================
 stock_list_path <- "models/data_combined.rds"  # Path to your RDS file
 initial_capital <- 10000
 n_workers <- NULL  # Auto-detect
@@ -339,5 +327,4 @@ if (nrow(results$all_trades) > 0) {
   print(yearly_performance)
 }
 
-# Optional: Reset to sequential processing when done
-# plan(sequential)
+plan(sequential)

@@ -1,10 +1,13 @@
+# =============================== PRESET ==================================
+
 # library(foreach)
 # library(doFuture)
 # library(tidyverse)
 
-holidays <- read_csv("data/holidays.csv", show_col_types = FALSE)$date
+data_dir <- "data/"
+holidays_path <- paste0(data_dir, "holidays.txt")
 
-# ============================================================================
+# ============================ MISCELLANEOUS ==============================
 
 # .combine = "multiout", .multicombine = TRUE, .init = list(list(), list(), ...)
 # https://stackoverflow.com/a/19801108
@@ -42,48 +45,6 @@ replace_missing <- function(x, replacement) {
   return(x)
 }
 
-get_holidays <- function(hist_dir) {
-  files <- list.files(hist_dir)
-
-  if (length(files) == 0) {
-    holidays <- as_date(c())
-  } else {
-    plan(multisession, workers = availableCores() - 1)
-
-    tradedays <- foreach(
-      file = files,
-      .combine = "c"
-    ) %dofuture% {
-      read_csv(paste0(hist_dir, file), show_col_types = FALSE) %>%
-        pull(date)
-    } %>%
-      unique()
-
-    plan(sequential)
-
-    holidays <- seq(min(tradedays), max(tradedays), by = "1 day") %>%
-      .[!wday(., week_start = 1) %in% 6:7] %>%
-      .[!.%in% tradedays]
-  }
-
-  new_holidays <- c(
-    mdy("January 1, 2025"),
-    seq(mdy("January 28, 2025"), mdy("February 4, 2025"), by = "1 day"),
-    mdy("January 26, 2025"),
-    mdy("February 8, 2025"),
-    seq(mdy("April 4, 2025"), mdy("April 6, 2025"), by = "1 day"),
-    seq(mdy("May 1, 2025"), mdy("May 5, 2025"), by = "1 day"),
-    mdy("April 27, 2025"),
-    seq(mdy("May 31, 2025"), mdy("June 2, 2025"), by = "1 day"),
-    seq(mdy("October 1, 2025"), mdy("October 8, 2025"), by = "1 day"),
-    mdy("September 28, 2025"),
-    mdy("October 11, 2025")
-  ) %>%
-    .[!wday(., week_start = 1) %in% 6:7]
-
-  return(unique(c(holidays, new_holidays)))
-}
-
 as_tradeday <- function(datetime) {
   date <- as_date(datetime)
   tradeday <- lapply(
@@ -91,10 +52,25 @@ as_tradeday <- function(datetime) {
     function(date) {
       seq(date - weeks(3), date, "1 day") %>%
         .[!wday(., week_start = 1) %in% 6:7] %>%
-        .[!.%in% holidays] %>%
+        .[!.%in% as_date(readLines(holidays_path))] %>%
         last()
     }
   ) %>%
     reduce(c)
   return(tradeday)
+}
+
+writeTitle <- function(str = "", level = 0, length = 75) {
+  str <- toupper(str)
+  pad_length <- floor((length - str_length(str) - 2) / 2)
+  left <- c("#", paste0(rep("=", pad_length - 2), collapse = ""), str) %>%
+    .[str_length(.) > 0] %>%
+    paste0(collapse = " ") %>%
+    str_sub(1, str_length(.) - str_length(str))
+  right <- c(str, paste0(rep("=", length), collapse = "")) %>%
+    .[str_length(.) > 0] %>%
+    paste0(collapse = " ")
+  paste0(left, right) %>%
+    str_sub(1, length) %>%
+    writeLines()
 }

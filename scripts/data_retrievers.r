@@ -1,15 +1,17 @@
+# =============================== PRESET ==================================
+
 # library(RCurl)
 # library(jsonlite)
 # library(data.table)
 # library(tidyverse)
 
-indices <- read_csv("data/indices.csv", show_col_types = FALSE)
+data_dir <- "data/"
+indices_path <- paste0(data_dir, "indices.csv")
+
 default_end_date_expr <- expr(as_tradeday(now() - hours(16)))
 current_tradeday_expr <- expr(as_tradeday(now() - hours(8)))
 
-# ============================================================================
-# Helper Functions
-# ============================================================================
+# ========================== HELPER FUNCTIONS =============================
 
 aktools <- function(key, ...){
   Sys.sleep(1)
@@ -49,16 +51,14 @@ loop_function <- function(func_name, ..., fail_max = 3, wait = 60) {
   stop("Maximum retries exceeded.")
 }
 
-# ============================================================================
-# Index Data Retrievers
-# ============================================================================
+# ============================= INDEX DATA ================================
 
 # https://quote.eastmoney.com/center/gridlist.html#index_sz
-get_index_spot <- function(source) {
+get_index_spot <- function(index_type) {
   ts1 <- eval(default_end_date_expr)
   aktools(
     key = "stock_zh_index_spot_em",
-    symbol = source
+    symbol = index_type
   ) %>%
     mutate(
       symbol = `代码`,
@@ -75,7 +75,7 @@ get_index_spot <- function(source) {
     arrange(symbol)
 }
 
-combine_index_spot <- function() {
+combine_indices <- function() {
   list(
     loop_function("get_index_spot", "上证系列指数") %>%
       mutate(market = "sh"),
@@ -85,12 +85,15 @@ combine_index_spot <- function() {
       mutate(market = "csi")
   ) %>%
     rbindlist(fill = TRUE) %>%
+    select(symbol, name, market, date) %>%
     distinct(symbol, .keep_all = TRUE) %>%
     arrange(symbol)
 }
 
 # http://quote.eastmoney.com/center/hszs.html
 get_index_hist <- function(symbol, start_date, end_date) {
+  indices <- read_csv(indices_path, show_col_types = FALSE)
+
   # date open close high low volume amount
   aktools(
     key = "stock_zh_index_daily_em",
@@ -120,9 +123,7 @@ get_index_comp <- function(symbol) {
     arrange(symbol)
 }
 
-# ============================================================================
-# Stock Data Retrievers
-# ============================================================================
+# ============================== SPOT DATA ================================
 
 # https://quote.eastmoney.com/center/gridlist.html#hs_a_board
 get_spot <- function() {
@@ -299,6 +300,8 @@ combine_spot <- function() {
       susp = replace_na(susp, FALSE)
     )
 }
+
+# =========================== HISTORICAL DATA =============================
 
 # https://quote.eastmoney.com/concept/sh603777.html?from=classic(示例)
 get_hist <- function(symbol, start_date, end_date) {
