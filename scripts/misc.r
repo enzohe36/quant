@@ -50,7 +50,7 @@ get_holidays <- function(hist_dir) {
   } else {
     plan(multisession, workers = availableCores() - 1)
 
-    tradedates <- foreach(
+    tradedays <- foreach(
       file = files,
       .combine = "c"
     ) %dofuture% {
@@ -61,9 +61,9 @@ get_holidays <- function(hist_dir) {
 
     plan(sequential)
 
-    holidays <- seq(min(tradedates), max(tradedates), by = "1 day") %>%
+    holidays <- seq(min(tradedays), max(tradedays), by = "1 day") %>%
       .[!wday(., week_start = 1) %in% 6:7] %>%
-      .[!.%in% tradedates]
+      .[!.%in% tradedays]
   }
 
   new_holidays <- c(
@@ -84,9 +84,9 @@ get_holidays <- function(hist_dir) {
   return(unique(c(holidays, new_holidays)))
 }
 
-as_tradedate <- function(datetime) {
+as_tradeday <- function(datetime) {
   date <- as_date(datetime)
-  tradedate <- lapply(
+  tradeday <- lapply(
     date,
     function(date) {
       seq(date - weeks(3), date, "1 day") %>%
@@ -96,5 +96,5 @@ as_tradedate <- function(datetime) {
     }
   ) %>%
     reduce(c)
-  return(tradedate)
+  return(tradeday)
 }

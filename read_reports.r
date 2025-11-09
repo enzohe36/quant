@@ -4,15 +4,10 @@ rm(list = ls())
 
 gc()
 
-library(doFuture)
-library(foreach)
-library(RCurl)
-library(jsonlite)
-library(data.table)
-library(glue)
-library(tidyverse)
-
-source("misc.r", encoding = "UTF-8")
+source_scripts(
+  scripts = c("misc", "data_retrievers"),
+  packages = c("foreach", "doFuture", "data.table", "tidyverse")
+)
 
 ################################################################################
 
@@ -29,10 +24,10 @@ industries <- c("算力")
 # industries <- c("通用设备", "专用设备", "电池")
 
 # index_comp <- get_index_comp("000985") %>%
-#   list(get_fundamentals(as_tradedate(now() - hours(16)))) %>%
+#   list(get_fundamentals(as_tradeday(now() - hours(16)))) %>%
 #   reduce(left_join, by = "symbol")
 # write.csv(index_comp, index_comp_path, quote = FALSE, row.names = FALSE)
-# tsprint(glue("Found {nrow(index_comp)} stocks."))
+# tsprint(str_glue("Found {nrow(index_comp)} stocks."))
 
 index_comp <- read_csv(index_comp_path, show_col_types = FALSE) %>%
   select(symbol, name)
@@ -80,7 +75,7 @@ report <- analysis[[2]] %>%
   paste(collapse = "\n")
 
 c(
-  glue("根据给出的研报节选，为股票池中的所有股票按主营业务分类。要求如下："),
+  str_glue("根据给出的研报节选，为股票池中的所有股票按主营业务分类。要求如下："),
   "- 确保股票池中的所有股票仅分类在最为相关的细分领域下；",
   "- 确保所选股票范围严格限定在股票池内；",
   "- 在Artifacts以Markdown表格的形式输出所有符合条件的股票，包含股票名称、非常简短的推荐理由，优先列出重点推荐股票。",

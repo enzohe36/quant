@@ -2,16 +2,10 @@ rm(list = ls())
 
 gc()
 
-source("r_settings.r", encoding = "UTF-8")
-
-scripts <- c("misc.r")
-load_pkgs(scripts) # No tidyverse
-library(foreach)
-library(doFuture)
-library(glue)
-library(tidyverse)
-
-source_scripts(scripts)
+source_scripts(
+  scripts = c("misc"),
+  packages = c("foreach", "doFuture", "tidyverse")
+)
 
 # ============================================================================
 
@@ -32,7 +26,7 @@ log_path <- paste0(log_dir, format(now(), "%Y%m%d_%H%M%S"), ".log")
 dir.create(backtest_dir)
 dir.create(log_dir)
 
-end_date <- as_tradedate(now() - hours(16))
+end_date <- as_tradeday(now() - hours(16))
 quarters <- seq(
   as_date("1990-01-01"),
   end_date %m-% months(3),
@@ -44,7 +38,7 @@ quarters <- seq(
 symbols <- list.files(hist_dir) %>%
   str_remove("\\.csv$")
 
-data_combined <- foreach (
+data_combined <- foreach(
   symbol = symbols,
   .combine = "c"
 ) %dofuture% {
@@ -63,7 +57,7 @@ data_combined <- foreach (
   hist <- read_csv(hist_path, show_col_types = FALSE)
 
   if (!file.exists(adjust_path)) {
-    tsprint(glue("{symbol}: Missing adjust file."), log_path)
+    tsprint(str_glue("{symbol}: Missing adjust file."), log_path)
     return(NULL)
   } else {
     try_error <- try(
@@ -72,19 +66,19 @@ data_combined <- foreach (
       silent = TRUE
     )
     if (inherits(try_error, "try-error")) {
-      tsprint(glue("{symbol}: Error reading adjust file."), log_path)
+      tsprint(str_glue("{symbol}: Error reading adjust file."), log_path)
     }
   }
 
   if (!file.exists(mc_path)) {
-    tsprint(glue("{symbol}: Missing mc file."), log_path)
+    tsprint(str_glue("{symbol}: Missing mc file."), log_path)
     return(NULL)
   } else {
     mc <- read_csv(mc_path, show_col_types = FALSE)
   }
 
   if (!file.exists(val_path)) {
-    tsprint(glue("{symbol}: Missing val file."), log_path)
+    tsprint(str_glue("{symbol}: Missing val file."), log_path)
     return(NULL)
   } else {
     try_error <- try(
@@ -101,7 +95,7 @@ data_combined <- foreach (
       silent = TRUE
     )
     if (inherits(try_error, "try-error")) {
-      tsprint(glue("{symbol}: Error reading val file."), log_path)
+      tsprint(str_glue("{symbol}: Error reading val file."), log_path)
     }
   }
 
@@ -139,7 +133,7 @@ data_combined <- foreach (
     silent = TRUE
   )
   if (inherits(try_error, "try-error")) {
-    tsprint(glue("{symbol}: Error combining data."), log_path)
+    tsprint(str_glue("{symbol}: Error combining data."), log_path)
     return(NULL)
   }
 

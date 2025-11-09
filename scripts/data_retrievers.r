@@ -1,12 +1,11 @@
 # library(RCurl)
 # library(jsonlite)
 # library(data.table)
-# library(glue)
 # library(tidyverse)
 
 indices <- read_csv("data/indices.csv", show_col_types = FALSE)
-default_end_date_expr <- expr(as_tradedate(now() - hours(16)))
-current_tradedate_expr <- expr(as_tradedate(now() - hours(8)))
+default_end_date_expr <- expr(as_tradeday(now() - hours(16)))
+current_tradeday_expr <- expr(as_tradeday(now() - hours(8)))
 
 # ============================================================================
 # Helper Functions
@@ -21,9 +20,9 @@ aktools <- function(key, ...){
     .encoding = "utf-8"
   ) %>%
     fromJSON()
-  ts2 <- eval(current_tradedate_expr)
+  ts2 <- eval(current_tradeday_expr)
   if (ts1 != ts2) {
-    stop(glue("Trade date changed from {ts1} to {ts2}!"))
+    stop(str_glue("Trade date changed from {ts1} to {ts2}!"))
   } else {
     return(result)
   }
@@ -39,7 +38,7 @@ loop_function <- function(func_name, ..., fail_max = 3, wait = 60) {
     )
     if (inherits(try_error, "try-error")) {
       tsprint(
-        glue("Error running {func_name}, attempt {fail_count}/{fail_max}.")
+        str_glue("Error running {func_name}, attempt {fail_count}/{fail_max}.")
       )
       fail_count <- fail_count + 1
       Sys.sleep(wait)
@@ -356,7 +355,7 @@ get_mc <- function(symbol) {
     period = "全部"
   ) %>%
     mutate(
-      date = as_tradedate(date),
+      date = as_tradeday(date),
       mc = as.numeric(value)
     ) %>%
     select(date, mc) %>%
@@ -386,7 +385,7 @@ get_val <- function(symbol) {
   ) %>%
     mutate(
       date = as_date(REPORT_DATE),
-      val_change_date = as_tradedate(now() - hours(16)),
+      val_change_date = as_tradeday(now() - hours(16)),
       revenue = as.numeric(TOTALOPERATEREVE),
       np = as.numeric(PARENTNETPROFIT),
       np_deduct = as.numeric(DEDU_PARENT_PROFIT),

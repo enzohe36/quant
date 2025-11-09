@@ -4,14 +4,10 @@ rm(list = ls())
 
 gc()
 
-source("r_settings.r", encoding = "UTF-8")
-
-scripts <- c("misc.r", "data_retrievers.r")
-load_pkgs(scripts) # No tidyverse
-library(foreach)
-library(tidyverse)
-
-source_scripts(scripts)
+source_scripts(
+  scripts = c("misc", "data_retrievers"),
+  packages = c("foreach", "tidyverse")
+)
 
 # ============================================================================
 # Paths and Parameters
@@ -38,7 +34,7 @@ dir.create(mc_dir)
 dir.create(val_dir)
 dir.create(log_dir)
 
-end_date <- as_tradedate(now() - hours(16))
+end_date <- as_tradeday(now() - hours(16))
 
 # ============================================================================
 # Spot Data Update
@@ -55,11 +51,11 @@ if (!file.exists(spot_combined_path)) {
     write_csv(spot_combined, spot_combined_path)
   }
 }
-tsprint(glue("Retrieved spot data for {nrow(spot_combined)} symbols."))
+tsprint(str_glue("Retrieved spot data for {nrow(spot_combined)} symbols."))
 
 # indices <- select(get_index_spot(), c(symbol, name, market))
 # write_csv(indices, indices_path)
-# tsprint(glue("Updated {nrow(indices)} indices."))
+# tsprint(str_glue("Updated {nrow(indices)} indices."))
 
 # ============================================================================
 # Historical Data Update
@@ -93,7 +89,7 @@ out <- foreach(
     if (!file.exists(hist_path)) {
       hist <- get_hist(symbol, NULL, end_date)
       write_csv(hist, hist_path)
-      tsprint(glue("{symbol}: Created hist file."), log_path)
+      tsprint(str_glue("{symbol}: Created hist file."), log_path)
     } else {
       hist <- read_csv(hist_path, show_col_types = FALSE)
       last_date <- max(pull(hist, date))
@@ -102,28 +98,28 @@ out <- foreach(
           pull(spot_symbol, delist) |
           pull(spot_symbol, susp)
       ) {
-      } else if (isTRUE(last_date == as_tradedate(end_date - 1))) {
+      } else if (isTRUE(last_date == as_tradeday(end_date - 1))) {
         hist <- bind_rows(hist, select(spot_symbol, names(hist)))
         write_csv(hist, hist_path)
-        glue("{symbol}: Appended spot to hist.") %>%
+        str_glue("{symbol}: Appended spot to hist.") %>%
           tsprint(log_path)
       } else {
         hist <- bind_rows(hist, get_hist(symbol, last_date + 1, end_date))
         write_csv(hist, hist_path)
-        tsprint(glue("{symbol}: Appended new data to hist."), log_path)
+        tsprint(str_glue("{symbol}: Appended new data to hist."), log_path)
       }
     },
     silent = TRUE
   )
   if (inherits(try_error, "try-error")) {
-    tsprint(glue("{symbol}: Error retrieving hist."), log_path)
+    tsprint(str_glue("{symbol}: Error retrieving hist."), log_path)
   }
 
   try_error <- try(
     if (!file.exists(adjust_path)) {
       adjust <- get_adjust(symbol)
       write_csv(adjust, adjust_path)
-      tsprint(glue("{symbol}: Created adjust file."), log_path)
+      tsprint(str_glue("{symbol}: Created adjust file."), log_path)
     } else {
       adjust <- read_csv(adjust_path, show_col_types = FALSE)
       last_date <- max(pull(adjust, date))
@@ -133,20 +129,20 @@ out <- foreach(
       ) {
         adjust <- get_adjust(symbol)
         write_csv(adjust, adjust_path)
-        tsprint(glue("{symbol}: Replaced adjust file."), log_path)
+        tsprint(str_glue("{symbol}: Replaced adjust file."), log_path)
       }
     },
     silent = TRUE
   )
   if (inherits(try_error, "try-error")) {
-    tsprint(glue("{symbol}: Error retrieving adjust."), log_path)
+    tsprint(str_glue("{symbol}: Error retrieving adjust."), log_path)
   }
 
   try_error <- try(
     if (!file.exists(mc_path)) {
       mc <- get_mc(symbol)
       write_csv(mc, mc_path)
-      tsprint(glue("{symbol}: Created mc file."), log_path)
+      tsprint(str_glue("{symbol}: Created mc file."), log_path)
     } else {
       mc <- read_csv(mc_path, show_col_types = FALSE)
       last_date <- max(pull(mc, date))
@@ -156,20 +152,20 @@ out <- foreach(
       ) {
         mc <- get_mc(symbol)
         write_csv(mc, mc_path)
-        tsprint(glue("{symbol}: Replaced mc file."), log_path)
+        tsprint(str_glue("{symbol}: Replaced mc file."), log_path)
       }
     },
     silent = TRUE
   )
   if (inherits(try_error, "try-error")) {
-    tsprint(glue("{symbol}: Error retrieving mc."), log_path)
+    tsprint(str_glue("{symbol}: Error retrieving mc."), log_path)
   }
 
   try_error <- try(
     if (!file.exists(val_path)) {
       val <- get_val(symbol)
       write_csv(val, val_path)
-      tsprint(glue("{symbol}: Created val file."), log_path)
+      tsprint(str_glue("{symbol}: Created val file."), log_path)
     } else {
       val <- read_csv(val_path, show_col_types = FALSE)
       last_date <- max(pull(val, val_change_date))
@@ -179,18 +175,18 @@ out <- foreach(
       ) {
         val <- get_val(symbol)
         write_csv(val, val_path)
-        tsprint(glue("{symbol}: Replaced val file."), log_path)
+        tsprint(str_glue("{symbol}: Replaced val file."), log_path)
       }
     },
     silent = TRUE
   )
   if (inherits(try_error, "try-error")) {
-    tsprint(glue("{symbol}: Error retrieving val."), log_path)
+    tsprint(str_glue("{symbol}: Error retrieving val."), log_path)
   }
 }
 
-tsprint(glue("Updated {length(symbols)} symbols."))
+tsprint(str_glue("Updated {length(symbols)} symbols."))
 
 holidays <- get_holidays(hist_dir)
 write_csv(tibble(date = holidays), paste0(data_dir, "holidays.csv"))
-tsprint(glue("Updated holidays from {min(holidays)} to {max(holidays)}."))
+tsprint(str_glue("Updated holidays from {min(holidays)} to {max(holidays)}."))

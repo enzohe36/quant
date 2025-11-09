@@ -1,14 +1,11 @@
-# rm(list = ls())
+rm(list = ls())
 
 gc()
 
-source("r_settings.r", encoding = "UTF-8")
-
-scripts <- c("misc.r", "ehlers.r")
-load_pkgs(scripts) # No tidyverse
-library(tidyverse)
-
-source_scripts(scripts)
+source_scripts(
+  scripts = c("misc", "ehlers"),
+  packages = c("tidyverse")
+)
 
 # ============================================================================
 
@@ -17,7 +14,7 @@ data_combined_path <- paste0(backtest_dir, "data_combined.rds")
 data_bt_path <- paste0(backtest_dir, "data_bt.rds")
 
 data_combined <- if (exists("data_bt")) data_bt else readRDS(data_combined_path)
-end_date <- as_tradedate(now() - hours(16))
+end_date <- as_tradeday(now() - hours(16))
 start_date <- end_date %m-% years(5)
 
 ts1 <- Sys.time()

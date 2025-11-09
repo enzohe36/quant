@@ -1,7 +1,13 @@
-library(lightgbm)
-library(caret)
-library(parallel)
-library(tidyverse)
+rm(list = ls())
+
+gc()
+
+source_scripts(
+  scripts = c("misc"),
+  packages = c("lightgbm", "caret", "parallel", "tidyverse")
+)
+
+# ============================================================================
 
 # Set seed for reproducibility
 set.seed(42)
