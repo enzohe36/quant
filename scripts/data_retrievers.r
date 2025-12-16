@@ -8,18 +8,24 @@
 data_dir <- "data/"
 indices_path <- paste0(data_dir, "indices.csv")
 
-default_end_date_expr <- expr(as_tradeday(now() - hours(16)))
-current_tradeday_expr <- expr(as_tradeday(now() - hours(8)))
+default_end_date_expr <- expr(as_tradeday(now() - hours(17)))
+current_tradeday_expr <- expr(as_tradeday(now() - hours(9)))
 
 # ========================== HELPER FUNCTIONS =============================
 
 aktools <- function(key, ...){
+  args <- list(...) %>%
+    lapply(function(x) if (is.character(x)) enc2utf8(x) else x)
+
   Sys.sleep(1)
   ts1 <- eval(default_end_date_expr)
-  result <- getForm(
-    uri = paste0("http://127.0.0.1:8080/api/public/", key),
-    ...,
-    .encoding = "utf-8"
+  result <- do.call(
+    getForm,
+    c(
+      list(uri = paste0("http://127.0.0.1:8080/api/public/", key)),
+      args,
+      list(.encoding = "utf-8")
+    )
   ) %>%
     fromJSON()
   ts2 <- eval(current_tradeday_expr)
@@ -28,7 +34,6 @@ aktools <- function(key, ...){
   } else {
     return(result)
   }
-  return(result)
 }
 
 loop_function <- function(func_name, ..., fail_max = 3, wait = 60) {
@@ -338,7 +343,7 @@ get_adjust <- function(symbol) {
       ),
       symbol
     ),
-    adjust = as.numeric("hfq-factor")
+    adjust = "hfq-factor"
   ) %>%
     mutate(
       date = as_date(date),

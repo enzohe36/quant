@@ -29,7 +29,7 @@ dir.create(mc_dir)
 dir.create(val_dir)
 dir.create(log_dir)
 
-source("get_indices.r", encoding = "UTF-8")
+# source("get_indices.r", encoding = "UTF-8")
 
 if (!file.exists(spot_combined_path)) {
   spot_combined <- combine_spot()
@@ -62,6 +62,8 @@ out <- foreach(
     "try_error", "last_date"
   )
   rm(list = vars)
+
+  gc()
 
   hist_path <- paste0(hist_dir, symbol, ".csv")
   adjust_path <- paste0(adjust_dir, symbol, ".csv")
