@@ -1,6 +1,6 @@
 # conda activate myenv; pip install aktools --upgrade -i https://pypi.org/simple; pip install akshare --upgrade -i https://pypi.org/simple; python -m aktools
 
-# =============================== PRESET ==================================
+# PRESET =======================================================================
 
 source_scripts(
   scripts = c("misc", "data_retrievers"),
@@ -20,7 +20,7 @@ log_path <- paste0(log_dir, format(now(), "%Y%m%d_%H%M%S"), ".log")
 
 end_date <- as_tradeday(now() - hours(16))
 
-# ============================== SPOT DATA ================================
+# SPOT DATA ====================================================================
 
 dir.create(data_dir)
 dir.create(hist_dir)
@@ -28,8 +28,6 @@ dir.create(adjust_dir)
 dir.create(mc_dir)
 dir.create(val_dir)
 dir.create(log_dir)
-
-# source("get_indices.r", encoding = "UTF-8")
 
 if (!file.exists(spot_combined_path)) {
   spot_combined <- combine_spot()
@@ -44,7 +42,7 @@ if (!file.exists(spot_combined_path)) {
 }
 tsprint(str_glue("Retrieved spot data for {nrow(spot_combined)} stocks."))
 
-# =========================== HISTORICAL DATA =============================
+# HISTORICAL DATA ==============================================================
 
 symbols <- spot_combined %>%
   filter(str_detect(symbol, "^(0|3|6)")) %>%
@@ -62,8 +60,6 @@ out <- foreach(
     "try_error", "last_date"
   )
   rm(list = vars)
-
-  gc()
 
   hist_path <- paste0(hist_dir, symbol, ".csv")
   adjust_path <- paste0(adjust_dir, symbol, ".csv")
@@ -173,5 +169,3 @@ out <- foreach(
 }
 
 tsprint(str_glue("Updated {length(symbols)} stocks."))
-
-source("get_holidays", encoding = "UTF-8")

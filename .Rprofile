@@ -12,12 +12,14 @@ if (.Platform$OS.type == "windows") {
       options(device = function(...) httpgd::hgd(silent = FALSE))
     }
   }
+
+  Sys.setlocale("LC_ALL", "chs")
 }
 
 options(warn = -1)
 options(repos = c(CRAN = "https://cloud.r-project.org"))
+options(encoding = "UTF-8")
 
-Sys.setlocale(locale = "Chinese")
 Sys.setenv(TZ = "Asia/Shanghai")
 
 source_scripts <- function(scripts, packages) {
@@ -40,5 +42,5 @@ source_scripts <- function(scripts, packages) {
     packages <- c(packages[packages != "tidyverse"], "tidyverse")
   }
   out <- sapply(packages, library, character.only = TRUE)
-  out <- sapply(scripts, source, encoding = "UTF-8")
+  out <- sapply(scripts, source)
 }

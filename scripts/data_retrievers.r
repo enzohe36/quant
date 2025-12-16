@@ -1,17 +1,17 @@
-# =============================== PRESET ==================================
+# PRESET =======================================================================
 
 # library(RCurl)
 # library(jsonlite)
 # library(data.table)
 # library(tidyverse)
 
-data_dir <- "data/"
-indices_path <- paste0(data_dir, "indices.csv")
+resource_dir <- "resources/"
+indices_path <- paste0(resource_dir, "indices.csv")
 
 default_end_date_expr <- expr(as_tradeday(now() - hours(17)))
 current_tradeday_expr <- expr(as_tradeday(now() - hours(9)))
 
-# ========================== HELPER FUNCTIONS =============================
+# HELPER FUNCTIONS =============================================================
 
 aktools <- function(key, ...){
   args <- list(...) %>%
@@ -19,6 +19,8 @@ aktools <- function(key, ...){
 
   Sys.sleep(1)
   ts1 <- eval(default_end_date_expr)
+  ts2 <- eval(current_tradeday_expr)
+  if (ts1 != ts2) stop(str_glue("Trade date changed from {ts1} to {ts2}!"))
   result <- do.call(
     getForm,
     c(
@@ -28,12 +30,7 @@ aktools <- function(key, ...){
     )
   ) %>%
     fromJSON()
-  ts2 <- eval(current_tradeday_expr)
-  if (ts1 != ts2) {
-    stop(str_glue("Trade date changed from {ts1} to {ts2}!"))
-  } else {
-    return(result)
-  }
+  return(result)
 }
 
 loop_function <- function(func_name, ..., fail_max = 3, wait = 60) {
@@ -44,9 +41,8 @@ loop_function <- function(func_name, ..., fail_max = 3, wait = 60) {
       silent = TRUE
     )
     if (inherits(try_error, "try-error")) {
-      tsprint(
-        str_glue("Error running {func_name}, attempt {fail_count}/{fail_max}.")
-      )
+      error_msg <- attr(try_error, "condition")$message
+      tsprint(str_glue("Attempt {fail_count}/{fail_max}: {error_msg}"))
       fail_count <- fail_count + 1
       Sys.sleep(wait)
     } else {
@@ -55,8 +51,7 @@ loop_function <- function(func_name, ..., fail_max = 3, wait = 60) {
   }
   stop("Maximum retries exceeded.")
 }
-
-# ============================= INDEX DATA ================================
+# INDEX DATA ===================================================================
 
 # https://quote.eastmoney.com/center/gridlist.html#index_sz
 get_index_spot <- function(index_type) {
@@ -128,7 +123,7 @@ get_index_comp <- function(symbol) {
     arrange(symbol)
 }
 
-# ============================== SPOT DATA ================================
+# SPOT DATA ====================================================================
 
 # https://quote.eastmoney.com/center/gridlist.html#hs_a_board
 get_spot <- function() {
@@ -306,7 +301,7 @@ combine_spot <- function() {
     )
 }
 
-# =========================== HISTORICAL DATA =============================
+# HISTORICAL DATA ==============================================================
 
 # https://quote.eastmoney.com/concept/sh603777.html?from=classic(示例)
 get_hist <- function(symbol, start_date, end_date) {

@@ -1,18 +1,19 @@
 # conda activate myenv; pip install aktools --upgrade -i https://pypi.org/simple; pip install akshare --upgrade -i https://pypi.org/simple; python -m aktools
 
-# =============================== PRESET ==================================
+# PRESET =======================================================================
 
 source_scripts(
   scripts = c("misc", "data_retrievers"),
   packages = c()
 )
 
-data_dir <- "data/"
-indices_path <- paste0(data_dir, "indices.csv")
+resource_dir <- "resources/"
+indices_path <- paste0(resource_dir, "indices.csv")
 
-# ============================= MAIN SCRIPT ===============================
+# MAIN SCRIPT ==================================================================
 
 dir.create(data_dir)
+dir.create(resource_dir)
 
 indices <- combine_indices()
 write_csv(indices, indices_path)

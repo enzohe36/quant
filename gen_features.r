@@ -1,4 +1,4 @@
-# =============================== PRESET ==================================
+# PRESET =======================================================================
 
 source_scripts(
   scripts = c("misc", "ehlers"),
@@ -21,7 +21,7 @@ min_osc_d1 <- -0.01
 osc_lookback <- 40
 max_osc_diff <- 1.9
 
-# ============================= MAIN SCRIPT ===============================
+# MAIN SCRIPT ==================================================================
 
 data_combined <- if (exists("data_bt")) data_bt else readRDS(data_combined_path)
 

@@ -1,13 +1,13 @@
-# =============================== PRESET ==================================
+# PRESET =======================================================================
 
 # library(foreach)
 # library(doFuture)
 # library(tidyverse)
 
-data_dir <- "data/"
-holidays_path <- paste0(data_dir, "holidays.txt")
+resource_dir <- "resources/"
+holidays_path <- paste0(resource_dir, "holidays.txt")
 
-# ============================ MISCELLANEOUS ==============================
+# MISCELLANEOUS ================================================================
 
 # .combine = "multiout", .multicombine = TRUE, .init = list(list(), list(), ...)
 # https://stackoverflow.com/a/19801108
@@ -60,17 +60,13 @@ as_tradeday <- function(datetime) {
   return(tradeday)
 }
 
-writeTitle <- function(str = "", level = 0, length = 75) {
-  str <- toupper(str)
-  pad_length <- floor((length - str_length(str) - 2) / 2)
-  left <- c("#", paste0(rep("=", pad_length - 2), collapse = ""), str) %>%
-    .[str_length(.) > 0] %>%
-    paste0(collapse = " ") %>%
-    str_sub(1, str_length(.) - str_length(str))
-  right <- c(str, paste0(rep("=", length), collapse = "")) %>%
-    .[str_length(.) > 0] %>%
-    paste0(collapse = " ")
-  paste0(left, right) %>%
-    str_sub(1, length) %>%
-    writeLines()
+write_title <- function(string = "", total_length = 80) {
+  string <- toupper(string)
+  if (string == "") {
+    output <- paste0("# ", strrep("=", total_length - 2))
+  } else {
+    n_equals <- total_length - nchar(string) - 3
+    output <- paste0("# ", string, " ", strrep("=", max(0, n_equals)))
+  }
+  cat(output, "\n", sep = "")
 }

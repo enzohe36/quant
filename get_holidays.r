@@ -1,4 +1,4 @@
-# =============================== PRESET ==================================
+# PRESET =======================================================================
 
 source_scripts(
   scripts = c("misc"),
@@ -6,15 +6,17 @@ source_scripts(
 )
 
 data_dir <- "data/"
-holidays_path <- paste0(data_dir, "holidays.txt")
-
 hist_dir <- paste0(data_dir, "hist/")
 
-# ============================= MAIN SCRIPT ===============================
+resource_dir <- "resources/"
+holidays_path <- paste0(resource_dir, "holidays.txt")
+
+# MAIN SCRIPT ==================================================================
 
 plan(multisession, workers = availableCores() - 1)
 
 dir.create(data_dir)
+dir.create(resource_dir)
 
 new_holidays <- c(
   mdy("January 1, 2025"),

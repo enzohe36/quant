@@ -1,4 +1,4 @@
-# =============================== PRESET ==================================
+# PRESET =======================================================================
 
 source_scripts(
   scripts = c("misc"),
@@ -17,7 +17,7 @@ data_combined_path <- paste0(backtest_dir, "data_combined.rds")
 log_dir <- "logs/"
 log_path <- paste0(log_dir, format(now(), "%Y%m%d_%H%M%S"), ".log")
 
-# ============================= MAIN SCRIPT ===============================
+# MAIN SCRIPT ==================================================================
 
 plan(multisession, workers = availableCores() - 1)
 
