@@ -10,7 +10,7 @@ pip install aktools --upgrade -i https://pypi.org/simple
 pip install akshare --upgrade -i https://pypi.org/simple
 
 Write-Host "Starting aktools server..."
-$aktools_process = Start-Process -FilePath "python" -ArgumentList "-m", "aktools" -PassThru
+$aktools_process = Start-Process -FilePath "python" -ArgumentList "-m", "aktools" -PassThru -WindowStyle Normal
 
 # Wait for server to start
 Start-Sleep -Seconds 20
@@ -39,9 +39,20 @@ catch {
     Write-Error "An error occurred: $_"
 }
 finally {
-    # Terminate aktools server
+    # Terminate aktools server and all child processes
     Write-Host "Terminating aktools server..."
-    Stop-Process -Id $aktools_process.Id -Force
+
+    # Stop the main process and all its children
+    if ($aktools_process -and !$aktools_process.HasExited) {
+        # Kill all child processes first
+        Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq $aktools_process.Id } | ForEach-Object {
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+        # Kill the main process
+        Stop-Process -Id $aktools_process.Id -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-Host "`nScript ended at: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor Cyan
 
     Write-Host "`nPress any key to close this window..."
     $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")

@@ -24,10 +24,9 @@ plan(multisession, workers = availableCores() - 1)
 dir.create(backtest_dir)
 dir.create(log_dir)
 
-end_date <- as_tradeday(now() - hours(16))
 quarters <- seq(
   as_date("1990-01-01"),
-  end_date %m-% months(3),
+  eval(last_td_expr) %m-% months(3),
   by = "1 day"
 ) %>%
   quarter("date_last") %>%
@@ -87,8 +86,7 @@ data_combined <- foreach(
           revenue = runSum(revenue, 4),
           np = runSum(np, 4),
           np_deduct = runSum(np_deduct, 4),
-          cfps = runSum(cfps, 4),
-          quarter = date
+          cfps = runSum(cfps, 4)
         ),
       silent = TRUE
     )
@@ -105,7 +103,7 @@ data_combined <- foreach(
       arrange(date) %>%
       fill(names(hist), .direction = "down") %>%
       mutate(shares = mc * 10^8 / close) %>%
-      fill(adjust, shares, quarter, .direction = "down") %>%
+      fill(adjust, shares, .direction = "down") %>%
       mutate(
         mc = close * shares,
         equity = bvps * shares,
@@ -113,9 +111,7 @@ data_combined <- foreach(
         across(c(open, high, low, close), ~ .x * adjust),
         volume = volume / adjust
       ) %>%
-      group_by(quarter) %>%
       fill(np, np_deduct, equity, revenue, cf, .direction = "down") %>%
-      ungroup() %>%
       mutate(
         pe = mc / np,
         pe_deduct = mc / np_deduct,

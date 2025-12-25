@@ -18,7 +18,7 @@ val_dir <- paste0(data_dir, "val/")
 log_dir <- "logs/"
 log_path <- paste0(log_dir, format(now(), "%Y%m%d_%H%M%S"), ".log")
 
-end_date <- as_tradeday(now() - hours(16))
+last_td <- eval(last_td_expr)
 
 # SPOT DATA ====================================================================
 
@@ -35,7 +35,7 @@ if (!file.exists(spot_combined_path)) {
 } else {
   spot_combined <- read_csv(spot_combined_path, show_col_types = FALSE)
   last_date <- max(pull(spot_combined, date))
-  if (last_date < end_date) {
+  if (last_date < last_td) {
     spot_combined <- combine_spot()
     write_csv(spot_combined, spot_combined_path)
   }
@@ -70,24 +70,24 @@ out <- foreach(
 
   try_error <- try(
     if (!file.exists(hist_path)) {
-      hist <- get_hist(symbol, NULL, end_date)
+      hist <- get_hist(symbol, NULL, last_td)
       write_csv(hist, hist_path)
       tsprint(str_glue("{symbol}: Created hist file."), log_path)
     } else {
       hist <- read_csv(hist_path, show_col_types = FALSE)
       last_date <- max(pull(hist, date))
       if (
-        last_date >= end_date |
+        last_date >= last_td |
           pull(spot_symbol, delist) |
           pull(spot_symbol, susp)
       ) {
-      } else if (isTRUE(last_date == as_tradeday(end_date - 1))) {
+      } else if (isTRUE(last_date == as_tradeday(last_td - 1))) {
         hist <- bind_rows(hist, select(spot_symbol, names(hist)))
         write_csv(hist, hist_path)
         str_glue("{symbol}: Appended spot to hist.") %>%
           tsprint(log_path)
       } else {
-        hist <- bind_rows(hist, get_hist(symbol, last_date + 1, end_date))
+        hist <- bind_rows(hist, get_hist(symbol, last_date + 1, last_td))
         write_csv(hist, hist_path)
         tsprint(str_glue("{symbol}: Appended new data to hist."), log_path)
       }
@@ -108,7 +108,7 @@ out <- foreach(
       last_date <- max(pull(adjust, date))
       adjust_change_date <- pull(spot_symbol, adjust_change_date)
       if (
-        isTRUE(last_date < adjust_change_date & adjust_change_date <= end_date)
+        isTRUE(last_date < adjust_change_date & adjust_change_date <= last_td)
       ) {
         adjust <- get_adjust(symbol)
         write_csv(adjust, adjust_path)
@@ -131,7 +131,7 @@ out <- foreach(
       last_date <- max(pull(mc, date))
       shares_change_date <- pull(spot_symbol, shares_change_date)
       if (
-        isTRUE(last_date < shares_change_date & shares_change_date <= end_date)
+        isTRUE(last_date < shares_change_date & shares_change_date <= last_td)
       ) {
         mc <- get_mc(symbol)
         write_csv(mc, mc_path)
@@ -154,7 +154,7 @@ out <- foreach(
       last_date <- max(pull(val, val_change_date))
       val_change_date <- pull(spot_symbol, val_change_date)
       if (
-        isTRUE(last_date < val_change_date & val_change_date <= end_date)
+        isTRUE(last_date < val_change_date & val_change_date <= last_td)
       ) {
         val <- get_val(symbol)
         write_csv(val, val_path)

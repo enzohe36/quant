@@ -630,39 +630,3 @@ plot_supersmoother_indicator <- function(data, result, spot) {
 
   return(combined_plot)
 }
-
-# USAGE EXAMPLE ================================================================
-
-# symbol <- "300378"
-# end_date <- today()
-# start_date <- end_date - years(2)
-
-# spot <- read_csv("data/spot.csv")  # Load spot dataframe with symbol and name columns
-# hist <- read_csv(paste0("data/hist/", symbol, ".csv"))
-# adjust <- read_csv(paste0("data/adjust/", symbol, ".csv"))
-# data <- left_join(hist, adjust, by = "date") %>%
-#   arrange(date) %>%
-#   fill(adjust, .direction = "down") %>%
-#   mutate(
-#     symbol = symbol,
-#     across(c(open, high, low, close), ~ .x * adjust),
-#     volume = volume / adjust
-#   ) %>%
-#   filter(date %in% hist$date)
-
-# result <- cbind(
-#   calculate_supersmoother_oscillator(data),
-#   select(calculate_kama(data), -date),
-#   select(calculate_ehlers_loops(data), -date)
-# ) %>%
-#   if_bullish()
-
-# plot <- plot_supersmoother_indicator(
-#   data = filter(data, date >= start_date & date <= end_date),
-#   result = filter(result, date >= start_date & date <= end_date),
-#   spot = spot
-# )
-
-# print(plot)
-
-# ggsave("supersmoother_indicator.png", plot, width = 14, height = 10, dpi = 300)

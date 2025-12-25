@@ -9,7 +9,7 @@ backtest_dir <- "backtest/"
 data_combined_path <- paste0(backtest_dir, "data_combined.rds")
 data_bt_path <- paste0(backtest_dir, "data_bt.rds")
 
-end_date <- as_tradeday(now() - hours(16))
+end_date <- eval(last_td_expr)
 start_date <- end_date %m-% years(5)
 
 zero_threshold <- 0.05
@@ -46,13 +46,12 @@ print(ts2 - ts1)
 
 # Test
 
-symbols <- sample(names(data_bt), 5)
-start_date <- end_date %m-% years(1)
+symbols <- c("301069", "300946", "300455", "300857")
 spot <- read_csv("data/spot_combined.csv", show_col_types = FALSE)
 
 for (symbol in symbols) {
   data <- data_bt[[symbol]] %>%
-    filter(date >= start_date & date <= end_date)
+    filter(date >= end_date %m-% years(1) & date <= end_date)
   plot <- plot_supersmoother_indicator(data, data, spot)
   print(plot)
 }

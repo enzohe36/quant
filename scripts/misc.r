@@ -7,6 +7,9 @@
 resource_dir <- "resources/"
 holidays_path <- paste0(resource_dir, "holidays.txt")
 
+last_td_expr <- expr(as_tradeday(now() - hours(17)))
+curr_td_expr <- expr(as_tradeday(now() - hours(9)))
+
 # MISCELLANEOUS ================================================================
 
 # .combine = "multiout", .multicombine = TRUE, .init = list(list(), list(), ...)

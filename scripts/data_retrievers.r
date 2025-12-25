@@ -8,9 +8,6 @@
 resource_dir <- "resources/"
 indices_path <- paste0(resource_dir, "indices.csv")
 
-default_end_date_expr <- expr(as_tradeday(now() - hours(17)))
-current_tradeday_expr <- expr(as_tradeday(now() - hours(9)))
-
 # HELPER FUNCTIONS =============================================================
 
 aktools <- function(key, ...){
@@ -18,9 +15,11 @@ aktools <- function(key, ...){
     lapply(function(x) if (is.character(x)) enc2utf8(x) else x)
 
   Sys.sleep(1)
-  ts1 <- eval(default_end_date_expr)
-  ts2 <- eval(current_tradeday_expr)
-  if (ts1 != ts2) stop(str_glue("Trade date changed from {ts1} to {ts2}!"))
+  last_td <- eval(last_td_expr)
+  curr_td <- eval(curr_td_expr)
+  # if (last_td != curr_td) {
+  #   stop(str_glue("Tradeday changed from {last_td} to {curr_td}!"))
+  # }
   result <- do.call(
     getForm,
     c(
@@ -51,11 +50,13 @@ loop_function <- function(func_name, ..., fail_max = 3, wait = 60) {
   }
   stop("Maximum retries exceeded.")
 }
-# INDEX DATA ===================================================================
+
+# SPOT DATA ====================================================================
 
 # https://quote.eastmoney.com/center/gridlist.html#index_sz
 get_index_spot <- function(index_type) {
-  ts1 <- eval(default_end_date_expr)
+  curr_td <- eval(curr_td_expr)
+  # symbol name date open high low close volume amount
   aktools(
     key = "stock_zh_index_spot_em",
     symbol = index_type
@@ -63,7 +64,7 @@ get_index_spot <- function(index_type) {
     mutate(
       symbol = `代码`,
       name = `名称`,
-      date = !!ts1,
+      date = !!curr_td,
       open = as.numeric(`今开`),
       high = as.numeric(`最高`),
       low = as.numeric(`最低`),
@@ -90,44 +91,9 @@ combine_indices <- function() {
     arrange(symbol)
 }
 
-# http://quote.eastmoney.com/center/hszs.html
-get_index_hist <- function(symbol, start_date, end_date) {
-  indices <- read_csv(indices_path, show_col_types = FALSE)
-
-  # date open close high low volume amount
-  aktools(
-    key = "stock_zh_index_daily_em",
-    symbol = paste0(filter(indices, symbol == !!symbol)$market, symbol),
-    start_date = format(start_date, "%Y%m%d"),
-    end_date = format(end_date, "%Y%m%d")
-  ) %>%
-    mutate(date = as_date(date)) %>%
-    select(date, open, high, low, close, volume, amount) %>%
-    arrange(date)
-}
-
-# http://www.csindex.com.cn/zh-CN/indices/index-detail/000300
-get_index_comp <- function(symbol) {
-  # 日期 指数代码 指数名称 指数英文名称 成分券代码 成分券名称 成分券英文名称 交易所
-  # 交易所英文名称 权重
-  aktools(
-    key = "index_stock_cons_weight_csindex",
-    symbol = symbol
-  ) %>%
-    mutate(
-      symbol = `成分券代码`,
-      index = !!symbol,
-      index_weight = as.numeric(`权重`)
-    ) %>%
-    select(symbol, index, index_weight) %>%
-    arrange(symbol)
-}
-
-# SPOT DATA ====================================================================
-
 # https://quote.eastmoney.com/center/gridlist.html#hs_a_board
 get_spot <- function() {
-  ts1 <- eval(default_end_date_expr)
+  curr_td <- eval(curr_td_expr)
   # 序号 代码 名称 最新价 涨跌幅 涨跌额 成交量 成交额 振幅 最高 最低 今开 昨收 量比 换手率
   # 市盈率-动态 市净率 总市值 流通市值 涨速 5分钟涨跌 60日涨跌幅 年初至今涨跌幅
   aktools(
@@ -136,7 +102,7 @@ get_spot <- function() {
     mutate(
       symbol = `代码`,
       name = `名称`,
-      date = !!ts1,
+      date = !!curr_td,
       open = as.numeric(`今开`),
       high = as.numeric(`最高`),
       low = as.numeric(`最低`),
@@ -173,16 +139,17 @@ get_delist <- function() {
 
 # https://data.eastmoney.com/tfpxx/
 get_susp <- function() {
-  ts1 <- eval(default_end_date_expr)
+  curr_td <- eval(curr_td_expr)
   # 序号 代码 名称 停牌时间 停牌截止时间 停牌期限 停牌原因 所属市场 预计复牌时间
   aktools(
     key = "stock_tfp_em",
-    date = format(ts1, "%Y%m%d")
+    date = format(curr_td, "%Y%m%d")
   ) %>%
     mutate(
       symbol = `代码`,
       susp = ifelse(
-        `停牌时间` <= !!ts1 & (`停牌截止时间` >= !!ts1 | is.na(`停牌截止时间`)),
+        `停牌时间` <= !!curr_td &
+          (`停牌截止时间` >= !!curr_td | is.na(`停牌截止时间`)),
         TRUE,
         FALSE
       )
@@ -210,12 +177,12 @@ get_adjust_change <- function(date) {
 }
 
 combine_adjust_change <- function() {
-  ts1 <- eval(default_end_date_expr)
+  curr_td <- eval(curr_td_expr)
   list(
-    loop_function("get_adjust_change", ts1),
-    loop_function("get_adjust_change", ts1 %m-% months(3)),
-    loop_function("get_adjust_change", ts1 %m-% months(6)),
-    loop_function("get_adjust_change", ts1 %m-% months(9))
+    loop_function("get_adjust_change", curr_td),
+    loop_function("get_adjust_change", curr_td %m-% months(3)),
+    loop_function("get_adjust_change", curr_td %m-% months(6)),
+    loop_function("get_adjust_change", curr_td %m-% months(9))
   ) %>%
     rbindlist(fill = TRUE) %>%
     summarize(
@@ -262,13 +229,13 @@ get_val_change <- function(date) {
 }
 
 combine_val_change <- function() {
-  ts1 <- eval(default_end_date_expr)
+  curr_td <- eval(curr_td_expr)
   # 序号 股票代码 股票简称 首次预约时间 一次变更日期 二次变更日期 三次变更日期 实际披露时间
   list(
-    loop_function("get_val_change", ts1),
-    loop_function("get_val_change", ts1 %m-% months(3)),
-    loop_function("get_val_change", ts1 %m-% months(6)),
-    loop_function("get_val_change", ts1 %m-% months(9))
+    loop_function("get_val_change", curr_td),
+    loop_function("get_val_change", curr_td %m-% months(3)),
+    loop_function("get_val_change", curr_td %m-% months(6)),
+    loop_function("get_val_change", curr_td %m-% months(9))
   ) %>%
     rbindlist(fill = TRUE) %>%
     summarize(
@@ -302,6 +269,38 @@ combine_spot <- function() {
 }
 
 # HISTORICAL DATA ==============================================================
+
+# http://quote.eastmoney.com/center/hszs.html
+get_index_hist <- function(symbol, start_date, end_date) {
+  indices <- read_csv(indices_path, show_col_types = FALSE)
+  # date open close high low volume amount
+  aktools(
+    key = "stock_zh_index_daily_em",
+    symbol = paste0(filter(indices, symbol == !!symbol)$market, symbol),
+    start_date = format(start_date, "%Y%m%d"),
+    end_date = format(end_date, "%Y%m%d")
+  ) %>%
+    mutate(date = as_date(date)) %>%
+    select(date, open, high, low, close, volume, amount) %>%
+    arrange(date)
+}
+
+# http://www.csindex.com.cn/zh-CN/indices/index-detail/000300
+get_index_comp <- function(symbol) {
+  # 日期 指数代码 指数名称 指数英文名称 成分券代码 成分券名称 成分券英文名称 交易所
+  # 交易所英文名称 权重
+  aktools(
+    key = "index_stock_cons_weight_csindex",
+    symbol = symbol
+  ) %>%
+    mutate(
+      symbol = `成分券代码`,
+      index = !!symbol,
+      index_weight = as.numeric(`权重`)
+    ) %>%
+    select(symbol, index, index_weight) %>%
+    arrange(symbol)
+}
 
 # https://quote.eastmoney.com/concept/sh603777.html?from=classic(示例)
 get_hist <- function(symbol, start_date, end_date) {
@@ -368,6 +367,7 @@ get_mc <- function(symbol) {
 
 # https://emweb.securities.eastmoney.com/pc_hsf10/pages/index.html?type=web&code=SZ301389&color=b#/cwfx
 get_val <- function(symbol) {
+  last_td <- eval(last_td_expr)
   # SECUCODE SECURITY_CODE SECURITY_NAME_ABBR ORG_CODE REPORT_DATE
   # SECURITY_TYPE_CODE EPSJB BPS PER_CAPITAL_RESERVE PER_UNASSIGN_PROFIT
   # PER_NETCASH TOTALOPERATEREVE GROSS_PROFIT PARENTNETPROFIT
@@ -388,7 +388,7 @@ get_val <- function(symbol) {
   ) %>%
     mutate(
       date = as_date(REPORT_DATE),
-      val_change_date = as_tradeday(now() - hours(16)),
+      val_change_date = last_td,
       revenue = as.numeric(TOTALOPERATEREVE),
       np = as.numeric(PARENTNETPROFIT),
       np_deduct = as.numeric(DEDU_PARENT_PROFIT),
