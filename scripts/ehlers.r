@@ -264,6 +264,8 @@ if_bullish <- function(
   min_osc_d1 = -0.01,
   osc_lookback = 40,
   max_osc_diff = 1.9,
+  price_rms_high = 1.5,
+  price_rms_low = -1,
   min_required_length = 0
 ) {
   oscillator <- result$oscillator
@@ -332,6 +334,41 @@ if_bullish <- function(
   warmup_length <- min(min_required_length, length(is_bullish))
   is_bullish[1:warmup_length] <- FALSE
 
+  run_starts <- is_bullish & !lag(is_bullish)
+  run_ends <- !is_bullish & lag(is_bullish)
+  run_id <- cumsum(run_starts)
+  run_id[!is_bullish] <- 0
+
+  for (rid in unique(run_id[run_id > 0])) {
+    run_indices <- which(run_id == rid)
+    if (length(run_indices) == 0) next
+
+    run_start_idx <- run_indices[1]
+    run_end_idx <- run_indices[length(run_indices)]
+    idx <- run_end_idx + 1
+    while (idx <= n && price_rms[idx] > price_rms_low) {
+      is_bullish[idx] <- TRUE
+      idx <- idx + 1
+    }
+  }
+
+  run_starts <- is_bullish & !lag(is_bullish)
+  run_id <- cumsum(run_starts)
+  run_id[!is_bullish] <- 0
+
+  for (rid in unique(run_id[run_id > 0])) {
+    run_indices <- which(run_id == rid)
+    if (length(run_indices) == 0) next
+
+    run_start_idx <- run_indices[1]
+    run_end_idx <- run_indices[length(run_indices)]
+    idx <- run_start_idx
+    while (idx <= run_end_idx && price_rms[idx] < price_rms_high) {
+      is_bullish[idx] <- FALSE
+      idx <- idx + 1
+    }
+  }
+
   result$is_bullish <- is_bullish
 
   return(result)
@@ -367,7 +404,9 @@ generate_features <- function(
   min_signal = 0.35,
   min_osc_d1 = -0.01,
   osc_lookback = 40,
-  max_osc_diff = 1.9
+  max_osc_diff = 1.9,
+  price_rms_high = 1.5,
+  price_rms_low = -1
 ) {
   # Calculate min_required_length
   min_required_length <- max(slow_length, nSlow, lowpass_cutoff) * 2
@@ -424,6 +463,8 @@ generate_features <- function(
         min_osc_d1 = min_osc_d1,
         osc_lookback = osc_lookback,
         max_osc_diff = max_osc_diff,
+        price_rms_high = price_rms_high,
+        price_rms_low = price_rms_low,
         min_required_length = min_required_length
       )
 
@@ -451,7 +492,7 @@ generate_features <- function(
 
 # PLOTTING =====================================================================
 
-plot_supersmoother_indicator <- function(data, result, spot) {
+plot_indicator <- function(data, spot) {
   # Extract symbol and name
   stock_symbol <- unique(data$symbol)
   stock_name <- filter(spot, symbol == stock_symbol)$name
@@ -464,15 +505,15 @@ plot_supersmoother_indicator <- function(data, result, spot) {
     high = data$high,
     low = data$low,
     close = data$close,
-    oscillator = result$oscillator,
-    signal_line = result$signal_line,
-    hue = result$hue,
-    kama = result$kama,
-    upper_bound = result$upper_bound,
-    lower_bound = result$lower_bound,
-    price_rms = result$price_rms,
-    volume_rms = result$volume_rms,
-    is_bullish = result$is_bullish,
+    oscillator = data$oscillator,
+    signal_line = data$signal_line,
+    hue = data$hue,
+    kama = data$kama,
+    upper_bound = data$upper_bound,
+    lower_bound = data$lower_bound,
+    price_rms = data$price_rms,
+    volume_rms = data$volume_rms,
+    is_bullish = data$is_bullish,
     candle_color = ifelse(data$close >= data$open, "red", "green")
   )
 

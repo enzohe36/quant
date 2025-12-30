@@ -5,12 +5,13 @@ source_scripts(
   packages = c("tidyverse")
 )
 
+data_dir <- "data/"
+spot_combined_path <- paste0(data_dir, "spot_combined.csv")
+
 backtest_dir <- "backtest/"
 data_combined_path <- paste0(backtest_dir, "data_combined.rds")
-data_bt_path <- paste0(backtest_dir, "data_bt.rds")
 
-end_date <- eval(last_td_expr)
-start_date <- end_date %m-% years(5)
+end_date <- eval(last_td_expr) %m-% years(2)
 
 zero_threshold <- 0.05
 price_lookback <- 10
@@ -20,15 +21,19 @@ min_signal <- 0.35
 min_osc_d1 <- -0.01
 osc_lookback <- 40
 max_osc_diff <- 1.9
+price_rms_high <- 1.5
+price_rms_low <- -1
+
+symbols <- c("301069", "300946", "300455", "300857", "002384")
 
 # MAIN SCRIPT ==================================================================
 
-data_combined <- if (exists("data_bt")) data_bt else readRDS(data_combined_path)
+spot_combined <- read_csv(spot_combined_path, show_col_types = FALSE)
+data_combined <- readRDS(data_combined_path)
 
-ts1 <- Sys.time()
-data_bt <- generate_features(
+data_combined <- generate_features(
   data_combined = data_combined,
-  start_date = start_date,
+  start_date = end_date %m-% years(5),
   end_date = end_date,
   zero_threshold = zero_threshold,
   price_lookback = price_lookback,
@@ -37,21 +42,14 @@ data_bt <- generate_features(
   min_signal = min_signal,
   min_osc_d1 = min_osc_d1,
   osc_lookback = osc_lookback,
-  max_osc_diff = max_osc_diff
+  max_osc_diff = max_osc_diff,
+  price_rms_high = price_rms_high,
+  price_rms_low = price_rms_low
 )
-ts2 <- Sys.time()
-print(ts2 - ts1)
-
-# saveRDS(data_bt, data_bt_path)
-
-# Test
-
-symbols <- c("301069", "300946", "300455", "300857")
-spot <- read_csv("data/spot_combined.csv", show_col_types = FALSE)
 
 for (symbol in symbols) {
-  data <- data_bt[[symbol]] %>%
+  data <- data_combined[[symbol]] %>%
     filter(date >= end_date %m-% years(1) & date <= end_date)
-  plot <- plot_supersmoother_indicator(data, data, spot)
+  plot <- plot_indicator(data, spot_combined)
   print(plot)
 }
