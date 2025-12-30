@@ -32,7 +32,7 @@ aktools <- function(key, ...){
   return(result)
 }
 
-loop_function <- function(func_name, ..., fail_max = 3, wait = 60) {
+loop_function <- function(func_name, ..., fail_max = 10, wait = 60) {
   fail_count <- 1
   while (fail_count <= fail_max) {
     try_error <- try(
@@ -41,7 +41,9 @@ loop_function <- function(func_name, ..., fail_max = 3, wait = 60) {
     )
     if (inherits(try_error, "try-error")) {
       error_msg <- attr(try_error, "condition")$message
-      tsprint(str_glue("Attempt {fail_count}/{fail_max}: {error_msg}"))
+      tsprint(
+        str_glue("{func_name}() attempt {fail_count}/{fail_max}: {error_msg}")
+      )
       fail_count <- fail_count + 1
       Sys.sleep(wait)
     } else {
@@ -108,9 +110,10 @@ get_spot <- function() {
       low = as.numeric(`最低`),
       close = as.numeric(`最新价`),
       volume = as.numeric(`成交量`),
-      amount = as.numeric(`成交额`)
+      amount = as.numeric(`成交额`),
+      to = as.numeric(`换手率`)
     ) %>%
-    select(symbol, name, date, open, high, low, close, volume, amount) %>%
+    select(symbol, name, date, open, high, low, close, volume, amount, to) %>%
     arrange(symbol)
 }
 
@@ -318,9 +321,10 @@ get_hist <- function(symbol, start_date, end_date) {
       low = as.numeric(`最低`),
       close = as.numeric(`收盘`),
       volume = as.numeric(`成交量`),
-      amount = as.numeric(`成交额`)
+      amount = as.numeric(`成交额`),
+      to = as.numeric(`换手率`)
     ) %>%
-    select(date, open, high, low, close, volume, amount) %>%
+    select(date, open, high, low, close, volume, amount, to) %>%
     arrange(date)
 }
 

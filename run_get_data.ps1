@@ -10,19 +10,22 @@ pip install aktools --upgrade -i https://pypi.org/simple
 pip install akshare --upgrade -i https://pypi.org/simple
 
 Write-Host "Starting aktools server..."
-$aktools_process = Start-Process -FilePath "python" -ArgumentList "-m", "aktools" -PassThru -WindowStyle Normal
+$aktools_process = Start-Process -FilePath "python" -ArgumentList "-m", "aktools" -PassThru
 
 # Wait for server to start
 Start-Sleep -Seconds 20
 
 try {
-    # Set date in yyyymmdd format
-    $date = Get-Date -Format "yyyyMMdd"
+    # Set date in yyyymmdd format (minus 15 hours)
+    $date = (Get-Date).AddHours(-15).ToString("yyyyMMdd")
 
     # Run R script
     Write-Host "`nScript started at: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor Cyan
-    Write-Host "Running get_data.r..."
+    Write-Host "`nRunning get_data.r..."
     Rscript get_data.r
+    if ($LASTEXITCODE -ne 0) {
+        throw "R script failed with exit code $LASTEXITCODE"
+    }
 
     # Compress data folder
     Write-Host "`nCompressing data folder..."
@@ -39,21 +42,11 @@ catch {
     Write-Error "An error occurred: $_"
 }
 finally {
-    # Terminate aktools server and all child processes
-    Write-Host "Terminating aktools server..."
-
-    # Stop the main process and all its children
-    if ($aktools_process -and !$aktools_process.HasExited) {
-        # Kill all child processes first
-        Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq $aktools_process.Id } | ForEach-Object {
-            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-        }
-        # Kill the main process
-        Stop-Process -Id $aktools_process.Id -Force -ErrorAction SilentlyContinue
-    }
+    # Terminate Python processes
+    Write-Host "Terminating Python processes..."
+    Stop-Process -Name "python" -Force
 
     Write-Host "`nScript ended at: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor Cyan
-
     Write-Host "`nPress any key to close this window..."
     $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
 }

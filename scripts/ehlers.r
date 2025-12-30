@@ -254,7 +254,7 @@ calculate_ehlers_loops <- function(
 
 # BULLISH CONDITION TEST =======================================================
 
-if_bullish <- function(
+if_buy <- function(
   result,
   zero_threshold = 0.05,
   price_lookback = 10,
@@ -323,7 +323,7 @@ if_bullish <- function(
   osc_diff <- oscillator - runMin(oscillator, osc_lookback)
   osc_start <- (strong_signal) & (osc_d1 > min_osc_d1)
 
-  is_bullish <- (
+  buy <- (
     (price_start & !volume_end_protected) |
       (osc_start)
   ) & (
@@ -331,13 +331,13 @@ if_bullish <- function(
   )
 
   # Set first min_required_length elements to FALSE
-  warmup_length <- min(min_required_length, length(is_bullish))
-  is_bullish[1:warmup_length] <- FALSE
+  warmup_length <- min(min_required_length, length(buy))
+  buy[1:warmup_length] <- FALSE
 
-  run_starts <- is_bullish & !lag(is_bullish)
-  run_ends <- !is_bullish & lag(is_bullish)
+  run_starts <- buy & !lag(buy)
+  run_ends <- !buy & lag(buy)
   run_id <- cumsum(run_starts)
-  run_id[!is_bullish] <- 0
+  run_id[!buy] <- 0
 
   for (rid in unique(run_id[run_id > 0])) {
     run_indices <- which(run_id == rid)
@@ -347,14 +347,14 @@ if_bullish <- function(
     run_end_idx <- run_indices[length(run_indices)]
     idx <- run_end_idx + 1
     while (idx <= n && price_rms[idx] > price_rms_low) {
-      is_bullish[idx] <- TRUE
+      buy[idx] <- TRUE
       idx <- idx + 1
     }
   }
 
-  run_starts <- is_bullish & !lag(is_bullish)
+  run_starts <- buy & !lag(buy)
   run_id <- cumsum(run_starts)
-  run_id[!is_bullish] <- 0
+  run_id[!buy] <- 0
 
   for (rid in unique(run_id[run_id > 0])) {
     run_indices <- which(run_id == rid)
@@ -364,19 +364,19 @@ if_bullish <- function(
     run_end_idx <- run_indices[length(run_indices)]
     idx <- run_start_idx
     while (idx <= run_end_idx && price_rms[idx] < price_rms_high) {
-      is_bullish[idx] <- FALSE
+      buy[idx] <- FALSE
       idx <- idx + 1
     }
   }
 
-  result$is_bullish <- is_bullish
+  result$buy <- buy
 
   return(result)
 }
 
 # FEATURE GENERATION ===========================================================
 
-generate_features <- function(
+gen_features <- function(
   data_combined,
   start_date,
   end_date,
@@ -396,7 +396,7 @@ generate_features <- function(
   highpass_cutoff = 20,
   lowpass_cutoff = 125,
   alpha = 0.0242,
-  # if_bullish args
+  # if_buy args
   zero_threshold = 0.05,
   price_lookback = 10,
   min_price_diff = 0.5,
@@ -454,7 +454,7 @@ generate_features <- function(
         -date
       )
     ) %>%
-      if_bullish(
+      if_buy(
         zero_threshold = zero_threshold,
         price_lookback = price_lookback,
         min_price_diff = min_price_diff,
@@ -468,16 +468,8 @@ generate_features <- function(
         min_required_length = min_required_length
       )
 
-    # Combine with original data, keeping only is_bullish from result
+    # Combine with original data, keeping only buy from result
     for (col_name in names(result)) data[[col_name]] <- result[[col_name]]
-    data <- select(
-      data,
-      symbol, date, open, high, low, close, volume, mc,
-      oscillator, signal_line, hue,
-      kama, upper_bound, lower_bound,
-      price_rms, volume_rms,
-      is_bullish
-    )
 
     # Return as list element for foreach to combine
     my_list <- list()
@@ -492,10 +484,10 @@ generate_features <- function(
 
 # PLOTTING =====================================================================
 
-plot_indicator <- function(data, spot) {
+plot_indicators <- function(data, spot) {
   # Extract symbol and name
   stock_symbol <- unique(data$symbol)
-  stock_name <- filter(spot, symbol == stock_symbol)$name
+  stock_name <- spot$name
   plot_title <- paste0(stock_symbol, " - ", stock_name)
 
   plot_data <- data.frame(
@@ -513,7 +505,7 @@ plot_indicator <- function(data, spot) {
     lower_bound = data$lower_bound,
     price_rms = data$price_rms,
     volume_rms = data$volume_rms,
-    is_bullish = data$is_bullish,
+    buy = data$buy,
     candle_color = ifelse(data$close >= data$open, "red", "green")
   )
 
@@ -547,11 +539,11 @@ plot_indicator <- function(data, spot) {
     index = plot_data$index,
     ymin = price_ylim[1],
     ymax = price_ylim[2],
-    is_bullish = plot_data$is_bullish
+    buy = plot_data$buy
   )
 
   p1 <- ggplot(plot_data, aes(x = index)) +
-    geom_rect(data = bullish_bg[bullish_bg$is_bullish, ],
+    geom_rect(data = bullish_bg[bullish_bg$buy, ],
               aes(xmin = index - 0.5, xmax = index + 0.5,
                   ymin = ymin, ymax = ymax),
               fill = "red", alpha = 0.15, inherit.aes = FALSE) +
@@ -585,11 +577,11 @@ plot_indicator <- function(data, spot) {
     index = plot_data$index,
     ymin = osc_ylim[1],
     ymax = osc_ylim[2],
-    is_bullish = plot_data$is_bullish
+    buy = plot_data$buy
   )
 
   p2 <- ggplot(plot_data, aes(x = index)) +
-    geom_rect(data = oscillator_bullish_bg[oscillator_bullish_bg$is_bullish, ],
+    geom_rect(data = oscillator_bullish_bg[oscillator_bullish_bg$buy, ],
               aes(xmin = index - 0.5, xmax = index + 0.5,
                   ymin = ymin, ymax = ymax),
               fill = "red", alpha = 0.15, inherit.aes = FALSE) +
@@ -636,11 +628,11 @@ plot_indicator <- function(data, spot) {
     index = plot_data$index,
     ymin = rms_ylim[1],
     ymax = rms_ylim[2],
-    is_bullish = plot_data$is_bullish
+    buy = plot_data$buy
   )
 
   p3 <- ggplot(plot_data, aes(x = index)) +
-    geom_rect(data = rms_bullish_bg[rms_bullish_bg$is_bullish, ],
+    geom_rect(data = rms_bullish_bg[rms_bullish_bg$buy, ],
               aes(xmin = index - 0.5, xmax = index + 0.5,
                   ymin = ymin, ymax = ymax),
               fill = "red", alpha = 0.15, inherit.aes = FALSE) +

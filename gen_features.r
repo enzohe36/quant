@@ -11,7 +11,8 @@ spot_combined_path <- paste0(data_dir, "spot_combined.csv")
 backtest_dir <- "backtest/"
 data_combined_path <- paste0(backtest_dir, "data_combined.rds")
 
-end_date <- eval(last_td_expr) %m-% years(2)
+end_date <- eval(last_td_expr)
+start_date <- end_date %m-% years(1)
 
 zero_threshold <- 0.05
 price_lookback <- 10
@@ -24,16 +25,14 @@ max_osc_diff <- 1.9
 price_rms_high <- 1.5
 price_rms_low <- -1
 
-symbols <- c("301069", "300946", "300455", "300857", "002384")
-
 # MAIN SCRIPT ==================================================================
 
 spot_combined <- read_csv(spot_combined_path, show_col_types = FALSE)
 data_combined <- readRDS(data_combined_path)
 
-data_combined <- generate_features(
+data_combined <- gen_features(
   data_combined = data_combined,
-  start_date = end_date %m-% years(5),
+  start_date = start_date,
   end_date = end_date,
   zero_threshold = zero_threshold,
   price_lookback = price_lookback,
@@ -47,9 +46,27 @@ data_combined <- generate_features(
   price_rms_low = price_rms_low
 )
 
+symbols <- sapply(
+  data_combined,
+  function(df) {
+    if (
+      df %>%
+        filter(date == !!end_date & mc >= 10^10 & pe > 0 & oscillator <= 0) %>%
+        pull(buy) %>%
+        isTRUE()
+    ) {
+      unique(df$symbol)
+    }
+  }
+) %>%
+  unlist() %>%
+  unname()
+
 for (symbol in symbols) {
+  image_path <- paste0(backtest_dir, symbol, ".png")
   data <- data_combined[[symbol]] %>%
-    filter(date >= end_date %m-% years(1) & date <= end_date)
-  plot <- plot_indicator(data, spot_combined)
-  print(plot)
+    filter(date >= start_date & date <= end_date)
+  spot <- filter(spot_combined, symbol == !!symbol)
+  plot <- plot_indicators(data, spot)
+  ggsave(image_path, plot)
 }
