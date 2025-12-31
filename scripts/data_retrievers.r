@@ -5,8 +5,8 @@
 # library(data.table)
 # library(tidyverse)
 
-resource_dir <- "resources/"
-indices_path <- paste0(resource_dir, "indices.csv")
+resources_dir <- "resources/"
+indices_path <- paste0(resources_dir, "indices.csv")
 
 # HELPER FUNCTIONS =============================================================
 

@@ -1,22 +1,20 @@
 # PRESET =======================================================================
 
-source_scripts(
-  scripts = c("misc"),
-  packages = c("foreach", "doFuture", "data.table", "tidyverse")
-)
+library(foreach)
+library(doFuture)
+library(tidyverse)
+
+source("scripts/misc.r")
 
 data_dir <- "data/"
 hist_dir <- paste0(data_dir, "hist/")
 
-resource_dir <- "resources/"
-holidays_path <- paste0(resource_dir, "holidays.txt")
+resources_dir <- "resources/"
+holidays_path <- paste0(resources_dir, "holidays.txt")
 
 # MAIN SCRIPT ==================================================================
 
-plan(multisession, workers = availableCores() - 1)
-
-dir.create(data_dir)
-dir.create(resource_dir)
+dir.create(resources_dir)
 
 new_holidays <- c(
   mdy("January 1, 2025"),
@@ -39,14 +37,17 @@ if (dir.exists(hist_dir)) {
   files <- list.files(hist_dir)
 
   if (length(files) > 0) {
+    plan(multisession, workers = availableCores() - 1)
+
     tradedays <- foreach(
       file = files,
       .combine = "c"
     ) %dofuture% {
-      read_csv(paste0(hist_dir, file), show_col_types = FALSE) %>%
-        pull(date)
+      pull(read_csv(paste0(hist_dir, file), show_col_types = FALSE), date)
     } %>%
       unique()
+
+    plan(sequential)
 
     holidays <- seq(min(tradedays), max(tradedays), by = "1 day") %>%
       .[!wday(., week_start = 1) %in% 6:7] %>%
@@ -57,5 +58,3 @@ if (dir.exists(hist_dir)) {
 holidays <- sort(unique(c(holidays, new_holidays)))
 writeLines(as.character(holidays), holidays_path)
 tsprint(str_glue("Updated holidays from {min(holidays)} to {max(holidays)}."))
-
-plan(sequential)

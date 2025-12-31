@@ -1,11 +1,16 @@
-# conda activate myenv; pip install aktools --upgrade -i https://pypi.org/simple; pip install akshare --upgrade -i https://pypi.org/simple; python -m aktools
+# pip install aktools --upgrade -i https://pypi.org/simple; pip install akshare --upgrade -i https://pypi.org/simple; python -m aktools
 
 # PRESET =======================================================================
 
-source_scripts(
-  scripts = c("misc", "data_retrievers"),
-  packages = c("foreach", "tidyverse")
-)
+library(foreach)
+library(doFuture)
+library(RCurl)
+library(jsonlite)
+library(data.table)
+library(tidyverse)
+
+source("scripts/misc.r")
+source("scripts/data_retrievers.r")
 
 data_dir <- "data/"
 spot_combined_path <- paste0(data_dir, "spot_combined.csv")
@@ -15,8 +20,8 @@ adjust_dir <- paste0(data_dir, "adjust/")
 mc_dir <- paste0(data_dir, "mc/")
 val_dir <- paste0(data_dir, "val/")
 
-log_dir <- "logs/"
-log_path <- paste0(log_dir, format(now(), "%Y%m%d_%H%M%S"), ".log")
+logs_dir <- "logs/"
+log_path <- paste0(logs_dir, format(now(), "%Y%m%d_%H%M%S"), ".log")
 
 last_td <- eval(last_td_expr)
 
@@ -27,7 +32,7 @@ dir.create(hist_dir)
 dir.create(adjust_dir)
 dir.create(mc_dir)
 dir.create(val_dir)
-dir.create(log_dir)
+dir.create(logs_dir)
 
 if (!file.exists(spot_combined_path)) {
   spot_combined <- combine_spot()
@@ -54,10 +59,9 @@ out <- foreach(
   .combine = "c"
 ) %do% {
   vars <- c(
-    "hist", "hist_path", "adjust", "adjust_path", "adjust_change_date",
-    "mc", "mc_path", "shares_change_date",
-    "val", "val_path", "val_change_date", "spot_symbol",
-    "try_error", "last_date"
+    "adjust", "adjust_change_date", "adjust_path", "hist", "hist_path", "mc",
+    "mc_path", "shares_change_date", "spot", "try_error", "val",
+    "val_change_date", "val_path"
   )
   rm(list = vars)
 
@@ -66,7 +70,7 @@ out <- foreach(
   mc_path <- paste0(mc_dir, symbol, ".csv")
   val_path <- paste0(val_dir, symbol, ".csv")
 
-  spot_symbol <- filter(spot_combined, symbol == !!symbol)
+  spot <- filter(spot_combined, symbol == !!symbol)
 
   try_error <- try(
     if (!file.exists(hist_path)) {
@@ -78,11 +82,11 @@ out <- foreach(
       last_date <- max(pull(hist, date))
       if (
         last_date >= last_td |
-          pull(spot_symbol, delist) |
-          pull(spot_symbol, susp)
+          pull(spot, delist) |
+          pull(spot, susp)
       ) {
       } else if (isTRUE(last_date == as_tradeday(last_td - 1))) {
-        hist <- bind_rows(hist, select(spot_symbol, names(hist)))
+        hist <- bind_rows(hist, select(spot, names(hist)))
         write_csv(hist, hist_path)
         str_glue("{symbol}: Appended spot to hist.") %>%
           tsprint(log_path)
@@ -106,7 +110,7 @@ out <- foreach(
     } else {
       adjust <- read_csv(adjust_path, show_col_types = FALSE)
       last_date <- max(pull(adjust, date))
-      adjust_change_date <- pull(spot_symbol, adjust_change_date)
+      adjust_change_date <- pull(spot, adjust_change_date)
       if (
         isTRUE(last_date < adjust_change_date & adjust_change_date <= last_td)
       ) {
@@ -129,7 +133,7 @@ out <- foreach(
     } else {
       mc <- read_csv(mc_path, show_col_types = FALSE)
       last_date <- max(pull(mc, date))
-      shares_change_date <- pull(spot_symbol, shares_change_date)
+      shares_change_date <- pull(spot, shares_change_date)
       if (
         isTRUE(last_date < shares_change_date & shares_change_date <= last_td)
       ) {
@@ -152,7 +156,7 @@ out <- foreach(
     } else {
       val <- read_csv(val_path, show_col_types = FALSE)
       last_date <- max(pull(val, val_change_date))
-      val_change_date <- pull(spot_symbol, val_change_date)
+      val_change_date <- pull(spot, val_change_date)
       if (
         isTRUE(last_date < val_change_date & val_change_date <= last_td)
       ) {

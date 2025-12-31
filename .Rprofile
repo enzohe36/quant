@@ -22,7 +22,7 @@ options(encoding = "UTF-8")
 
 Sys.setenv(TZ = "Asia/Shanghai")
 
-conflictRules("dplyr", exclude = "lag")
+# conflictRules("dplyr", exclude = "lag")
 
 source_scripts <- function(scripts, packages) {
   scripts <- paste0("scripts/", scripts, ".r")

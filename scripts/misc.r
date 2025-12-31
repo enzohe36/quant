@@ -4,8 +4,8 @@
 # library(doFuture)
 # library(tidyverse)
 
-resource_dir <- "resources/"
-holidays_path <- paste0(resource_dir, "holidays.txt")
+resources_dir <- "resources/"
+holidays_path <- paste0(resources_dir, "holidays.txt")
 
 last_td_expr <- expr(as_tradeday(now() - hours(17)))
 curr_td_expr <- expr(as_tradeday(now() - hours(9)))

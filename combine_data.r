@@ -1,9 +1,13 @@
 # PRESET =======================================================================
 
-source_scripts(
-  scripts = c("misc"),
-  packages = c("foreach", "doFuture", "tidyverse")
-)
+library(foreach)
+library(doFuture)
+library(xts)
+library(DSTrading)
+library(patchwork)
+library(tidyverse)
+
+source("scripts/misc.r")
 
 data_dir <- "data/"
 hist_dir <- paste0(data_dir, "hist/")
@@ -11,18 +15,24 @@ adjust_dir <- paste0(data_dir, "adjust/")
 mc_dir <- paste0(data_dir, "mc/")
 val_dir <- paste0(data_dir, "val/")
 
-backtest_dir <- "backtest/"
-data_combined_path <- paste0(backtest_dir, "data_combined.rds")
+data_combined_path <- paste0(data_dir, "data_combined.rds")
 
-log_dir <- "logs/"
-log_path <- paste0(log_dir, format(now(), "%Y%m%d_%H%M%S"), ".log")
+logs_dir <- "logs/"
+log_path <- paste0(logs_dir, format(now(), "%Y%m%d_%H%M%S"), ".log")
+
+# HELPER FUNCTIONS =============================================================
+
+calculate_avg_cost <- function(open, close, to) {
+  n <- length(close)
+  avg_cost <- numeric(n)
+  avg_cost[1] <- (1 - to[1]) * open[1] + to[1] * close[1]
+  for (i in 2:n) avg_cost[i] <- (1 - to[i]) * avg_cost[i - 1] + to[i] * close[i]
+  return(avg_cost)
+}
 
 # MAIN SCRIPT ==================================================================
 
-plan(multisession, workers = availableCores() - 1)
-
-dir.create(backtest_dir)
-dir.create(log_dir)
+dir.create(logs_dir)
 
 quarters <- seq(
   as_date("1990-01-01"),
@@ -35,14 +45,15 @@ quarters <- seq(
 symbols <- list.files(hist_dir) %>%
   str_remove("\\.csv$")
 
+plan(multisession, workers = availableCores() - 1)
+
 data_combined <- foreach(
   symbol = symbols,
   .combine = "c"
 ) %dofuture% {
   vars <- c(
-    "hist_path", "adjust_path", "mc_path", "val_path",
-    "hist", "adjust", "mc", "val",
-    "data", "try_error", "my_list"
+    "adjust", "adjust_path", "data", "hist", "hist_path", "mc", "mc_path",
+    "my_list", "try_error", "val", "val_path"
   )
   rm(list = vars)
 
@@ -102,13 +113,18 @@ data_combined <- foreach(
       full_join(val, by = "date") %>%
       arrange(date) %>%
       fill(names(hist), .direction = "down") %>%
-      mutate(shares = mc * 10^8 / close) %>%
+      mutate(
+        volume = volume * 100,
+        to = to / 100,
+        avg_price = amount / volume,
+        shares = mc * 10^8 / close
+      ) %>%
       fill(adjust, shares, .direction = "down") %>%
       mutate(
         mc = close * shares,
         equity = bvps * shares,
         cf = cfps * shares,
-        across(c(open, high, low, close), ~ .x * adjust),
+        across(c(open, high, low, close, avg_price), ~ .x * adjust),
         volume = volume / adjust
       ) %>%
       fill(np, np_deduct, equity, revenue, cf, .direction = "down") %>%
@@ -122,8 +138,11 @@ data_combined <- foreach(
         npm = np / revenue,
         symbol = !!symbol
       ) %>%
-      select(symbol, names(hist), mc, pe, pe_deduct, pb, ps, pcf, roe, npm) %>%
-      filter(date %in% pull(hist, date)),
+      filter(date %in% pull(hist, date)) %>%
+      mutate(avg_cost = calculate_avg_cost(open, close, to)) %>%
+      select(
+        symbol, names(hist), avg_cost, mc, pe, pe_deduct, pb, ps, pcf, roe, npm
+      ),
     silent = TRUE
   )
   if (inherits(try_error, "try-error")) {
@@ -136,6 +155,6 @@ data_combined <- foreach(
   return(my_list)
 }
 
-saveRDS(data_combined, data_combined_path)
-
 plan(sequential)
+
+saveRDS(data_combined, data_combined_path)
