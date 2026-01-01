@@ -5,6 +5,7 @@ library(doFuture)
 library(xts)
 library(DSTrading)
 library(patchwork)
+library(data.table)
 library(tidyverse)
 
 source("scripts/misc.r")
@@ -20,7 +21,7 @@ logs_dir <- "logs/"
 log_path <- paste0(logs_dir, format(now(), "%Y%m%d_%H%M%S"), ".log")
 
 end_date <- eval(last_td_expr)
-start_date <- end_date %m-% years(1)
+start_date <- end_date %m-% years(20)
 
 zero_threshold <- 0.05
 price_lookback <- 10
@@ -33,7 +34,7 @@ max_osc_diff <- 1.9
 price_rms_high <- 1.5
 price_rms_low <- -1
 
-# MAIN SCRIPT ==================================================================
+# STOCK ANALYSIS ===============================================================
 
 dir.create(backtest_dir)
 dir.create(logs_dir)
@@ -43,7 +44,7 @@ spot_combined <- read_csv(spot_combined_path, show_col_types = FALSE)
 
 plan(multisession, workers = availableCores() - 1)
 
-data_combined <- foreach(
+data_combined_gf <- foreach(
   data = data_combined,
   .combine = "c"
 ) %dofuture% {
@@ -74,7 +75,7 @@ data_combined <- foreach(
 plan(sequential)
 
 symbols <- lapply(
-  data_combined,
+  data_combined_gf,
   function(df) {
     if (
       filter(
@@ -96,10 +97,55 @@ symbols <- lapply(
 
 for (symbol in symbols) {
   image_path <- paste0(backtest_dir, symbol, ".png")
-  data <- data_combined[[symbol]] %>%
+  data <- data_combined_gf[[symbol]] %>%
     filter(date >= start_date & date <= end_date)
-  spot <- filter(spot_combined, symbol == !!symbol)
-  plot <- plot_indicators(data, spot)
-  # print(plot)
+  name <- pull(filter(spot_combined, symbol == !!symbol), name)
+  plot <- plot_indicators(data, plot_title = paste0(symbol, " - ", name))
+  print(plot)
   ggsave(image_path, plot)
 }
+
+# MARKET ANALYSIS ==============================================================
+
+plan(multisession, workers = availableCores() - 1)
+
+data_combined_market <- foreach(
+  data = rbindlist(data_combined_gf) %>% split(.$date),
+  .combine = "c"
+) %dofuture% {
+  data %>%
+    mutate(mc_log = log(mc)) %>%
+    filter(mc_log >= mean(mc_log) - sd(mc_log)) %>%
+    summarize(
+      across(
+        c(close, avg_cost, pe:npm, oscillator:volume_rms),
+        ~ sum(.x * index_weight, na.rm = TRUE) / sum(index_weight, na.rm = TRUE)
+      ),
+      count = n(),
+      .by = date
+    ) %>%
+    list()
+} %>%
+  rbindlist() %>%
+  arrange(date) %>%
+  filter(date >= end_date %m-% years(10) & date <= end_date)
+
+plan(sequential)
+
+image_path <- paste0(backtest_dir, "market.png")
+plot <- ggplot(data_combined_market, aes(x = date)) +
+  geom_line(aes(y = close), color = "black", linewidth = 0.5) +
+  geom_line(aes(y = avg_cost), color = "blue", linewidth = 0.5) +
+  theme_minimal()
+print(plot)
+ggsave(image_path, plot)
+
+plot <- ggplot(data_combined_market, aes(x = date)) +
+  geom_line(aes(y = count), color = "black", linewidth = 0.5) +
+  theme_minimal()
+print(plot)
+
+plot <- ggplot(data_combined_market, aes(x = date)) +
+  geom_line(aes(y = close / avg_cost - 1), color = "black", linewidth = 0.5) +
+  theme_minimal()
+print(plot)

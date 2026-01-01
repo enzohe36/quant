@@ -468,12 +468,9 @@ generate_features <- function(
 
 # PLOTTING =====================================================================
 
-plot_indicators <- function(data, spot) {
-  # Extract symbol and name
-  stock_symbol <- unique(data$symbol)
-  stock_name <- spot$name
-  plot_title <- paste0(stock_symbol, " - ", stock_name)
-
+plot_indicators <- function(
+  data, plot_title = "Indicator Plot", close_only = FALSE
+) {
   plot_data <- tibble(
     index = 1:nrow(data),
     date = data$date,
@@ -541,15 +538,24 @@ plot_indicators <- function(data, spot) {
               fill = "black", alpha = 0.1, inherit.aes = FALSE) +
     geom_ribbon(aes(ymin = lower_bound, ymax = upper_bound),
                 fill = NA, color = "black", linewidth = 0.5) +
-    geom_line(aes(y = avg_cost), color = "blue", linewidth = 0.5) +
-    geom_segment(aes(x = index, y = low, yend = high),
-                 color = plot_data$candle_color, linewidth = 0.3) +
-    geom_segment(aes(x = index - 0.4, xend = index + 0.4, y = open),
-                 color = plot_data$candle_color, linewidth = 0.3) +
-    geom_rect(aes(xmin = index - 0.4, xmax = index + 0.4,
-                  ymin = pmin(open, close), ymax = pmax(open, close),
-                  fill = candle_color),
-              linewidth = 0) +
+    geom_line(aes(y = avg_cost), color = "blue", linewidth = 0.5)
+
+  if (close_only) {
+    p1 <- p1 +
+      geom_line(aes(y = close), color = "darkorange", linewidth = 0.5)
+  } else {
+    p1 <- p1 +
+      geom_segment(aes(x = index, y = low, yend = high),
+                  color = plot_data$candle_color, linewidth = 0.3) +
+      geom_segment(aes(x = index - 0.4, xend = index + 0.4, y = open),
+                  color = plot_data$candle_color, linewidth = 0.3) +
+      geom_rect(aes(xmin = index - 0.4, xmax = index + 0.4,
+                    ymin = pmin(open, close), ymax = pmax(open, close),
+                    fill = candle_color),
+                linewidth = 0)
+  }
+
+  p1 <- p1 +
     scale_fill_identity() +
     scale_x_continuous(breaks = date_breaks, labels = date_labels) +
     scale_y_continuous(limits = price_ylim, expand = c(0, 0)) +
@@ -584,14 +590,14 @@ plot_indicators <- function(data, spot) {
                color = "gray50", linewidth = 0.5) +
     # Actual oscillator line with dynamic colors (no legend)
     geom_line(aes(y = oscillator, color = oscillator_color, group = 1),
-              linewidth = 1) +
+              linewidth = 0.5) +
     scale_color_identity() +
     # Invisible dummy line for oscillator legend
     geom_line(aes(y = oscillator, linetype = "Oscillator"),
-              color = "darkorange", linewidth = 1, alpha = 0) +
+              color = "darkorange", linewidth = 0.5, alpha = 0) +
     # Signal line
     geom_line(aes(y = signal_line, linetype = "Signal Line"),
-              color = "black", linewidth = 1) +
+              color = "black", linewidth = 0.5) +
     scale_linetype_manual(
       name = "",
       values = c("Oscillator" = "solid", "Signal Line" = "solid"),
@@ -599,7 +605,7 @@ plot_indicators <- function(data, spot) {
         override.aes = list(
           color = c("darkorange", "black"),
           alpha = c(1, 1),
-          linewidth = c(1, 1)
+          linewidth = 0.5
         )
       )
     ) +
@@ -633,8 +639,8 @@ plot_indicators <- function(data, spot) {
               fill = "black", alpha = 0.1, inherit.aes = FALSE) +
     geom_hline(yintercept = 0, linetype = "dashed",
                color = "gray50", linewidth = 0.5) +
-    geom_line(aes(y = price_rms, color = "Price RMS"), linewidth = 1) +
-    geom_line(aes(y = volume_rms, color = "Volume RMS"), linewidth = 1) +
+    geom_line(aes(y = price_rms, color = "Price RMS"), linewidth = 0.5) +
+    geom_line(aes(y = volume_rms, color = "Volume RMS"), linewidth = 0.5) +
     scale_color_manual(
       name = "",
       values = c("Price RMS" = "lightblue", "Volume RMS" = "navyblue")
