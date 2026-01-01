@@ -2,9 +2,7 @@
 
 library(foreach)
 library(doFuture)
-library(xts)
-library(DSTrading)
-library(patchwork)
+library(data.table)
 library(tidyverse)
 
 source("scripts/misc.r")
@@ -17,8 +15,14 @@ val_dir <- paste0(data_dir, "val/")
 
 data_combined_path <- paste0(data_dir, "data_combined.rds")
 
+resources_dir <- "resources/"
+index_comp_path <- paste0(resources_dir, "index_comp.csv")
+
 logs_dir <- "logs/"
 log_path <- paste0(logs_dir, format(now(), "%Y%m%d_%H%M%S"), ".log")
+
+last_td <- eval(last_td_expr)
+index_change_date <- as_date("2025-12-15")
 
 # HELPER FUNCTIONS =============================================================
 
@@ -30,20 +34,15 @@ calculate_avg_cost <- function(open, close, to) {
   return(avg_cost)
 }
 
-# MAIN SCRIPT ==================================================================
+# INITIAL PROCESSING ===========================================================
 
 dir.create(logs_dir)
 
-quarters <- seq(
-  as_date("1990-01-01"),
-  eval(last_td_expr) %m-% months(3),
-  by = "1 day"
-) %>%
+quarters <- seq(as_date("1990-01-01"), last_td %m-% months(3), "1 day") %>%
   quarter("date_last") %>%
   unique()
 
-symbols <- list.files(hist_dir) %>%
-  str_remove("\\.csv$")
+symbols <- str_remove(list.files(hist_dir), "\\.csv$")
 
 plan(multisession, workers = availableCores() - 1)
 
@@ -153,6 +152,92 @@ data_combined <- foreach(
   my_list <- list()
   my_list[[symbol]] <- data
   return(my_list)
+}
+
+plan(sequential)
+
+tsprint(str_glue("Combined {length(data_combined)} stocks."))
+
+# INDEX WEIGHT =================================================================
+
+index_comp <- read_csv(index_comp_path, show_col_types = FALSE)
+
+plan(multisession, workers = availableCores() - 1)
+
+spot_icd <- foreach(
+  data = data_combined,
+  .combine = "c"
+) %dofuture% {
+  list(filter(data, date == index_change_date))
+} %>%
+  rbindlist() %>%
+  full_join(index_comp, by = "symbol") %>%
+  mutate(
+    mc_log = log(mc),
+    index_weight = index_weight / 100,
+    index_weight_log = log(index_weight)
+  ) %>%
+  arrange(mc_log) %>%
+  mutate(id = row_number())
+
+plan(sequential)
+
+spot_icd_index <- filter(spot_icd, symbol %in% index_comp$symbol)
+fit <- lm(index_weight_log ~ mc_log, data = spot_icd_index)
+print(summary(fit))
+mc_min <- min(spot_icd_index$mc, na.rm = TRUE)
+mc_max <- max(spot_icd_index$mc, na.rm = TRUE)
+sd_reject <- (1 / sd(spot_icd_index$mc_log, na.rm = TRUE)) * (
+  min(spot_icd_index$mc_log, na.rm = TRUE) -
+    mean(spot_icd_index$mc_log, na.rm = TRUE)
+)
+tsprint(
+  str_glue(
+    "mc_min = {mc_min / 10^8}e+8, mc_max = {mc_max / 10^8}e+8, ",
+    "sd_reject = {sd_reject}"
+  )
+)
+
+plot(
+  spot_icd$id,
+  spot_icd$mc_log,
+  pch = 16, cex = 0.5
+)
+points(
+  spot_icd_index$id,
+  spot_icd_index$mc_log,
+  pch = 16, cex = 0.5, col = "red"
+)
+
+plot(
+  spot_icd$mc_log,
+  spot_icd$index_weight_log,
+  pch = 16, cex = 0.5
+)
+points(
+  spot_icd_index$mc_log,
+  coef(fit)["mc_log"] * spot_icd_index$mc_log + coef(fit)[1],
+  pch = 16, cex = 0.5, col = "red"
+)
+
+plot(
+  spot_icd$mc,
+  spot_icd$index_weight,
+  pch = 16, cex = 0.5
+)
+points(
+  spot_icd_index$mc,
+  exp(coef(fit)[2] * log(spot_icd_index$mc) + coef(fit)[1]),
+  pch = 16, cex = 0.5, col = "red"
+)
+
+plan(multisession, workers = availableCores() - 1)
+
+data_combined <- foreach(
+  data = data_combined,
+  .combine = "c"
+) %dofuture% {
+  list(mutate(data, index_weight = exp(coef(fit)[2] * log(mc) + coef(fit)[1])))
 }
 
 plan(sequential)

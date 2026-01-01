@@ -88,8 +88,26 @@ combine_indices <- function() {
       mutate(market = "csi")
   ) %>%
     rbindlist(fill = TRUE) %>%
-    select(symbol, name, market, date) %>%
-    distinct(symbol, .keep_all = TRUE) %>%
+    select(date, symbol, name, market) %>%
+    arrange(symbol)
+}
+
+# http://www.csindex.com.cn/zh-CN/indices/index-detail/000300
+get_index_comp <- function(symbol) {
+  curr_td <- eval(curr_td_expr)
+  # 日期 指数代码 指数名称 指数英文名称 成分券代码 成分券名称 成分券英文名称 交易所
+  # 交易所英文名称 权重
+  aktools(
+    key = "index_stock_cons_weight_csindex",
+    symbol = symbol
+  ) %>%
+    mutate(
+      symbol = `成分券代码`,
+      date = !!curr_td,
+      index = !!symbol,
+      index_weight = as.numeric(`权重`)
+    ) %>%
+    select(date, symbol, index, index_weight) %>%
     arrange(symbol)
 }
 
@@ -283,26 +301,12 @@ get_index_hist <- function(symbol, start_date, end_date) {
     start_date = format(start_date, "%Y%m%d"),
     end_date = format(end_date, "%Y%m%d")
   ) %>%
-    mutate(date = as_date(date)) %>%
+    mutate(
+      date = as_date(date),
+      across(c(open, high, low, close, volume, amount), as.numeric)
+    ) %>%
     select(date, open, high, low, close, volume, amount) %>%
     arrange(date)
-}
-
-# http://www.csindex.com.cn/zh-CN/indices/index-detail/000300
-get_index_comp <- function(symbol) {
-  # 日期 指数代码 指数名称 指数英文名称 成分券代码 成分券名称 成分券英文名称 交易所
-  # 交易所英文名称 权重
-  aktools(
-    key = "index_stock_cons_weight_csindex",
-    symbol = symbol
-  ) %>%
-    mutate(
-      symbol = `成分券代码`,
-      index = !!symbol,
-      index_weight = as.numeric(`权重`)
-    ) %>%
-    select(symbol, index, index_weight) %>%
-    arrange(symbol)
 }
 
 # https://quote.eastmoney.com/concept/sh603777.html?from=classic(示例)
