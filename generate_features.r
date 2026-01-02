@@ -74,26 +74,28 @@ data_combined_gf <- foreach(
 
 plan(sequential)
 
-symbols <- lapply(
-  data_combined_gf,
-  function(df) {
-    if (
-      filter(
-        df,
-        date == !!end_date &
-          mc >= 10^10 &
-          pe > 0 &
-          runMax(price_rms, 20) >= 2
-      ) %>%
-        pull(buy) %>%
-        isTRUE()
-    ) {
-      unique(df$symbol)
-    }
-  }
-) %>%
-  unlist() %>%
-  unname()
+# symbols <- lapply(
+#   data_combined_gf,
+#   function(df) {
+#     if (
+#       filter(
+#         df,
+#         date == !!end_date &
+#           mc >= 10^10 &
+#           pe > 0 &
+#           runMax(price_rms, 20) >= 2
+#       ) %>%
+#         pull(buy) %>%
+#         isTRUE()
+#     ) {
+#       unique(df$symbol)
+#     }
+#   }
+# ) %>%
+#   unlist() %>%
+#   unname()
+
+symbols <- "300720"
 
 for (symbol in symbols) {
   image_path <- paste0(backtest_dir, symbol, ".png")
@@ -132,20 +134,21 @@ data_combined_market <- foreach(
 
 plan(sequential)
 
-image_path <- paste0(backtest_dir, "market.png")
 plot <- ggplot(data_combined_market, aes(x = date)) +
   geom_line(aes(y = close), color = "black", linewidth = 0.5) +
   geom_line(aes(y = avg_cost), color = "blue", linewidth = 0.5) +
   theme_minimal()
 print(plot)
-ggsave(image_path, plot)
+ggsave(paste0(backtest_dir, "market_indicators.png"), plot)
 
 plot <- ggplot(data_combined_market, aes(x = date)) +
   geom_line(aes(y = count), color = "black", linewidth = 0.5) +
   theme_minimal()
 print(plot)
+ggsave(paste0(backtest_dir, "market_stock_count.png"), plot)
 
 plot <- ggplot(data_combined_market, aes(x = date)) +
   geom_line(aes(y = close / avg_cost - 1), color = "black", linewidth = 0.5) +
   theme_minimal()
 print(plot)
+ggsave(paste0(backtest_dir, "market_cost_dev.png"), plot)

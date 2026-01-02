@@ -78,6 +78,19 @@ get_index_spot <- function(index_type) {
     arrange(symbol)
 }
 
+get_indices <- function() {
+  curr_td <- eval(curr_td_expr)
+  # index_code display_name publish_date
+  aktools("index_stock_info") %>%
+    mutate(
+      date = !!curr_td,
+      symbol = `index_code`,
+      name = `display_name`
+    ) %>%
+    select(date, symbol, name) %>%
+    arrange(symbol)
+}
+
 combine_indices <- function() {
   list(
     loop_function("get_index_spot", "上证系列指数") %>%
@@ -88,7 +101,8 @@ combine_indices <- function() {
       mutate(market = "csi")
   ) %>%
     rbindlist(fill = TRUE) %>%
-    select(date, symbol, name, market) %>%
+    select(symbol, market) %>%
+    right_join(loop_function("get_indices"), by = "symbol") %>%
     arrange(symbol)
 }
 
@@ -199,11 +213,12 @@ get_adjust_change <- function(date) {
 
 combine_adjust_change <- function() {
   curr_td <- eval(curr_td_expr)
+  m_delay <- ifelse(month(curr_td) == 1, 1, 0)
   list(
-    loop_function("get_adjust_change", curr_td),
-    loop_function("get_adjust_change", curr_td %m-% months(3)),
-    loop_function("get_adjust_change", curr_td %m-% months(6)),
-    loop_function("get_adjust_change", curr_td %m-% months(9))
+    loop_function("get_adjust_change", curr_td %m-% months(m_delay)),
+    loop_function("get_adjust_change", curr_td %m-% months(3 + m_delay)),
+    loop_function("get_adjust_change", curr_td %m-% months(6 + m_delay)),
+    loop_function("get_adjust_change", curr_td %m-% months(9 + m_delay))
   ) %>%
     rbindlist(fill = TRUE) %>%
     summarize(
@@ -251,7 +266,6 @@ get_val_change <- function(date) {
 
 combine_val_change <- function() {
   curr_td <- eval(curr_td_expr)
-  # 序号 股票代码 股票简称 首次预约时间 一次变更日期 二次变更日期 三次变更日期 实际披露时间
   list(
     loop_function("get_val_change", curr_td),
     loop_function("get_val_change", curr_td %m-% months(3)),
@@ -270,19 +284,12 @@ combine_val_change <- function() {
 }
 
 combine_spot <- function() {
-  spot <- loop_function("get_spot")
-  delist <- loop_function("get_delist")
-  susp <- loop_function("get_susp")
-  adjust_change <- combine_adjust_change()
-  shares_change <- loop_function("get_shares_change")
-  val_change <- combine_val_change()
-
-  spot %>%
-    left_join(delist, by = "symbol") %>%
-    left_join(susp, by = "symbol") %>%
-    left_join(adjust_change, by = "symbol") %>%
-    left_join(shares_change, by = "symbol") %>%
-    left_join(val_change, by = "symbol") %>%
+  loop_function("get_spot") %>%
+    left_join(loop_function("get_delist"), by = "symbol") %>%
+    left_join(loop_function("get_susp"), by = "symbol") %>%
+    left_join(combine_adjust_change(), by = "symbol") %>%
+    left_join(loop_function("get_shares_change"), by = "symbol") %>%
+    left_join(combine_val_change(), by = "symbol") %>%
     mutate(
       delist = replace_na(delist, FALSE),
       susp = replace_na(susp, FALSE)
@@ -396,7 +403,7 @@ get_val <- function(symbol) {
   ) %>%
     mutate(
       date = as_date(REPORT_DATE),
-      val_change_date = last_td,
+      val_change_date = !!last_td,
       revenue = as.numeric(TOTALOPERATEREVE),
       np = as.numeric(PARENTNETPROFIT),
       np_deduct = as.numeric(DEDU_PARENT_PROFIT),

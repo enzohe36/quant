@@ -21,28 +21,3 @@ options(repos = c(CRAN = "https://cloud.r-project.org"))
 options(encoding = "UTF-8")
 
 Sys.setenv(TZ = "Asia/Shanghai")
-
-# conflictRules("dplyr", exclude = "lag")
-
-source_scripts <- function(scripts, packages) {
-  scripts <- paste0("scripts/", scripts, ".r")
-  packages <- scripts |>
-    sapply(
-      function(script) {
-        lines <- readLines(script, encoding = "UTF-8")
-        gsub(
-          "^.*library\\(([^)]+)\\)$",
-          "\\1",
-          lines[grepl("^.*library\\(([^)]+)\\)$", lines)]
-        )
-      }
-    ) |>
-    unlist() |>
-    c(packages) |>
-    unique()
-  if ("tidyverse" %in% packages) {
-    packages <- c(packages[packages != "tidyverse"], "tidyverse")
-  }
-  out <- sapply(packages, library, character.only = TRUE)
-  out <- sapply(scripts, source)
-}
