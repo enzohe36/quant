@@ -55,55 +55,19 @@ loop_function <- function(func_name, ..., fail_max = 10, wait = 60) {
 
 # SPOT DATA ====================================================================
 
-# https://quote.eastmoney.com/center/gridlist.html#index_sz
-get_index_spot <- function(index_type) {
-  curr_td <- eval(curr_td_expr)
-  # symbol name date open high low close volume amount
-  aktools(
-    key = "stock_zh_index_spot_em",
-    symbol = index_type
-  ) %>%
-    mutate(
-      symbol = `代码`,
-      name = `名称`,
-      date = !!curr_td,
-      open = as.numeric(`今开`),
-      high = as.numeric(`最高`),
-      low = as.numeric(`最低`),
-      close = as.numeric(`最新价`),
-      volume = as.numeric(`成交量`),
-      amount = as.numeric(`成交额`)
-    ) %>%
-    select(symbol, name, date, open, high, low, close, volume, amount) %>%
-    arrange(symbol)
-}
-
 get_indices <- function() {
   curr_td <- eval(curr_td_expr)
-  # index_code display_name publish_date
-  aktools("index_stock_info") %>%
+  # 指数代码 指数简称 指数全称 基日 基点 指数系列 样本数量 最新收盘 近一个月收益率 资产类别
+  # 指数热点 指数币种 合作指数 跟踪产品 指数合规 指数类别 发布时间
+  aktools("index_csindex_all") %>%
     mutate(
       date = !!curr_td,
-      symbol = `index_code`,
-      name = `display_name`
+      index = `指数代码`,
+      index_type = replace(`指数类别`, `指数类别` == "-", NA),
+      index_name = `指数简称`
     ) %>%
-    select(date, symbol, name) %>%
-    arrange(symbol)
-}
-
-combine_indices <- function() {
-  list(
-    loop_function("get_index_spot", "上证系列指数") %>%
-      mutate(market = "sh"),
-    loop_function("get_index_spot", "深证系列指数") %>%
-      mutate(market = "sz"),
-    loop_function("get_index_spot", "中证系列指数") %>%
-      mutate(market = "csi")
-  ) %>%
-    rbindlist(fill = TRUE) %>%
-    select(symbol, market) %>%
-    right_join(loop_function("get_indices"), by = "symbol") %>%
-    arrange(symbol)
+    select(date, index, index_type, index_name) %>%
+    arrange(index_type, index)
 }
 
 # http://www.csindex.com.cn/zh-CN/indices/index-detail/000300
@@ -116,13 +80,14 @@ get_index_comp <- function(symbol) {
     symbol = symbol
   ) %>%
     mutate(
-      symbol = `成分券代码`,
       date = !!curr_td,
       index = !!symbol,
-      index_weight = as.numeric(`权重`)
+      symbol = `成分券代码`,
+      name = `成分券名称`,
+      weight = as.numeric(`权重`)
     ) %>%
-    select(date, symbol, index, index_weight) %>%
-    arrange(symbol)
+    select(date, index, symbol, name, weight) %>%
+    arrange(desc(weight), symbol)
 }
 
 # https://quote.eastmoney.com/center/gridlist.html#hs_a_board
@@ -213,7 +178,7 @@ get_adjust_change <- function(date) {
 
 combine_adjust_change <- function() {
   curr_td <- eval(curr_td_expr)
-  m_delay <- ifelse(month(curr_td) == 1, 1, 0)
+  m_delay <- ifelse(month(curr_td) == 1, 3, 0)
   list(
     loop_function("get_adjust_change", curr_td %m-% months(m_delay)),
     loop_function("get_adjust_change", curr_td %m-% months(3 + m_delay)),

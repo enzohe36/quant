@@ -3,9 +3,11 @@
 library(foreach)
 library(doFuture)
 library(data.table)
+library(sn)
 library(tidyverse)
 
 source("scripts/misc.r")
+source("scripts/features.r")
 
 data_dir <- "data/"
 hist_dir <- paste0(data_dir, "hist/")
@@ -15,26 +17,12 @@ val_dir <- paste0(data_dir, "val/")
 
 data_combined_path <- paste0(data_dir, "data_combined.rds")
 
-resources_dir <- "resources/"
-index_comp_path <- paste0(resources_dir, "index_comp.csv")
-
 logs_dir <- "logs/"
 log_path <- paste0(logs_dir, format(now(), "%Y%m%d_%H%M%S"), ".log")
 
 last_td <- eval(last_td_expr)
-index_change_date <- as_date("2025-12-15")
 
-# HELPER FUNCTIONS =============================================================
-
-calculate_avg_cost <- function(open, close, to) {
-  n <- length(close)
-  avg_cost <- numeric(n)
-  avg_cost[1] <- (1 - to[1]) * open[1] + to[1] * close[1]
-  for (i in 2:n) avg_cost[i] <- (1 - to[i]) * avg_cost[i - 1] + to[i] * close[i]
-  return(avg_cost)
-}
-
-# INITIAL PROCESSING ===========================================================
+# MAIN SCRIPT ==================================================================
 
 dir.create(logs_dir)
 
@@ -93,10 +81,10 @@ data_combined <- foreach(
         full_join(tibble(date = !!quarters), by = "date") %>%
         arrange(date) %>%
         mutate(
-          revenue = runSum(revenue, 4),
-          np = runSum(np, 4),
-          np_deduct = runSum(np_deduct, 4),
-          cfps = runSum(cfps, 4)
+          revenue = run_sum(revenue, 4),
+          np = run_sum(np, 4),
+          np_deduct = run_sum(np_deduct, 4),
+          cfps = run_sum(cfps, 4)
         ),
       silent = TRUE
     )
@@ -113,6 +101,7 @@ data_combined <- foreach(
       arrange(date) %>%
       fill(names(hist), .direction = "down") %>%
       mutate(
+        symbol = !!symbol,
         volume = volume * 100,
         to = to / 100,
         avg_price = amount / volume,
@@ -134,14 +123,11 @@ data_combined <- foreach(
         ps = mc / revenue,
         pcf = mc / cf,
         roe = np / equity,
-        npm = np / revenue,
-        symbol = !!symbol
+        npm = np / revenue
       ) %>%
       filter(date %in% pull(hist, date)) %>%
-      mutate(avg_cost = calculate_avg_cost(open, close, to)) %>%
-      select(
-        symbol, names(hist), avg_cost, mc, pe, pe_deduct, pb, ps, pcf, roe, npm
-      ),
+      mutate(avg_cost = calculate_avg_cost(avg_price, to)) %>%
+      select(symbol, names(hist), avg_cost, mc, pe:npm),
     silent = TRUE
   )
   if (inherits(try_error, "try-error")) {
@@ -156,90 +142,5 @@ data_combined <- foreach(
 
 plan(sequential)
 
-tsprint(str_glue("Combined {length(data_combined)} stocks."))
-
-# INDEX WEIGHT =================================================================
-
-index_comp <- read_csv(index_comp_path, show_col_types = FALSE)
-
-plan(multisession, workers = availableCores() - 1)
-
-spot_icd <- foreach(
-  data = data_combined,
-  .combine = "c"
-) %dofuture% {
-  list(filter(data, date == index_change_date))
-} %>%
-  rbindlist() %>%
-  full_join(index_comp, by = "symbol") %>%
-  mutate(
-    mc_log = log(mc),
-    index_weight = index_weight / 100,
-    index_weight_log = log(index_weight)
-  ) %>%
-  arrange(mc_log) %>%
-  mutate(id = row_number())
-
-plan(sequential)
-
-spot_icd_index <- filter(spot_icd, symbol %in% index_comp$symbol)
-fit <- lm(index_weight_log ~ mc_log, data = spot_icd_index)
-print(summary(fit))
-mc_min <- min(spot_icd_index$mc, na.rm = TRUE)
-mc_max <- max(spot_icd_index$mc, na.rm = TRUE)
-sd_reject <- (1 / sd(spot_icd_index$mc_log, na.rm = TRUE)) * (
-  min(spot_icd_index$mc_log, na.rm = TRUE) -
-    mean(spot_icd_index$mc_log, na.rm = TRUE)
-)
-tsprint(
-  str_glue(
-    "mc_min = {mc_min / 10^8}e+8, mc_max = {mc_max / 10^8}e+8, ",
-    "sd_reject = {sd_reject}"
-  )
-)
-
-plot(
-  spot_icd$id,
-  spot_icd$mc_log,
-  pch = 16, cex = 0.5
-)
-points(
-  spot_icd_index$id,
-  spot_icd_index$mc_log,
-  pch = 16, cex = 0.5, col = "red"
-)
-
-plot(
-  spot_icd$mc_log,
-  spot_icd$index_weight_log,
-  pch = 16, cex = 0.5
-)
-points(
-  spot_icd_index$mc_log,
-  coef(fit)["mc_log"] * spot_icd_index$mc_log + coef(fit)[1],
-  pch = 16, cex = 0.5, col = "red"
-)
-
-plot(
-  spot_icd$mc,
-  spot_icd$index_weight,
-  pch = 16, cex = 0.5
-)
-points(
-  spot_icd_index$mc,
-  exp(coef(fit)[2] * log(spot_icd_index$mc) + coef(fit)[1]),
-  pch = 16, cex = 0.5, col = "red"
-)
-
-plan(multisession, workers = availableCores() - 1)
-
-data_combined <- foreach(
-  data = data_combined,
-  .combine = "c"
-) %dofuture% {
-  list(mutate(data, index_weight = exp(coef(fit)[2] * log(mc) + coef(fit)[1])))
-}
-
-plan(sequential)
-
 saveRDS(data_combined, data_combined_path)
+tsprint(str_glue("Combined {length(data_combined)} stocks."))

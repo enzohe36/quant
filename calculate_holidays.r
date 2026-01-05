@@ -17,17 +17,13 @@ holidays_path <- paste0(resources_dir, "holidays.txt")
 dir.create(resources_dir)
 
 new_holidays <- c(
-  mdy("January 1, 2025"),
-  seq(mdy("January 28, 2025"), mdy("February 4, 2025"), by = "1 day"),
-  mdy("January 26, 2025"),
-  mdy("February 8, 2025"),
-  seq(mdy("April 4, 2025"), mdy("April 6, 2025"), by = "1 day"),
-  seq(mdy("May 1, 2025"), mdy("May 5, 2025"), by = "1 day"),
-  mdy("April 27, 2025"),
-  seq(mdy("May 31, 2025"), mdy("June 2, 2025"), by = "1 day"),
-  seq(mdy("October 1, 2025"), mdy("October 8, 2025"), by = "1 day"),
-  mdy("September 28, 2025"),
-  mdy("October 11, 2025")
+  seq(mdy("January 1, 2026"), mdy("January 3, 2026"), "1 day"),
+  seq(mdy("February 15, 2026"), mdy("February 23, 2026"), "1 day"),
+  seq(mdy("April 4, 2026"), mdy("April 6, 2026"), "1 day"),
+  seq(mdy("May 1, 2026"), mdy("May 5, 2026"), "1 day"),
+  seq(mdy("June 19, 2026"), mdy("June 21, 2026"), "1 day"),
+  seq(mdy("September 25, 2026"), mdy("September 27, 2026"), "1 day"),
+  seq(mdy("October 1, 2026"), mdy("October 7, 2026"), "1 day")
 ) %>%
   .[!wday(., week_start = 1) %in% 6:7]
 

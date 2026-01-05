@@ -32,8 +32,7 @@ tsprint <- function(v, ...) {
   }
 }
 
-# Redefines TTR::runSum
-runSum <- function(x, n) {
+run_sum <- function(x, n) {
   sapply(seq_along(x), function(i) {
     if (i < n) {
       return(NA_real_)   # not enough values before current
@@ -42,6 +41,8 @@ runSum <- function(x, n) {
     return(sum(window))
   })
 }
+
+run_mean <- function(x, n) run_sum(x, n) / n
 
 replace_missing <- function(x, replacement) {
   x[is.infinite(x) | is.na(x)] <- replacement

@@ -9,6 +9,7 @@ library(data.table)
 library(tidyverse)
 
 source("scripts/misc.r")
+source("scripts/features.r")
 source("scripts/ehlers.r")
 
 data_dir <- "data/"
@@ -95,12 +96,16 @@ plan(sequential)
 #   unlist() %>%
 #   unname()
 
+# symbols <- c(
+#   "300720", "001301", "688766", "688656", "688122", "301018", "300450", "600703", "301069", "300946", "600562", "300455", "300857", "688099", "603893", "300885", "688608", "301291", "688027", "300757", "301308", "002384", "600114", "688120", "688709", "300827", "688472", "688249", "300660", "688012", "002850", "002518", "601231", "688525", "300408", "002558", "688256", "688002", "300655", "688210", "688670", "688559", "688170", "688234", "300316", "301488", "300019", "688160", "300652", "300037", "002008", "300378", "301207", "600711", "600863", "300516", "688200", "301606", "688196", "603530", "688128", "605008", "688172", "600483", "601869", "688409", "688599", "300446", "301010", "301117", "688333", "688256", "688041", "688709", "603893", "688018", "688099", "688608", "688591", "301308", "603019", "300857", "688072", "688012", "002371", "688234", "300316", "300475", "600703", "600330", "300655", "603650", "300398", "002384", "300308", "300502", "000988", "002281", "300620", "688027", "300450", "688499", "688155", "688411", "300274", "300827", "605117", "688472", "688676", "300037", "002407", "301358", "300073", "300080", "002050", "601689", "300660", "603009", "300100", "300580", "300652", "002896", "002472", "603728", "688160", "002008", "300946", "002850", "300953", "603662", "688322", "688400", "301076", "688716", "600114", "688210", "300885", "600392", "600111", "000831", "300748", "600366", "000970", "300127", "600206", "300618", "603799", "000603", "000737", "300199", "688117", "688235", "688131", "688617", "688236", "301091", "688629", "688002", "300768", "688631", "301236", "300339", "300378"
+# )
+
 symbols <- "300720"
 
 for (symbol in symbols) {
   image_path <- paste0(backtest_dir, symbol, ".png")
   data <- data_combined_gf[[symbol]] %>%
-    filter(date >= start_date & date <= end_date)
+    filter(date >= end_date %m-% years(1) & date <= end_date)
   name <- pull(filter(spot_combined, symbol == !!symbol), name)
   plot <- plot_indicators(data, plot_title = paste0(symbol, " - ", name))
   print(plot)
@@ -111,44 +116,56 @@ for (symbol in symbols) {
 
 plan(multisession, workers = availableCores() - 1)
 
-data_combined_market <- foreach(
+data_market <- foreach(
   data = rbindlist(data_combined_gf) %>% split(.$date),
   .combine = "c"
 ) %dofuture% {
-  data %>%
-    mutate(mc_log = log(mc)) %>%
-    filter(mc_log >= mean(mc_log) - sd(mc_log)) %>%
+  ind <- data$mc_float %>%
+    log() %>%
+    normalize(silent = TRUE)
+  ind <- which(!is.na(ind) & ind >= 2)
+  data <- data[ind, ]$mc / 10^8
+  list(
     summarize(
-      across(
-        c(close, avg_cost, pe:npm, oscillator:volume_rms),
-        ~ sum(.x * index_weight, na.rm = TRUE) / sum(index_weight, na.rm = TRUE)
-      ),
+      data,
+      r = weighted.mean(r, mc_float, na.rm = TRUE),
+      dev = weighted.mean(dev, mc_float, na.rm = TRUE),
       count = n(),
       .by = date
-    ) %>%
-    list()
+    )
+  )
 } %>%
   rbindlist() %>%
   arrange(date) %>%
-  filter(date >= end_date %m-% years(10) & date <= end_date)
+  mutate(
+    close = cumprod(r),
+    avg_cost = close / dev
+  )
 
 plan(sequential)
 
-plot <- ggplot(data_combined_market, aes(x = date)) +
+plot <- ggplot(data_market, aes(x = date)) +
   geom_line(aes(y = close), color = "black", linewidth = 0.5) +
   geom_line(aes(y = avg_cost), color = "blue", linewidth = 0.5) +
   theme_minimal()
 print(plot)
-ggsave(paste0(backtest_dir, "market_indicators.png"), plot)
 
-plot <- ggplot(data_combined_market, aes(x = date)) +
+plot <- ggplot(data_market, aes(x = date)) +
+  geom_line(aes(y = mc), color = "black", linewidth = 0.5) +
+  theme_minimal()
+print(plot)
+
+plot <- ggplot(data_market, aes(x = date)) +
   geom_line(aes(y = count), color = "black", linewidth = 0.5) +
   theme_minimal()
 print(plot)
-ggsave(paste0(backtest_dir, "market_stock_count.png"), plot)
 
-plot <- ggplot(data_combined_market, aes(x = date)) +
+plot <- ggplot(data_market, aes(x = date)) +
   geom_line(aes(y = close / avg_cost - 1), color = "black", linewidth = 0.5) +
   theme_minimal()
 print(plot)
-ggsave(paste0(backtest_dir, "market_cost_dev.png"), plot)
+
+plot <- ggplot(data_market, aes(x = date)) +
+  geom_line(aes(y = pe), color = "black", linewidth = 0.5) +
+  theme_minimal()
+print(plot)
