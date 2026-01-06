@@ -14,7 +14,10 @@ calculate_avg_cost <- function(avg_price, to) {
   return(avg_cost)
 }
 
-normalize <- function(x, n_bins = 100, plot = TRUE, silent = FALSE) {
+normalize <- function(x, n_bins = NULL, plot = TRUE, silent = FALSE) {
+  x <- replace_missing(x, NaN)
+  if (is.null(n_bins)) n_bins <- ceiling(sqrt(length(na.omit(x))))
+
   # Calculate probability histogram
   if (plot & !silent) {
     par(mfrow = c(1, 2))
@@ -80,23 +83,4 @@ normalize <- function(x, n_bins = 100, plot = TRUE, silent = FALSE) {
   }
 
   return(x_symmetric)
-}
-
-calculate_wrm <- function(
-  x, w = NULL, s_low = 2, s_high = 2, output_index = FALSE
-) {
-  w <- if (is.null(w)) rep(1, length(x))
-  x_w <- x * w
-  x_mean <- sum(x_w, na.rm = TRUE) / sum(w[!is.na(x_w)])
-  x_sq_w <- w * (x - x_mean)^2
-  x_sd <- sqrt(sum(x_sq_w, na.rm = TRUE) / sum(w[!is.na(x_sq_w)]))
-  index <- which(x >= x_mean - s_low * x_sd & x <= x_mean + s_high * x_sd)
-  if (output_index) {
-    return(index)
-  } else {
-    x_f <- x[index]
-    w_f <- w[index]
-    x_f_w <- x_f * w_f
-    return(sum(x_f_w, na.rm = TRUE) / sum(w_f[!is.na(x_f_w)]))
-  }
 }

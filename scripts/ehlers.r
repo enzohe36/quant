@@ -7,7 +7,6 @@
 # library(xts)
 # library(DSTrading)
 # library(patchwork)
-# library(tidyverse)
 
 # HELPER FUNCTIONS =============================================================
 
@@ -376,8 +375,6 @@ if_buy <- function(
 
 generate_features <- function(
   data,
-  start_date,
-  end_date,
   # supersmoother oscillator args
   smoothing_length = 5,
   fast_length = 20,
@@ -408,9 +405,6 @@ generate_features <- function(
 ) {
   # Calculate min_required_length
   min_required_length <- max(slow_length, nSlow, lowpass_cutoff) * 2
-  start_date <- start_date - days(min_required_length * 2)
-
-  data <- filter(data, date >= start_date & date <= end_date)
   if (nrow(data) <= min_required_length) return(NULL)
 
   # Calculate indicators
@@ -459,6 +453,9 @@ generate_features <- function(
       price_rms_high = price_rms_high,
       price_rms_low = price_rms_low,
       min_required_length = min_required_length
+    ) %>%
+    mutate(
+      across(everything(), replace, row_number() <= min_required_length, NA)
     )
 
   # Combine with original data, keeping only buy from result

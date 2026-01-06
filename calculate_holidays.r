@@ -2,6 +2,7 @@
 
 library(foreach)
 library(doFuture)
+library(data.table)
 library(tidyverse)
 
 source("scripts/misc.r")
@@ -25,7 +26,7 @@ new_holidays <- c(
   seq(mdy("September 25, 2026"), mdy("September 27, 2026"), "1 day"),
   seq(mdy("October 1, 2026"), mdy("October 7, 2026"), "1 day")
 ) %>%
-  .[!wday(., week_start = 1) %in% 6:7]
+  .[!wday(.) %in% c(1, 7)]
 
 holidays <- as_date(c())
 
@@ -46,7 +47,7 @@ if (dir.exists(hist_dir)) {
     plan(sequential)
 
     holidays <- seq(min(tradedays), max(tradedays), by = "1 day") %>%
-      .[!wday(., week_start = 1) %in% 6:7] %>%
+      .[!wday(.) %in% c(1, 7)] %>%
       .[!.%in% tradedays]
   }
 }

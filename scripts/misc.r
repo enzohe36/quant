@@ -2,6 +2,7 @@
 
 # library(foreach)
 # library(doFuture)
+# library(data.table)
 # library(tidyverse)
 
 resources_dir <- "resources/"
@@ -11,6 +12,8 @@ last_td_expr <- expr(as_tradeday(now() - hours(17)))
 curr_td_expr <- expr(as_tradeday(now() - hours(9)))
 
 # MISCELLANEOUS ================================================================
+
+holidays <- as_date(readLines(holidays_path))
 
 # .combine = "multiout", .multicombine = TRUE, .init = list(list(), list(), ...)
 # https://stackoverflow.com/a/19801108
@@ -33,13 +36,10 @@ tsprint <- function(v, ...) {
 }
 
 run_sum <- function(x, n) {
-  sapply(seq_along(x), function(i) {
-    if (i < n) {
-      return(NA_real_)   # not enough values before current
-    }
-    window <- x[(i - n + 1):i]
-    return(sum(window))
-  })
+  sapply(
+    seq_along(x),
+    function(i) if (i < n) NA_real_ else sum(x[(i - n + 1):i])
+  )
 }
 
 run_mean <- function(x, n) run_sum(x, n) / n
@@ -55,14 +55,21 @@ as_tradeday <- function(datetime) {
     date,
     function(date) {
       seq(date - weeks(3), date, "1 day") %>%
-        .[!wday(., week_start = 1) %in% 6:7] %>%
-        .[!.%in% as_date(readLines(holidays_path))] %>%
+        .[!wday(.) %in% c(1, 7)] %>%
+        .[!.%in% holidays] %>%
         last()
     }
   ) %>%
     reduce(c)
   return(tradeday)
 }
+
+first_td <- as_date("1990-12-19")
+last_td <- eval(last_td_expr)
+curr_td <- eval(curr_td_expr)
+all_td <- seq(first_td, last_td, "1 day") %>%
+  .[!wday(.) %in% c(1, 7)] %>%
+  .[!.%in% holidays]
 
 write_title <- function(string = "", total_length = 80) {
   string <- toupper(string)

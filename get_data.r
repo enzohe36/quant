@@ -2,15 +2,15 @@
 
 # PRESET =======================================================================
 
-library(foreach)
-library(doFuture)
 library(RCurl)
 library(jsonlite)
+library(foreach)
+library(doFuture)
 library(data.table)
 library(tidyverse)
 
-source("scripts/misc.r")
 source("scripts/data_retrievers.r")
+source("scripts/misc.r")
 
 data_dir <- "data/"
 spot_combined_path <- paste0(data_dir, "spot_combined.csv")
@@ -20,10 +20,8 @@ adjust_dir <- paste0(data_dir, "adjust/")
 mc_dir <- paste0(data_dir, "mc/")
 val_dir <- paste0(data_dir, "val/")
 
-logs_dir <- "logs/"
+logs_dir <- paste0(data_dir, "logs/")
 log_path <- paste0(logs_dir, format(now(), "%Y%m%d_%H%M%S"), ".log")
-
-last_td <- eval(last_td_expr)
 
 # SPOT DATA ====================================================================
 
@@ -49,14 +47,9 @@ tsprint(str_glue("Retrieved spot data for {nrow(spot_combined)} stocks."))
 
 # HISTORICAL DATA ==============================================================
 
-symbols <- spot_combined %>%
-  filter(str_detect(symbol, "^(0|3|6)")) %>%
-  # filter(!delist & !susp) %>%
-  pull(symbol)
-
-out <- foreach(
-  symbol = symbols,
-  .combine = "c"
+success_count <- foreach(
+  symbol = spot_combined$symbol,
+  .combine = sum
 ) %do% {
   vars <- c(
     "adjust", "adjust_change_date", "adjust_path", "hist", "hist_path", "mc",
@@ -100,6 +93,7 @@ out <- foreach(
   )
   if (inherits(try_error, "try-error")) {
     tsprint(str_glue("{symbol}: Error retrieving hist."), log_path)
+    return(0)
   }
 
   try_error <- try(
@@ -110,7 +104,11 @@ out <- foreach(
     } else {
       adjust <- read_csv(adjust_path, show_col_types = FALSE)
       last_date <- max(pull(adjust, date))
-      adjust_change_date <- pull(spot, adjust_change_date)
+      adjust_change_date <- max(
+        pull(spot, adjust_change_date),
+        pull(spot, shares_change_date),
+        na.rm = TRUE
+      )
       if (
         isTRUE(last_date < adjust_change_date & adjust_change_date <= last_td)
       ) {
@@ -123,6 +121,7 @@ out <- foreach(
   )
   if (inherits(try_error, "try-error")) {
     tsprint(str_glue("{symbol}: Error retrieving adjust."), log_path)
+    return(0)
   }
 
   try_error <- try(
@@ -146,6 +145,7 @@ out <- foreach(
   )
   if (inherits(try_error, "try-error")) {
     tsprint(str_glue("{symbol}: Error retrieving mc."), log_path)
+    return(0)
   }
 
   try_error <- try(
@@ -169,7 +169,10 @@ out <- foreach(
   )
   if (inherits(try_error, "try-error")) {
     tsprint(str_glue("{symbol}: Error retrieving val."), log_path)
+    return(0)
   }
+
+  return(1)
 }
 
-tsprint(str_glue("Updated {length(symbols)} stocks."))
+tsprint(str_glue("Updated {success_count} stocks."))

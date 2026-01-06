@@ -2,8 +2,6 @@
 
 # library(RCurl)
 # library(jsonlite)
-# library(data.table)
-# library(tidyverse)
 
 resources_dir <- "resources/"
 indices_path <- paste0(resources_dir, "indices.csv")
@@ -258,7 +256,8 @@ combine_spot <- function() {
     mutate(
       delist = replace_na(delist, FALSE),
       susp = replace_na(susp, FALSE)
-    )
+    ) %>%
+    filter(str_detect(symbol, "^(0|3|6)"))
 }
 
 # HISTORICAL DATA ==============================================================
@@ -306,6 +305,7 @@ get_hist <- function(symbol, start_date, end_date) {
 
 # https://finance.sina.com.cn/realstock/company/sh600006/nc.shtml(示例)
 get_adjust <- function(symbol) {
+  last_td <- eval(last_td_expr)
   # date hfq_factor
   aktools(
     key = "stock_zh_a_daily",
@@ -324,7 +324,9 @@ get_adjust <- function(symbol) {
       adjust = as.numeric(hfq_factor)
     ) %>%
     select(date, adjust) %>%
-    arrange(date)
+    arrange(date) %>%
+    rbind(mutate(last(.), date = !!last_td)) %>%
+    distinct(date, .keep_all = TRUE)
 }
 
 # https://gushitong.baidu.com/stock/ab-002044

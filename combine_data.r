@@ -1,13 +1,17 @@
 # PRESET =======================================================================
 
+library(xts)
+library(DSTrading)
+library(patchwork)
+library(sn)
 library(foreach)
 library(doFuture)
 library(data.table)
-library(sn)
 library(tidyverse)
 
-source("scripts/misc.r")
+source("scripts/ehlers.r")
 source("scripts/features.r")
+source("scripts/misc.r")
 
 data_dir <- "data/"
 hist_dir <- paste0(data_dir, "hist/")
@@ -17,25 +21,36 @@ val_dir <- paste0(data_dir, "val/")
 
 data_combined_path <- paste0(data_dir, "data_combined.rds")
 
-logs_dir <- "logs/"
+backtest_dir <- "backtest/"
+
+logs_dir <- paste0(backtest_dir, "logs/")
 log_path <- paste0(logs_dir, format(now(), "%Y%m%d_%H%M%S"), ".log")
 
-last_td <- eval(last_td_expr)
+zero_threshold <- 0.05
+price_lookback <- 10
+min_price_diff <- 0.5
+price_lookforward <- 5
+min_signal <- 0.35
+min_osc_d1 <- -0.01
+osc_lookback <- 40
+max_osc_diff <- 1.9
+price_rms_high <- 1.5
+price_rms_low <- -1
+min_required_length <- 0
 
 # MAIN SCRIPT ==================================================================
 
+dir.create(backtest_dir)
 dir.create(logs_dir)
 
-quarters <- seq(as_date("1990-01-01"), last_td %m-% months(3), "1 day") %>%
-  quarter("date_last") %>%
-  unique()
-
-symbols <- str_remove(list.files(hist_dir), "\\.csv$")
+quarters_start <- unique(quarter(all_td, "date_first"))
+quarters_start_td <- as_tradeday(quarters_start)
+quarters_end <- quarters_start - 1
 
 plan(multisession, workers = availableCores() - 1)
 
 data_combined <- foreach(
-  symbol = symbols,
+  symbol = str_remove(list.files(hist_dir), "\\.csv$"),
   .combine = "c"
 ) %dofuture% {
   vars <- c(
@@ -78,7 +93,7 @@ data_combined <- foreach(
   } else {
     try_error <- try(
       val <- read_csv(val_path, show_col_types = FALSE) %>%
-        full_join(tibble(date = !!quarters), by = "date") %>%
+        full_join(tibble(date = !!quarters_end), by = "date") %>%
         arrange(date) %>%
         mutate(
           revenue = run_sum(revenue, 4),
@@ -116,22 +131,56 @@ data_combined <- foreach(
         volume = volume / adjust
       ) %>%
       fill(np, np_deduct, equity, revenue, cf, .direction = "down") %>%
-      mutate(
-        pe = mc / np,
-        pe_deduct = mc / np_deduct,
-        pb = mc / equity,
-        ps = mc / revenue,
-        pcf = mc / cf,
-        roe = np / equity,
-        npm = np / revenue
-      ) %>%
       filter(date %in% pull(hist, date)) %>%
-      mutate(avg_cost = calculate_avg_cost(avg_price, to)) %>%
-      select(symbol, names(hist), avg_cost, mc, pe:npm),
+      mutate(
+        avg_cost = calculate_avg_cost(avg_price, to),
+        quarter = quarter(date, with_year = TRUE)
+      ) %>%
+      group_by(quarter) %>%
+      mutate(
+        across(
+          c(mc, to),
+          ~ c(rep(NaN, n() - 1), mean(.x)),
+          .names = "{col}_quarter"
+        )
+      ) %>%
+      ungroup() %>%
+      mutate(
+        across(
+          c(mc_quarter, to_quarter),
+          ~ replace(.x, date < date[date %in% quarters_start_td][2], NA)
+        )
+      ) %>%
+      fill(mc_quarter, to_quarter, .direction = "down") %>%
+      select(
+        symbol, names(hist), avg_cost, mc, np, np_deduct, equity, revenue, cf,
+        quarter, mc_quarter, to_quarter
+      ),
     silent = TRUE
   )
   if (inherits(try_error, "try-error")) {
     tsprint(str_glue("{symbol}: Error combining data."), log_path)
+    return(NULL)
+  }
+
+  try_error <- try(
+    data <- generate_features(
+      data = data,
+      zero_threshold = zero_threshold,
+      price_lookback = price_lookback,
+      min_price_diff = min_price_diff,
+      price_lookforward = price_lookforward,
+      min_signal = min_signal,
+      min_osc_d1 = min_osc_d1,
+      osc_lookback = osc_lookback,
+      max_osc_diff = max_osc_diff,
+      price_rms_high = price_rms_high,
+      price_rms_low = price_rms_low
+    ),
+    silent = TRUE
+  )
+  if (inherits(try_error, "try-error")) {
+    tsprint(str_glue("{symbol}: Error generating features."), log_path)
     return(NULL)
   }
 
