@@ -11,6 +11,7 @@ calculate_avg_cost <- function(avg_price, to) {
   for (i in 2:n) {
     avg_cost[i] <- (1 - to[i]) * avg_cost[i - 1] + to[i] * avg_price[i]
   }
+  avg_cost[which(is.na(cumsum_na(to)) | cumsum_na(to) <= 1)] <- NA_real_
   return(avg_cost)
 }
 

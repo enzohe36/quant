@@ -102,14 +102,14 @@ calculate_oscillator <- function(
 
   smoothed_price <- supersmoother(close, smoothing_length)
 
-  fast_ma <- EMA(smoothed_price, fast_length)
-  slow_ma <- EMA(smoothed_price, slow_length)
+  fast_ma <- ema_na(smoothed_price, fast_length)
+  slow_ma <- ema_na(smoothed_price, slow_length)
 
-  atr <- as.numeric(ATR(hlc, atr_length)[, "atr"])
+  atr <- as.numeric(atr_na(hlc, atr_length)[, "atr"])
   smoothed_atr <- supersmoother(replace_missing(atr, 0), smoothing_length)
 
   oscillator <- (fast_ma - slow_ma) / smoothed_atr
-  signal_line <- EMA(oscillator, 25)
+  signal_line <- ema_na(oscillator, 25)
 
   osc_d1 <- momentum(oscillator)
   osc_d1_norm <- tanh(osc_d1 * hue_multiplier)
@@ -121,12 +121,19 @@ calculate_oscillator <- function(
     method = "recursive"
   )
 
-  return(data.frame(
+  result <- data.frame(
     date = data$date,
     oscillator = oscillator,
     signal_line = signal_line,
     hue = hue
-  ))
+  ) %>%
+    mutate(
+      across(
+        everything(),
+        ~ replace(.x, row_number() <= slow_length * 2, NA_real_)
+      )
+    )
+  return(result)
 }
 
 # KAMA =========================================================================
@@ -134,25 +141,27 @@ calculate_oscillator <- function(
 calculate_kama <- function(
   data,
   atr_length = 20,
-  atr_multiplier = 3,
-  nER = 10,
-  nFast = 2,
-  nSlow = 30
+  atr_multiplier = 3
 ) {
   hlc <- xts(data[, c("high", "low", "close")], order.by = data$date)
 
-  atr <- as.numeric(ATR(hlc, atr_length)[, "atr"])
+  atr <- as.numeric(atr_na(hlc, atr_length)[, "atr"])
 
-  kama <- as.numeric(KAMA(hlc, nER, nFast, nSlow, "Ehlers's"))
+  try_error <- try(
+    kama <- as.numeric(KAMA(hlc, priceMethod = "Ehlers's")),
+    silent = TRUE
+  )
+  if (inherits(try_error, "try-error")) kama <- rep(NA_real_, nrow(data))
   upper_bound <- kama + atr_multiplier * atr
   lower_bound <- kama - atr_multiplier * atr
 
-  return(data.frame(
+  result <- data.frame(
     date = data$date,
     kama = kama,
     upper_bound = upper_bound,
     lower_bound = lower_bound
-  ))
+  )
+  return(result)
 }
 
 # EHLERS LOOPS =================================================================
@@ -242,11 +251,18 @@ calculate_rms <- function(
   volume_rms <- smoothed_volume / sqrt(pmax(volume_ms, 1e-10))
   volume_rms[is.nan(volume_rms) | is.infinite(volume_rms)] <- 0
 
-  return(data.frame(
+  result <- data.frame(
     date = data$date,
     price_rms = price_rms,
     volume_rms = volume_rms
-  ))
+  ) %>%
+    mutate(
+      across(
+        everything(),
+        ~ replace(.x, row_number() <= lowpass_cutoff * 2, NA_real_)
+      )
+    )
+  return(result)
 }
 
 # BULLISH CONDITION TEST =======================================================
@@ -262,8 +278,7 @@ if_buy <- function(
   osc_lookback = 40,
   max_osc_diff = 1.9,
   price_rms_high = 1.5,
-  price_rms_low = -1,
-  min_required_length = 0
+  price_rms_low = -1
 ) {
   oscillator <- result$oscillator
   signal_line <- result$signal_line
@@ -276,7 +291,7 @@ if_buy <- function(
   price_d2 <- momentum(price_d1)
   price_near_max <- (abs(price_d1) <= zero_threshold) & (price_d2 < 0)
 
-  price_diff <- price_rms - runMin(price_rms, price_lookback)
+  price_diff <- price_rms - run_min(price_rms, price_lookback)
 
   price_start <- (
     (price_near_max) & (price_diff >= min_price_diff)
@@ -303,13 +318,15 @@ if_buy <- function(
   )
 
   # Protect volume_end runs that start within protection period
-  volume_end_run_needs_protection <- volume_end_run_begins &
+  protect_volume_end_run <- volume_end_run_begins &
     (days_since_price_start < price_lookforward)
 
   volume_end_run_id <- cumsum(replace_na(volume_end_run_begins, FALSE))
   volume_end_run_id[!volume_end] <- 0
 
-  protected_run_ids <- unique(volume_end_run_id[volume_end_run_needs_protection & volume_end])
+  protected_run_ids <- unique(
+    volume_end_run_id[protect_volume_end_run & volume_end]
+  )
 
   volume_end_protected <- volume_end
   volume_end_protected[volume_end_run_id %in% protected_run_ids] <- FALSE
@@ -317,19 +334,14 @@ if_buy <- function(
   # Oscillator start conditions
   strong_signal <- oscillator - signal_line >= min_signal
   osc_d1 <- momentum(oscillator)
-  osc_diff <- oscillator - runMin(oscillator, osc_lookback)
+  osc_diff <- oscillator - run_min(oscillator, osc_lookback)
   osc_start <- (strong_signal) & (osc_d1 > min_osc_d1)
 
   buy <- (
-    (price_start & !volume_end_protected) |
-      (osc_start)
-  ) & (
-    (osc_diff <= max_osc_diff)
-  )
-
-  # Set first min_required_length elements to FALSE
-  warmup_length <- min(min_required_length, length(buy))
-  buy[1:warmup_length] <- FALSE
+    ((price_start & !volume_end_protected) | (osc_start)) &
+      (osc_diff <= max_osc_diff)
+  ) %>%
+    replace_na(FALSE)
 
   run_starts <- buy & !lag(buy)
   run_ends <- !buy & lag(buy)
@@ -343,7 +355,7 @@ if_buy <- function(
     run_start_idx <- run_indices[1]
     run_end_idx <- run_indices[length(run_indices)]
     idx <- run_end_idx + 1
-    while (idx <= n && price_rms[idx] > price_rms_low) {
+    while (idx <= n && isTRUE(price_rms[idx] > price_rms_low)) {
       buy[idx] <- TRUE
       idx <- idx + 1
     }
@@ -360,7 +372,7 @@ if_buy <- function(
     run_start_idx <- run_indices[1]
     run_end_idx <- run_indices[length(run_indices)]
     idx <- run_start_idx
-    while (idx <= run_end_idx && price_rms[idx] < price_rms_high) {
+    while (idx <= run_end_idx && isTRUE(price_rms[idx] < price_rms_high)) {
       buy[idx] <- FALSE
       idx <- idx + 1
     }
@@ -375,23 +387,6 @@ if_buy <- function(
 
 generate_features <- function(
   data,
-  # supersmoother oscillator args
-  smoothing_length = 5,
-  fast_length = 20,
-  slow_length = 50,
-  atr_length = 20,
-  hue_multiplier = 100,
-  # kama args
-  kama_atr_length = 20,
-  atr_multiplier = 3,
-  nER = 10,
-  nFast = 2,
-  nSlow = 30,
-  # ehlers loops args
-  highpass_cutoff = 20,
-  lowpass_cutoff = 125,
-  alpha = 0.0242,
-  # if_buy args
   zero_threshold = 0.05,
   price_lookback = 10,
   min_price_diff = 0.5,
@@ -403,43 +398,11 @@ generate_features <- function(
   price_rms_high = 1.5,
   price_rms_low = -1
 ) {
-  # Calculate min_required_length
-  min_required_length <- max(slow_length, nSlow, lowpass_cutoff) * 2
-  if (nrow(data) <= min_required_length) return(NULL)
-
   # Calculate indicators
   result <- cbind(
-    select(
-      calculate_oscillator(
-        data,
-        smoothing_length = smoothing_length,
-        fast_length = fast_length,
-        slow_length = slow_length,
-        atr_length = atr_length,
-        hue_multiplier = hue_multiplier
-      ),
-      -date
-    ),
-    select(
-      calculate_kama(
-        data,
-        atr_length = kama_atr_length,
-        atr_multiplier = atr_multiplier,
-        nER = nER,
-        nFast = nFast,
-        nSlow = nSlow
-      ),
-      -date
-    ),
-    select(
-      calculate_rms(
-        data,
-        highpass_cutoff = highpass_cutoff,
-        lowpass_cutoff = lowpass_cutoff,
-        alpha = alpha
-      ),
-      -date
-    )
+    select(calculate_oscillator(data), -date),
+    select(calculate_kama(data), -date),
+    select(calculate_rms(data), -date)
   ) %>%
     if_buy(
       zero_threshold = zero_threshold,
@@ -451,11 +414,7 @@ generate_features <- function(
       osc_lookback = osc_lookback,
       max_osc_diff = max_osc_diff,
       price_rms_high = price_rms_high,
-      price_rms_low = price_rms_low,
-      min_required_length = min_required_length
-    ) %>%
-    mutate(
-      across(everything(), replace, row_number() <= min_required_length, NA)
+      price_rms_low = price_rms_low
     )
 
   # Combine with original data, keeping only buy from result
@@ -494,11 +453,14 @@ plot_indicators <- function(
     )
   )
 
-  oscillator_colors <- sapply(plot_data$hue, function(h) {
-    if (is.na(h)) return("#FFFF00")
-    rgb_vals <- hsv_to_rgb(h, 1.0, 1.0)
-    return(rgb(rgb_vals$r, rgb_vals$g, rgb_vals$b, maxColorValue = 255))
-  })
+  oscillator_colors <- sapply(
+    as.numeric(plot_data$hue),
+    function(h) {
+      if (is.na(h)) return(NA)
+      rgb_vals <- hsv_to_rgb(h, 1.0, 1.0)
+      return(rgb(rgb_vals$r, rgb_vals$g, rgb_vals$b, maxColorValue = 255))
+    }
+  )
 
   plot_data$oscillator_color <- oscillator_colors
 
@@ -507,18 +469,35 @@ plot_indicators <- function(
   date_labels <- format(plot_data$date[date_breaks], "%Y-%m-%d")
 
   # Calculate y-axis limits with padding
-  price_range <- range(c(plot_data$low, plot_data$high, plot_data$lower_bound,
-                         plot_data$upper_bound, plot_data$avg_cost), na.rm = TRUE)
+  price_range <- range(
+    c(
+      plot_data$low, plot_data$high, plot_data$lower_bound,
+      plot_data$upper_bound, plot_data$avg_cost
+    ),
+    na.rm = TRUE
+  )
   price_padding <- diff(price_range) * 0.02
-  price_ylim <- c(price_range[1] - price_padding, price_range[2] + price_padding)
+  price_ylim <- c(
+    price_range[1] - price_padding, price_range[2] + price_padding
+  )
 
-  osc_range <- range(c(plot_data$oscillator, plot_data$signal_line), na.rm = TRUE)
+  osc_range <- range(
+    c(plot_data$oscillator, plot_data$signal_line),
+    na.rm = TRUE
+  )
   osc_padding <- diff(osc_range) * 0.02
-  osc_ylim <- c(osc_range[1] - osc_padding, osc_range[2] + osc_padding)
+  osc_ylim <- c(
+    osc_range[1] - osc_padding, osc_range[2] + osc_padding
+  )
 
-  rms_range <- range(c(plot_data$price_rms, plot_data$volume_rms), na.rm = TRUE)
+  rms_range <- range(
+    c(plot_data$price_rms, plot_data$volume_rms),
+    na.rm = TRUE
+  )
   rms_padding <- diff(rms_range) * 0.02
-  rms_ylim <- c(rms_range[1] - rms_padding, rms_range[2] + rms_padding)
+  rms_ylim <- c(
+    rms_range[1] - rms_padding, rms_range[2] + rms_padding
+  )
 
   # Candlestick chart
   buy_bg <- data.frame(
@@ -529,30 +508,35 @@ plot_indicators <- function(
   )
 
   p1 <- ggplot(plot_data, aes(x = index)) +
-    geom_rect(data = buy_bg[buy_bg$buy, ],
-              aes(xmin = index - 0.5, xmax = index + 0.5,
-                  ymin = ymin, ymax = ymax),
-              fill = "black", alpha = 0.1, inherit.aes = FALSE) +
-    geom_ribbon(aes(ymin = lower_bound, ymax = upper_bound),
-                fill = NA, color = "black", linewidth = 0.5) +
-    geom_line(aes(y = avg_cost), color = "blue", linewidth = 0.5)
-
-  if (close_only) {
-    p1 <- p1 +
-      geom_line(aes(y = close), color = "darkorange", linewidth = 0.5)
-  } else {
-    p1 <- p1 +
-      geom_segment(aes(x = index, y = low, yend = high),
-                  color = plot_data$candle_color, linewidth = 0.3) +
-      geom_segment(aes(x = index - 0.4, xend = index + 0.4, y = open),
-                  color = plot_data$candle_color, linewidth = 0.3) +
-      geom_rect(aes(xmin = index - 0.4, xmax = index + 0.4,
-                    ymin = pmin(open, close), ymax = pmax(open, close),
-                    fill = candle_color),
-                linewidth = 0)
-  }
-
-  p1 <- p1 +
+    geom_rect(
+      data = buy_bg[buy_bg$buy, ],
+      aes(xmin = index - 0.5, xmax = index + 0.5, ymin = ymin, ymax = ymax),
+      fill = "black", alpha = 0.1, inherit.aes = FALSE
+    ) +
+    geom_ribbon(
+      aes(ymin = lower_bound, ymax = upper_bound),
+      fill = NA, color = "black", linewidth = 0.5
+    ) +
+    geom_line(
+      aes(y = avg_cost),
+      color = "blue", linewidth = 0.5
+    ) +
+    geom_segment(
+      aes(x = index, y = low, yend = high),
+      color = plot_data$candle_color, linewidth = 0.3
+    ) +
+    geom_segment(
+      aes(x = index - 0.4, xend = index + 0.4, y = open),
+      color = plot_data$candle_color, linewidth = 0.3
+    ) +
+    geom_rect(
+      aes(
+        xmin = index - 0.4, xmax = index + 0.4,
+        ymin = pmin(open, close), ymax = pmax(open, close),
+        fill = candle_color
+      ),
+      linewidth = 0
+    ) +
     scale_fill_identity() +
     scale_x_continuous(breaks = date_breaks, labels = date_labels) +
     scale_y_continuous(limits = price_ylim, expand = c(0, 0)) +
@@ -563,7 +547,9 @@ plot_indicators <- function(
       axis.ticks.x = element_blank(),
       panel.grid.minor = element_blank(),
       panel.grid.major.x = element_line(color = "gray80"),
-      plot.title = element_text(hjust = 0.5, face = "bold", margin = margin(0, 0, 0, 0)),
+      plot.title = element_text(
+        hjust = 0.5, face = "bold", margin = margin(0, 0, 0, 0)
+      ),
       legend.position = "top",
       legend.justification = "center",
       legend.direction = "horizontal",
@@ -579,32 +565,35 @@ plot_indicators <- function(
   )
 
   p2 <- ggplot(plot_data, aes(x = index)) +
-    geom_rect(data = oscillator_buy_bg[oscillator_buy_bg$buy, ],
-              aes(xmin = index - 0.5, xmax = index + 0.5,
-                  ymin = ymin, ymax = ymax),
-              fill = "black", alpha = 0.1, inherit.aes = FALSE) +
-    geom_hline(yintercept = 0, linetype = "dashed",
-               color = "gray50", linewidth = 0.5) +
+    geom_rect(
+      data = oscillator_buy_bg[oscillator_buy_bg$buy, ],
+      aes(xmin = index - 0.5, xmax = index + 0.5, ymin = ymin, ymax = ymax),
+      fill = "black", alpha = 0.1, inherit.aes = FALSE
+    ) +
+    geom_hline(
+      yintercept = 0,
+      linetype = "dashed", color = "gray50", linewidth = 0.5
+    ) +
     # Actual oscillator line with dynamic colors (no legend)
-    geom_line(aes(y = oscillator, color = oscillator_color, group = 1),
-              linewidth = 0.5) +
+    geom_line(
+      aes(y = oscillator, color = oscillator_color, group = 1),
+      linewidth = 0.5
+    ) +
     scale_color_identity() +
     # Invisible dummy line for oscillator legend
-    geom_line(aes(y = oscillator, linetype = "Oscillator"),
-              color = "darkorange", linewidth = 0.5, alpha = 0) +
+    geom_line(
+      aes(y = oscillator, linetype = "Oscillator"),
+      color = "darkorange", linewidth = 0.5, alpha = 0
+    ) +
     # Signal line
-    geom_line(aes(y = signal_line, linetype = "Signal Line"),
-              color = "black", linewidth = 0.5) +
+    geom_line(
+      aes(y = signal_line, linetype = "Signal Line"),
+      color = "black", linewidth = 0.5
+    ) +
     scale_linetype_manual(
       name = "",
       values = c("Oscillator" = "solid", "Signal Line" = "solid"),
-      guide = guide_legend(
-        override.aes = list(
-          color = c("darkorange", "black"),
-          alpha = c(1, 1),
-          linewidth = 0.5
-        )
-      )
+      guide = guide_legend(override.aes = list(alpha = 1))
     ) +
     scale_x_continuous(breaks = date_breaks, labels = date_labels) +
     scale_y_continuous(limits = osc_ylim, expand = c(0, 0)) +
@@ -630,14 +619,23 @@ plot_indicators <- function(
   )
 
   p3 <- ggplot(plot_data, aes(x = index)) +
-    geom_rect(data = rms_buy_bg[rms_buy_bg$buy, ],
-              aes(xmin = index - 0.5, xmax = index + 0.5,
-                  ymin = ymin, ymax = ymax),
-              fill = "black", alpha = 0.1, inherit.aes = FALSE) +
-    geom_hline(yintercept = 0, linetype = "dashed",
-               color = "gray50", linewidth = 0.5) +
-    geom_line(aes(y = price_rms, color = "Price RMS"), linewidth = 0.5) +
-    geom_line(aes(y = volume_rms, color = "Volume RMS"), linewidth = 0.5) +
+    geom_rect(
+      data = rms_buy_bg[rms_buy_bg$buy, ],
+      aes(xmin = index - 0.5, xmax = index + 0.5, ymin = ymin, ymax = ymax),
+      fill = "black", alpha = 0.1, inherit.aes = FALSE
+    ) +
+    geom_hline(
+      yintercept = 0,
+      linetype = "dashed", color = "gray50", linewidth = 0.5
+    ) +
+    geom_line(
+      aes(y = price_rms, color = "Price RMS"),
+      linewidth = 0.5
+    ) +
+    geom_line(
+      aes(y = volume_rms, color = "Volume RMS"),
+      linewidth = 0.5
+    ) +
     scale_color_manual(
       name = "",
       values = c("Price RMS" = "lightblue", "Volume RMS" = "navyblue")

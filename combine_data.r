@@ -36,7 +36,6 @@ osc_lookback <- 40
 max_osc_diff <- 1.9
 price_rms_high <- 1.5
 price_rms_low <- -1
-min_required_length <- 0
 
 # MAIN SCRIPT ==================================================================
 
