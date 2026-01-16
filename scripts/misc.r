@@ -91,7 +91,6 @@ atr_na <- function(HLC, n = 14, ...) {
   return(result)
 }
 
-
 run_mean <- function(x, n) run_sum(x, n) / n
 
 replace_missing <- function(x, replacement) {

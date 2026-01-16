@@ -123,6 +123,7 @@ calculate_oscillator <- function(
 
   result <- data.frame(
     date = data$date,
+    atr = smoothed_atr,
     oscillator = oscillator,
     signal_line = signal_line,
     hue = hue
@@ -138,28 +139,16 @@ calculate_oscillator <- function(
 
 # KAMA =========================================================================
 
-calculate_kama <- function(
-  data,
-  atr_length = 20,
-  atr_multiplier = 3
-) {
+calculate_kama <- function(data) {
   hlc <- xts(data[, c("high", "low", "close")], order.by = data$date)
-
-  atr <- as.numeric(atr_na(hlc, atr_length)[, "atr"])
-
   try_error <- try(
     kama <- as.numeric(KAMA(hlc, priceMethod = "Ehlers's")),
     silent = TRUE
   )
   if (inherits(try_error, "try-error")) kama <- rep(NA_real_, nrow(data))
-  upper_bound <- kama + atr_multiplier * atr
-  lower_bound <- kama - atr_multiplier * atr
-
   result <- data.frame(
     date = data$date,
-    kama = kama,
-    upper_bound = upper_bound,
-    lower_bound = lower_bound
+    kama = kama
   )
   return(result)
 }
@@ -348,6 +337,7 @@ if_buy <- function(
   run_id <- cumsum(run_starts)
   run_id[!buy] <- 0
 
+  # Delay buy run ends until price_rms drops below price_rms_low
   for (rid in unique(run_id[run_id > 0])) {
     run_indices <- which(run_id == rid)
     if (length(run_indices) == 0) next
@@ -361,6 +351,7 @@ if_buy <- function(
     }
   }
 
+  # Delay buy run starts until price_rms rises above price_rms_high
   run_starts <- buy & !lag(buy)
   run_id <- cumsum(run_starts)
   run_id[!buy] <- 0
@@ -378,8 +369,15 @@ if_buy <- function(
     }
   }
 
-  result$buy <- buy
+  # Invalidate buy signals with missing critical indicators
+  buy <- ifelse(
+    is.na(oscillator) | is.na(signal_line) |
+      is.na(price_rms) | is.na(volume_rms),
+    FALSE,
+    buy
+  )
 
+  result$buy <- buy
   return(result)
 }
 
@@ -424,9 +422,7 @@ generate_features <- function(
 
 # PLOTTING =====================================================================
 
-plot_indicators <- function(
-  data, plot_title = "Indicator Plot", close_only = FALSE
-) {
+plot_indicators <- function(data, plot_title = "Indicator Plot") {
   plot_data <- tibble(
     index = 1:nrow(data),
     date = data$date,
@@ -439,8 +435,8 @@ plot_indicators <- function(
     signal_line = data$signal_line,
     hue = data$hue,
     kama = data$kama,
-    upper_bound = data$upper_bound,
-    lower_bound = data$lower_bound,
+    upper_bound = data$kama + 3 * data$atr,
+    lower_bound = data$kama - 3 * data$atr,
     price_rms = data$price_rms,
     volume_rms = data$volume_rms,
     buy = data$buy,
@@ -464,9 +460,43 @@ plot_indicators <- function(
 
   plot_data$oscillator_color <- oscillator_colors
 
-  n_breaks <- min(10, nrow(plot_data))
-  date_breaks <- seq(1, nrow(plot_data), length.out = n_breaks)
-  date_labels <- format(plot_data$date[date_breaks], "%Y-%m-%d")
+  # Create natural date breaks using lubridate
+  # Find first occurrence of each unit change in the actual data
+  date_range <- range(plot_data$date)
+  time_span <- as.numeric(difftime(date_range[2], date_range[1], units = "days"))
+
+  # Determine appropriate interval based on time span
+  if (time_span > 1096) {
+    # More than 3 years: label first day of each year
+    plot_data$period <- year(plot_data$date)
+    date_format <- "%Y"
+  } else if (time_span > 366) {
+    # 1-3 years: label first day of each quarter
+    plot_data$period <- paste0(year(plot_data$date), "-Q", quarter(plot_data$date))
+    date_format <- "%Y-%m"
+  } else if (time_span > 92) {
+    # 3-12 months: label first day of each month
+    plot_data$period <- format(plot_data$date, "%Y-%m")
+    date_format <- "%Y-%m"
+  } else if (time_span > 31) {
+    # 1-3 months: label first day of each week
+    plot_data$period <- format(floor_date(plot_data$date, "week"), "%Y-%W")
+    date_format <- "%m-%d"
+  } else {
+    # 31 days or less: label every few days
+    interval_days <- max(1, ceiling(time_span / 10))
+    plot_data$period <- floor_date(plot_data$date, paste(interval_days, "days"))
+    date_format <- "%m-%d"
+  }
+
+  # Find the first index where each period appears
+  date_breaks <- plot_data %>%
+    group_by(period) %>%
+    summarise(first_index = min(index), .groups = "drop") %>%
+    arrange(first_index) %>%
+    pull(first_index)
+
+  date_labels <- format(plot_data$date[date_breaks], date_format)
 
   # Calculate y-axis limits with padding
   price_range <- range(
@@ -518,6 +548,10 @@ plot_indicators <- function(
       fill = NA, color = "black", linewidth = 0.5
     ) +
     geom_line(
+      aes(y = kama),
+      color = "black", linewidth = 0.5
+    ) +
+    geom_line(
       aes(y = avg_cost),
       color = "blue", linewidth = 0.5
     ) +
@@ -538,7 +572,12 @@ plot_indicators <- function(
       linewidth = 0
     ) +
     scale_fill_identity() +
-    scale_x_continuous(breaks = date_breaks, labels = date_labels) +
+    scale_x_continuous(
+      breaks = date_breaks,
+      labels = date_labels,
+      limits = c(0.6, nrow(plot_data) + 0.4),
+      expand = c(0, 0)
+    ) +
     scale_y_continuous(limits = price_ylim, expand = c(0, 0)) +
     labs(title = plot_title, y = "Price", x = NULL) +
     theme_minimal() +
@@ -595,7 +634,12 @@ plot_indicators <- function(
       values = c("Oscillator" = "solid", "Signal Line" = "solid"),
       guide = guide_legend(override.aes = list(alpha = 1))
     ) +
-    scale_x_continuous(breaks = date_breaks, labels = date_labels) +
+    scale_x_continuous(
+      breaks = date_breaks,
+      labels = date_labels,
+      limits = c(0.6, nrow(plot_data) + 0.4),
+      expand = c(0, 0)
+    ) +
     scale_y_continuous(limits = osc_ylim, expand = c(0, 0)) +
     labs(y = "Oscillator", x = NULL) +
     theme_minimal() +
@@ -640,7 +684,12 @@ plot_indicators <- function(
       name = "",
       values = c("Price RMS" = "lightblue", "Volume RMS" = "navyblue")
     ) +
-    scale_x_continuous(breaks = date_breaks, labels = date_labels) +
+    scale_x_continuous(
+      breaks = date_breaks,
+      labels = date_labels,
+      limits = c(0.6, nrow(plot_data) + 0.4),
+      expand = c(0, 0)
+    ) +
     scale_y_continuous(limits = rms_ylim, expand = c(0, 0)) +
     labs(y = "RMS", x = "Date") +
     theme_minimal() +

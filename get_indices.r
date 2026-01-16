@@ -20,47 +20,31 @@ index_comp_path <- paste0(resources_dir, "index_comp.csv")
 
 dir.create(resources_dir)
 
-indices <- get_indices()
+indices <- combine_indices()
 write_csv(indices, indices_path)
 tsprint(str_glue("Retrieved {nrow(indices)} indices."))
 
-index_names <- c(
-  # 机器人
-  "932438", "H30590",
-  # 新材料
-  "H30597",
-  # 半导体
-  "931743", "932066", "932448", "932139", "H30184",
-  # 芯片
-  "932040", "H30007",
-  # 航天/空天
-  "932419", "H30213", "932116", "932143", "930875",
-  # 卫星
-  "931585", "931594",
-  # 储能
-  "931746", "931747", "932246", "932090",
-  # 电池
-  "931555", "931664", "931719",
-  # 稀土
-  "930598",
-  # 有色
-  "000811", "930708", "931892", "H11059", "000819", "932112",
-  # 光伏
-  "931151", "931798", "931528",
-  # 计算机
-  "930651", "932067", "H30182",
-  # 电子
-  "930652", "931461", "931483", "931494", "H30190", "399811", "932138",
-  "H30183",
-  # 通信
-  "930852", "931079", "931144", "931160", "931271", "931723", "932065",
-  "932141", "932145"
+index_list <- c(
+  "930713", # CS人工智
+  "000685", # 科创芯片
+  "931743", # 半导体材料设备
+  "931079", # 5G通信
+  "980022", # 机器人产业
+  "980032", # 新能电池
+  "980018", # 卫星通信
+  "930601", # 中证软件
+  "931151", # 光伏产业
+  "H11059", # 工业有色
+  "930598" # 稀土产业
 )
 
-index_comp <- list()
-for (index_name in index_names) {
-  index_comp <- c(index_comp, list(loop_function("get_index_comp", index_name)))
-}
-index_comp <- rbindlist(index_comp)
+index_comp <- foreach(
+  index = index_list,
+  .combine = "c"
+) %do% {
+  list(loop_function("get_index_comp", index))
+} %>%
+  rbindlist() %>%
+  filter(str_detect(symbol, "^(0|3|6)"))
 write_csv(index_comp, index_comp_path)
-tsprint(str_glue("Retrieved components of {length(index_names)} indices."))
+tsprint(str_glue("Retrieved {nrow(index_comp)} index components."))

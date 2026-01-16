@@ -8,6 +8,10 @@ indices_path <- paste0(resources_dir, "indices.csv")
 
 # HELPER FUNCTIONS =============================================================
 
+indices <- if (file.exists(indices_path)) {
+  read_csv(indices_path, show_col_types = FALSE)
+}
+
 aktools <- function(key, ...){
   args <- list(...) %>%
     lapply(function(x) if (is.character(x)) enc2utf8(x) else x)
@@ -55,36 +59,98 @@ loop_function <- function(func_name, ..., fail_max = 10, wait = 60) {
 
 get_indices <- function() {
   curr_td <- eval(curr_td_expr)
+  # index_code display_name publish_date
+  aktools("index_stock_info") %>%
+    mutate(
+      date = !!curr_td,
+      source = "csi",
+      index = index_code,
+      index_name = display_name,
+      stock_count = NA
+    ) %>%
+    select(date, source, index, index_name, stock_count) %>%
+    arrange(index)
+}
+
+get_indices_csi <- function() {
+  curr_td <- eval(curr_td_expr)
   # 指数代码 指数简称 指数全称 基日 基点 指数系列 样本数量 最新收盘 近一个月收益率 资产类别
   # 指数热点 指数币种 合作指数 跟踪产品 指数合规 指数类别 发布时间
   aktools("index_csindex_all") %>%
     mutate(
       date = !!curr_td,
+      source = "csi",
       index = `指数代码`,
-      index_type = replace(`指数类别`, `指数类别` == "-", NA),
-      index_name = `指数简称`
+      index_name = `指数简称`,
+      stock_count = as.integer(`样本数量`)
     ) %>%
-    select(date, index, index_type, index_name) %>%
-    arrange(index_type, index)
+    select(date, source, index, index_name, stock_count) %>%
+    arrange(index)
+}
+
+get_indices_cni <- function() {
+  curr_td <- eval(curr_td_expr)
+  # 指数代码 指数简称 样本数 收盘点位 涨跌幅 PE滚动 成交量 成交额 总市值 自由流通市值
+  aktools("index_all_cni") %>%
+    mutate(
+      date = !!curr_td,
+      source = "cni",
+      index = `指数代码`,
+      index_name = `指数简称`,
+      stock_count = as.integer(`样本数`)
+    ) %>%
+    select(date, source, index, index_name, stock_count) %>%
+    arrange(index)
+}
+
+combine_indices <- function() {
+  list(
+    loop_function("get_indices"),
+    loop_function("get_indices_csi"),
+    loop_function("get_indices_cni")
+  ) %>%
+    rbindlist(fill = TRUE) %>%
+    distinct(index, .keep_all = TRUE) %>%
+    arrange(index)
 }
 
 # http://www.csindex.com.cn/zh-CN/indices/index-detail/000300
-get_index_comp <- function(symbol) {
+get_index_comp <- function(index) {
+  index <- filter(indices, index == !!index)
   curr_td <- eval(curr_td_expr)
-  # 日期 指数代码 指数名称 指数英文名称 成分券代码 成分券名称 成分券英文名称 交易所
-  # 交易所英文名称 权重
-  aktools(
-    key = "index_stock_cons_weight_csindex",
-    symbol = symbol
-  ) %>%
-    mutate(
-      date = !!curr_td,
-      index = !!symbol,
-      symbol = `成分券代码`,
-      name = `成分券名称`,
-      weight = as.numeric(`权重`)
+  if (index$source == "csi") {
+    # 日期 指数代码 指数名称 指数英文名称 成分券代码 成分券名称 成分券英文名称 交易所
+    # 交易所英文名称 权重
+    data <- aktools(
+      key = "index_stock_cons_weight_csindex",
+      symbol = index$index
     ) %>%
-    select(date, index, symbol, name, weight) %>%
+      mutate(
+        date = !!curr_td,
+        index = !!index$index,
+        index_name = !!index$index_name,
+        symbol = `成分券代码`,
+        name = `成分券名称`,
+        weight = as.numeric(`权重`)
+      )
+  } else if (index$source == "cni") {
+    # 日期 样本代码 样本简称 所属行业 总市值 权重
+    data <- aktools(
+      key = "index_detail_cni",
+      symbol = index$index
+    ) %>%
+      filter(`日期` == max(`日期`)) %>%
+      mutate(
+        date = !!curr_td,
+        index = !!index$index,
+        index_name = !!index$index_name,
+        symbol = `样本代码`,
+        name = `样本简称`,
+        weight = as.numeric(`权重`)
+      )
+  }
+  data %>%
+    select(date, index, index_name, symbol, name, weight) %>%
     arrange(desc(weight), symbol)
 }
 
@@ -257,28 +323,11 @@ combine_spot <- function() {
       delist = replace_na(delist, FALSE),
       susp = replace_na(susp, FALSE)
     ) %>%
-    filter(str_detect(symbol, "^(0|3|6)"))
+    filter(str_detect(symbol, "^(0|3|6)")) %>%
+    arrange(symbol)
 }
 
 # HISTORICAL DATA ==============================================================
-
-# http://quote.eastmoney.com/center/hszs.html
-get_index_hist <- function(symbol, start_date, end_date) {
-  indices <- read_csv(indices_path, show_col_types = FALSE)
-  # date open close high low volume amount
-  aktools(
-    key = "stock_zh_index_daily_em",
-    symbol = paste0(filter(indices, symbol == !!symbol)$market, symbol),
-    start_date = format(start_date, "%Y%m%d"),
-    end_date = format(end_date, "%Y%m%d")
-  ) %>%
-    mutate(
-      date = as_date(date),
-      across(c(open, high, low, close, volume, amount), as.numeric)
-    ) %>%
-    select(date, open, high, low, close, volume, amount) %>%
-    arrange(date)
-}
 
 # https://quote.eastmoney.com/concept/sh603777.html?from=classic(示例)
 get_hist <- function(symbol, start_date, end_date) {

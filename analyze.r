@@ -19,6 +19,7 @@ spot_combined_path <- paste0(data_dir, "spot_combined.csv")
 
 resources_dir <- "resources/"
 index_comp_path <- paste0(resources_dir, "index_comp.csv")
+watchlist_path <- paste0(resources_dir, "watchlist.txt")
 
 backtest_dir <- "backtest/"
 
@@ -55,8 +56,6 @@ dir.create(logs_dir)
 data_combined <- readRDS(data_combined_path)
 spot_combined <- read_csv(spot_combined_path, show_col_types = FALSE)
 
-# index_comp <- read_csv(index_comp_path, show_col_types = FALSE)
-
 # plan(multisession, workers = availableCores() - 1)
 
 # symbols <- foreach(
@@ -75,21 +74,22 @@ spot_combined <- read_csv(spot_combined_path, show_col_types = FALSE)
 
 # plan(sequential)
 
-# symbols <- c(
-#   "300720", "001301", "688766", "688656", "688122", "301018", "300450", "600703", "301069", "300946", "600562", "300455", "300857", "688099", "603893", "300885", "688608", "301291", "688027", "300757", "301308", "002384", "600114", "688120", "688709", "300827", "688472", "688249", "300660", "688012", "002850", "002518", "601231", "688525", "300408", "002558", "688256", "688002", "300655", "688210", "688670", "688559", "688170", "688234", "300316", "301488", "300019", "688160", "300652", "300037", "002008", "300378", "301207", "600711", "600863", "300516", "688200", "301606", "688196", "603530", "688128", "605008", "688172", "600483", "601869", "688409", "688599", "300446", "301010", "301117", "688333", "688256", "688041", "688709", "603893", "688018", "688099", "688608", "688591", "301308", "603019", "300857", "688072", "688012", "002371", "688234", "300316", "300475", "600703", "600330", "300655", "603650", "300398", "002384", "300308", "300502", "000988", "002281", "300620", "688027", "300450", "688499", "688155", "688411", "300274", "300827", "605117", "688472", "688676", "300037", "002407", "301358", "300073", "300080", "002050", "601689", "300660", "603009", "300100", "300580", "300652", "002896", "002472", "603728", "688160", "002008", "300946", "002850", "300953", "603662", "688322", "688400", "301076", "688716", "600114", "688210", "300885", "600392", "600111", "000831", "300748", "600366", "000970", "300127", "600206", "300618", "603799", "000603", "000737", "300199", "688117", "688235", "688131", "688617", "688236", "301091", "688629", "688002", "300768", "688631", "301236", "300339", "300378"
-# )
-
-symbols <- c("688790", "002261", "688608", "688472", "688411")
+symbols <- c(
+  pull(read_csv(index_comp_path, show_col_types = FALSE), symbol),
+  readLines(watchlist_path)
+) %>%
+  unique() %>%
+  sort()
 
 for (symbol in symbols) {
   print(symbol)
   image_path <- paste0(backtest_dir, symbol, ".png")
   data <- data_combined[[symbol]] %>%
-    filter(date >= last_td %m-% years(2) & date <= last_td)
+    filter(date >= ymd(20250101) & date <= last_td - 1)
   name <- pull(filter(spot_combined, symbol == !!symbol), name)
   plot <- plot_indicators(data, plot_title = paste0(symbol, " - ", name))
-  print(plot)
-  # ggsave(image_path, plot)
+  # print(plot)
+  suppressMessages(ggsave(image_path, plot))
 }
 
 # MARKET ANALYSIS ==============================================================
