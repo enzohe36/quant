@@ -21,9 +21,9 @@ resources_dir <- "resources/"
 index_comp_path <- paste0(resources_dir, "index_comp.csv")
 watchlist_path <- paste0(resources_dir, "watchlist.txt")
 
-backtest_dir <- "backtest/"
+analysis_dir <- "analysis/"
 
-logs_dir <- paste0(backtest_dir, "logs/")
+logs_dir <- paste0(analysis_dir, "logs/")
 log_path <- paste0(logs_dir, format(now(), "%Y%m%d_%H%M%S"), ".log")
 
 last_td <- eval(last_td_expr)
@@ -50,29 +50,11 @@ filter_index_comp <- function(data) {
 
 # STOCK ANALYSIS ===============================================================
 
-dir.create(backtest_dir)
+dir.create(analysis_dir)
 dir.create(logs_dir)
 
 data_combined <- readRDS(data_combined_path)
 spot_combined <- read_csv(spot_combined_path, show_col_types = FALSE)
-
-# plan(multisession, workers = availableCores() - 1)
-
-# symbols <- foreach(
-#   data = data_combined %>% .[names(.) %in% index_comp$symbol],
-#   .combine = "c"
-# ) %dofuture% {
-#   filter(
-#     data,
-#     date == !!last_td &
-#       buy &
-#       mc_quarter >= 10^10 &
-#       mc_quarter / np_deduct >= 0 & mc_quarter / np_deduct <= 300
-#   ) %>%
-#     pull(symbol)
-# }
-
-# plan(sequential)
 
 symbols <- c(
   pull(read_csv(index_comp_path, show_col_types = FALSE), symbol),
@@ -81,16 +63,45 @@ symbols <- c(
   unique() %>%
   sort()
 
-for (symbol in symbols) {
-  print(symbol)
-  image_path <- paste0(backtest_dir, symbol, ".png")
-  data <- data_combined[[symbol]] %>%
-    filter(date >= ymd(20250101) & date <= last_td - 1)
-  name <- pull(filter(spot_combined, symbol == !!symbol), name)
+plan(multisession, workers = availableCores() - 1)
+
+symbols_filtered <- foreach(
+  data = data_combined %>% .[names(.) %in% symbols],
+  .combine = "c"
+) %dofuture% {
+  data <- filter(
+    data,
+    date == !!last_td,
+    mc_quarter >= 5 * 10^9,
+    mc_quarter / np_deduct > 0 & mc_quarter / np_deduct <= 300,
+    close >= 20,
+    close / run_min(close, 20) <= 1.3
+  )
+  if (nrow(data) == 0) return(NULL)
+  return(data$symbol)
+}
+
+count <- foreach(
+  data = data_combined %>% .[names(.) %in% symbols_filtered],
+  .combine = "c"
+) %dofuture% {
+  vars <- c("image_path", "name", "plot", "symbol")
+  rm(list = vars)
+
+  data <- filter(data, date >= ymd(20250101))
+  symbol <- first(data$symbol)
+  image_path <- paste0(analysis_dir, symbol, ".png")
+  name <- filter(spot_combined, symbol == !!symbol)$name
   plot <- plot_indicators(data, plot_title = paste0(symbol, " - ", name))
   # print(plot)
   suppressMessages(ggsave(image_path, plot))
-}
+  return(1)
+} %>%
+  sum()
+
+plan(sequential)
+
+tsprint(str_glue("Generated {count} stock analysis plots."))
 
 # MARKET ANALYSIS ==============================================================
 

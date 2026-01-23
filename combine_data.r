@@ -21,9 +21,9 @@ val_dir <- paste0(data_dir, "val/")
 
 data_combined_path <- paste0(data_dir, "data_combined.rds")
 
-backtest_dir <- "backtest/"
+analysis_dir <- "analysis/"
 
-logs_dir <- paste0(backtest_dir, "logs/")
+logs_dir <- paste0(analysis_dir, "logs/")
 log_path <- paste0(logs_dir, format(now(), "%Y%m%d_%H%M%S"), ".log")
 
 zero_threshold <- 0.05
@@ -39,17 +39,20 @@ price_rms_low <- -1
 
 # MAIN SCRIPT ==================================================================
 
-dir.create(backtest_dir)
+dir.create(analysis_dir)
 dir.create(logs_dir)
 
 quarters_start <- unique(quarter(all_td, "date_first"))
 quarters_start_td <- as_tradeday(quarters_start)
 quarters_end <- quarters_start - 1
 
+symbols <- str_remove(list.files(hist_dir), "\\.csv$")
+tsprint(str_glue("Found {length(symbols)} stock histories."))
+
 plan(multisession, workers = availableCores() - 1)
 
 data_combined <- foreach(
-  symbol = str_remove(list.files(hist_dir), "\\.csv$"),
+  symbol = symbols,
   .combine = "c"
 ) %dofuture% {
   vars <- c(
@@ -139,7 +142,7 @@ data_combined <- foreach(
       mutate(
         across(
           c(mc, to),
-          ~ c(rep(NaN, n() - 1), mean(.x)),
+          ~ c(rep(NA_real_, n() - 1), mean(.x)),
           .names = "{col}_quarter"
         )
       ) %>%

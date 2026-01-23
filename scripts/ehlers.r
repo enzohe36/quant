@@ -94,7 +94,6 @@ calculate_oscillator <- function(
   smoothing_length = 5,
   fast_length = 20,
   slow_length = 50,
-  atr_length = 20,
   hue_multiplier = 100
 ) {
   close <- data$close
@@ -105,10 +104,11 @@ calculate_oscillator <- function(
   fast_ma <- ema_na(smoothed_price, fast_length)
   slow_ma <- ema_na(smoothed_price, slow_length)
 
-  atr <- as.numeric(atr_na(hlc, atr_length)[, "atr"])
-  smoothed_atr <- supersmoother(replace_missing(atr, 0), smoothing_length)
+  atr <- as.numeric(atr_na(hlc, 20)[, "atr"]) %>%
+    replace_na(0) %>%
+    supersmoother(smoothing_length)
 
-  oscillator <- (fast_ma - slow_ma) / smoothed_atr
+  oscillator <- (fast_ma - slow_ma) / atr
   signal_line <- ema_na(oscillator, 25)
 
   osc_d1 <- momentum(oscillator)
@@ -123,7 +123,7 @@ calculate_oscillator <- function(
 
   result <- data.frame(
     date = data$date,
-    atr = smoothed_atr,
+    atr = atr,
     oscillator = oscillator,
     signal_line = signal_line,
     hue = hue
@@ -545,7 +545,7 @@ plot_indicators <- function(data, plot_title = "Indicator Plot") {
     ) +
     geom_ribbon(
       aes(ymin = lower_bound, ymax = upper_bound),
-      fill = NA, color = "black", linewidth = 0.5
+      fill = NA, color = "black", linetype = "dotted", linewidth = 0.5
     ) +
     geom_line(
       aes(y = kama),
@@ -585,7 +585,6 @@ plot_indicators <- function(data, plot_title = "Indicator Plot") {
       axis.text.x = element_blank(),
       axis.ticks.x = element_blank(),
       panel.grid.minor = element_blank(),
-      panel.grid.major.x = element_line(color = "gray80"),
       plot.title = element_text(
         hjust = 0.5, face = "bold", margin = margin(0, 0, 0, 0)
       ),
@@ -647,7 +646,6 @@ plot_indicators <- function(data, plot_title = "Indicator Plot") {
       axis.text.x = element_blank(),
       axis.ticks.x = element_blank(),
       panel.grid.minor = element_blank(),
-      panel.grid.major.x = element_line(color = "gray80"),
       legend.position = "top",
       legend.justification = "center",
       legend.direction = "horizontal",
@@ -695,7 +693,6 @@ plot_indicators <- function(data, plot_title = "Indicator Plot") {
     theme_minimal() +
     theme(
       panel.grid.minor = element_blank(),
-      panel.grid.major.x = element_line(color = "gray80"),
       legend.position = "top",
       legend.justification = "center",
       legend.direction = "horizontal",

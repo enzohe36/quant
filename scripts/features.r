@@ -16,7 +16,7 @@ calculate_avg_cost <- function(avg_price, to) {
 }
 
 normalize <- function(x, n_bins = NULL, plot = TRUE, silent = FALSE) {
-  x <- replace_missing(x, NaN)
+  x <- replace_missing(x, NA_real_)
   if (is.null(n_bins)) n_bins <- ceiling(sqrt(length(na.omit(x))))
 
   # Calculate probability histogram

@@ -63,10 +63,14 @@ get_indices <- function() {
   aktools("index_stock_info") %>%
     mutate(
       date = !!curr_td,
-      source = "csi",
+      source = case_when(
+        str_detect(index_code, "^0") ~ "csi",
+        str_detect(index_code, "^3") ~ "cni",
+        TRUE ~ NA_character_
+      ),
       index = index_code,
       index_name = display_name,
-      stock_count = NA
+      stock_count = NA_integer_
     ) %>%
     select(date, source, index, index_name, stock_count) %>%
     arrange(index)
@@ -114,44 +118,74 @@ combine_indices <- function() {
     arrange(index)
 }
 
-# http://www.csindex.com.cn/zh-CN/indices/index-detail/000300
 get_index_comp <- function(index) {
-  index <- filter(indices, index == !!index)
   curr_td <- eval(curr_td_expr)
-  if (index$source == "csi") {
-    # 日期 指数代码 指数名称 指数英文名称 成分券代码 成分券名称 成分券英文名称 交易所
-    # 交易所英文名称 权重
-    data <- aktools(
-      key = "index_stock_cons_weight_csindex",
-      symbol = index$index
+  # 品种代码 品种名称 纳入日期
+  aktools(
+    key = "index_stock_cons",
+    symbol = index
+  ) %>%
+    mutate(
+      date = !!curr_td,
+      symbol = `品种代码`,
+      name = `品种名称`,
+      weight = NA_real_
     ) %>%
-      mutate(
-        date = !!curr_td,
-        index = !!index$index,
-        index_name = !!index$index_name,
-        symbol = `成分券代码`,
-        name = `成分券名称`,
-        weight = as.numeric(`权重`)
-      )
-  } else if (index$source == "cni") {
-    # 日期 样本代码 样本简称 所属行业 总市值 权重
-    data <- aktools(
-      key = "index_detail_cni",
-      symbol = index$index
+    select(date, symbol, name, weight) %>%
+    arrange(desc(weight), symbol)
+}
+
+get_index_comp_csi <- function(index) {
+  curr_td <- eval(curr_td_expr)
+  # 日期 指数代码 指数名称 指数英文名称 成分券代码 成分券名称 成分券英文名称 交易所
+  # 交易所英文名称 权重
+  aktools(
+    key = "index_stock_cons_weight_csindex",
+    symbol = index
+  ) %>%
+    mutate(
+      date = !!curr_td,
+      symbol = `成分券代码`,
+      name = `成分券名称`,
+      weight = as.numeric(`权重`)
     ) %>%
-      filter(`日期` == max(`日期`)) %>%
-      mutate(
-        date = !!curr_td,
-        index = !!index$index,
-        index_name = !!index$index_name,
-        symbol = `样本代码`,
-        name = `样本简称`,
-        weight = as.numeric(`权重`)
-      )
+    select(date, symbol, name, weight) %>%
+    arrange(desc(weight), symbol)
+}
+
+get_index_comp_cni <- function(index) {
+  curr_td <- eval(curr_td_expr)
+  # 日期 样本代码 样本简称 所属行业 总市值 权重
+  aktools(
+    key = "index_detail_cni",
+    symbol = index
+  ) %>%
+    filter(`日期` == max(`日期`)) %>%
+    mutate(
+      date = !!curr_td,
+      symbol = `样本代码`,
+      name = `样本简称`,
+      weight = as.numeric(`权重`)
+    ) %>%
+    select(date, symbol, name, weight) %>%
+    arrange(desc(weight), symbol)
+}
+
+# http://www.csindex.com.cn/zh-CN/indices/index-detail/000300
+combine_index_comp <- function(index) {
+  index <- filter(indices, index == !!index)
+  if (isTRUE(index$source == "csi")) {
+    data <- loop_function("get_index_comp_csi", index$index)
+  } else if (isTRUE(index$source == "cni")) {
+    data <- loop_function("get_index_comp_cni", index$index)
   }
   data %>%
+    mutate(
+      index = !!index$index,
+      index_name = !!index$index_name
+    ) %>%
     select(date, index, index_name, symbol, name, weight) %>%
-    arrange(desc(weight), symbol)
+    filter(str_detect(symbol, "^(0|3|6)"))
 }
 
 # https://quote.eastmoney.com/center/gridlist.html#hs_a_board

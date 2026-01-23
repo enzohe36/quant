@@ -42,6 +42,8 @@ run_sum <- function(x, n) {
   )
 }
 
+run_mean <- function(x, n) run_sum(x, n) / n
+
 run_min <- function(x, n) {
   sapply(
     seq_along(x),
@@ -75,8 +77,7 @@ ema_na <- function(x, n = 10, ...) {
 }
 
 atr_na <- function(HLC, n = 14, ...) {
-  complete_rows <- complete.cases(HLC)
-  first_complete <- which(complete_rows)[1]
+  first_non_na <- which(complete.cases(HLC))[1]
   num_rows <- nrow(HLC)
   result <- data.frame(
     tr = rep(NA, num_rows),
@@ -84,14 +85,12 @@ atr_na <- function(HLC, n = 14, ...) {
     truehigh = rep(NA, num_rows),
     truelow = rep(NA, num_rows)
   )
-  if (isTRUE(num_rows - first_complete + 1 > n)) {
-    atr_values <- ATR(HLC[first_complete:num_rows, ], n = n, ...)
-    result[first_complete:num_rows, ] <- atr_values
+  if (isTRUE(num_rows - first_non_na + 1 > n)) {
+    result[first_non_na:num_rows, ] <-
+      ATR(HLC[first_non_na:num_rows, ], n = n, ...)
   }
   return(result)
 }
-
-run_mean <- function(x, n) run_sum(x, n) / n
 
 replace_missing <- function(x, replacement) {
   x[is.infinite(x) | is.na(x)] <- replacement
