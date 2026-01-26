@@ -1,30 +1,53 @@
-library(keras)
+# Dual DQN Trading Agent Training
+# Trains on multiple stocks with pattern analysis
+
 library(tensorflow)
+library(reticulate)
 library(quantmod)
 library(TTR)
-library(R6)
 
-# Download and prepare data
-getSymbols("AAPL", from = "2018-01-01", to = "2023-12-31")
-prices <- Cl(AAPL)
+cat("Dual DQN Training (Multiple Stocks)\n")
+cat(strrep("=", 80), "\n\n")
 
-# Create features
+# Load Python DQN module
+cat("Loading DQN module...\n")
+tf_config()
+py_run_file("scripts/dqn.py")
+
+# Create models directory
+if (!dir.exists("models")) {
+  dir.create("models")
+  cat("Created models/ directory\n")
+}
+
+# Configuration
+tickers <- c("AAPL", "GOOGL", "MSFT", "TSLA")
+initial_balance <- 1000000
+buy_probability <- 0.01
+median_hold <- 20
+short_wait_penalty <- 0.01
+
+cat(sprintf("\nTraining configuration:\n"))
+cat(sprintf("  Stocks: %s\n", paste(tickers, collapse=", ")))
+cat(sprintf("  Initial balance: $%s\n", format(initial_balance, big.mark=",", scientific=FALSE)))
+cat(sprintf("  Buy probability: %.1f%%\n", buy_probability * 100))
+cat(sprintf("  Target hold: %d days\n", median_hold))
+cat(sprintf("  Short wait penalty: %.2f per step\n\n", short_wait_penalty))
+
+# Feature creation function
 create_features <- function(prices) {
   returns_1 <- ROC(prices, n = 1)
   returns_5 <- ROC(prices, n = 5)
   returns_20 <- ROC(prices, n = 20)
-
   sma_5 <- SMA(prices, n = 5)
   sma_20 <- SMA(prices, n = 20)
   sma_50 <- SMA(prices, n = 50)
-
   rsi <- RSI(prices, n = 14)
   macd_obj <- MACD(prices, nFast = 12, nSlow = 26, nSig = 9)
   bb <- BBands(prices, n = 20, sd = 2)
-
   volatility <- runSD(returns_1, n = 20)
-
-  features <- data.frame(
+  
+  data.frame(
     price = as.numeric(prices),
     returns_1 = as.numeric(returns_1),
     returns_5 = as.numeric(returns_5),
@@ -38,442 +61,212 @@ create_features <- function(prices) {
     bb_upper = as.numeric(bb[, "up"] / prices),
     bb_lower = as.numeric(bb[, "dn"] / prices),
     volatility = as.numeric(volatility)
-  )
-
-  return(na.omit(features))
+  ) |> na.omit()
 }
 
-features <- create_features(prices)
+normalize <- function(x) (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
 
-# Normalize features
-normalize <- function(x) {
-  (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
-}
+# Download and prepare all stocks
+cat("Downloading stock data (2018-2023)...\n")
+all_train_data <- list()
+all_test_data <- list()
 
-for (col in names(features)) {
-  if (col != "price") {
-    features[[col]] <- normalize(features[[col]])
+for (ticker in tickers) {
+  cat(sprintf("  %s...", ticker))
+  getSymbols(ticker, from = "2018-01-01", to = "2023-12-31", auto.assign = TRUE)
+  prices <- Cl(get(ticker))
+  
+  features <- create_features(prices)
+  
+  for (col in names(features)) {
+    if (col != "price") features[[col]] <- normalize(features[[col]])
   }
+  
+  train_size <- floor(0.8 * nrow(features))
+  all_train_data[[ticker]] <- as.matrix(features[1:train_size, ])
+  all_test_data[[ticker]] <- as.matrix(features[(train_size + 1):nrow(features), ])
+  
+  cat(sprintf(" %d train / %d test days\n", nrow(all_train_data[[ticker]]), nrow(all_test_data[[ticker]])))
 }
 
-# DQN Model Creation
-create_dqn_model <- function(state_size, action_size, learning_rate = 0.001) {
-  inputs <- layer_input(shape = c(state_size), name = "state_input")
+cat("\n")
 
-  x <- inputs %>%
-    layer_dense(units = 128, activation = 'relu', name = "dense_1") %>%
-    layer_dropout(rate = 0.2, name = "dropout_1") %>%
-    layer_dense(units = 64, activation = 'relu', name = "dense_2") %>%
-    layer_dropout(rate = 0.2, name = "dropout_2") %>%
-    layer_dense(units = 32, activation = 'relu', name = "dense_3")
+# Calculate total training days across all stocks
+total_train_days <- sum(sapply(all_train_data, nrow))
+cat(sprintf("Total training days: %d\n\n", total_train_days))
 
-  outputs <- x %>%
-    layer_dense(units = action_size, activation = 'linear', name = "q_values")
+# State size
+state_size <- ncol(all_train_data[[1]]) - 1 + 3
 
-  model <- keras_model(inputs = inputs, outputs = outputs)
+# Calculate hyperparameters
+train_days <- total_train_days
+calculated_envs <- 2 * sqrt(train_days / 100)
+num_envs <- 2^round(log2(calculated_envs))
+num_envs <- max(32, min(64, num_envs))  # Increased from 8-64 to 32-64
 
-  model$compile(
-    optimizer = optimizer_adam(learning_rate = learning_rate),
-    loss = 'mse'
-  )
+cat(sprintf("Environments: %d\n", num_envs))
 
-  return(model)
+mu <- log(median_hold)
+avg_hold_duration <- exp(mu + 0.5^2 / 2)
+estimated_trades_per_env <- (train_days * buy_probability) / avg_hold_duration
+estimated_trades_per_episode <- estimated_trades_per_env * num_envs
+
+min_episodes <- ceiling((3 * train_days) / (num_envs * estimated_trades_per_env))
+max_episodes <- ceiling((5 * train_days) / (num_envs * estimated_trades_per_env))
+optimal_episodes <- ceiling((min_episodes + max_episodes) / 2)
+optimal_episodes <- max(30, min(100, optimal_episodes))
+
+buffer_size <- 25 * estimated_trades_per_episode
+buffer_size <- max(10000, min(50000, buffer_size))
+
+cat(sprintf("Episodes: %d\n", optimal_episodes))
+cat(sprintf("Buffer size: %d\n\n", buffer_size))
+
+# Prepare training data as list of (name, data) tuples for Python
+train_data_list <- list()
+for (ticker in tickers) {
+  train_data_list[[length(train_data_list) + 1]] <- tuple(ticker, all_train_data[[ticker]])
 }
 
-# Experience Replay Buffer
-ReplayBuffer <- R6Class(
-  "ReplayBuffer",
-  public = list(
-    capacity = NULL,
-    buffer = NULL,
-    position = 0,
+# Train
+cat("Starting training...\n")
+cat("Note: Incomplete trades at stock boundaries are discarded\n")
+cat("Note: Buying within median_hold after selling incurs penalty\n")
+cat(strrep("-", 80), "\n")
 
-    initialize = function(capacity = 10000) {
-      self$capacity <- as.integer(capacity)
-      self$buffer <- list()
-    },
+t0 <- Sys.time()
+results <- py$train_dual_dqn(
+  train_data_list = train_data_list,
+  state_size = as.integer(state_size),
+  episodes = as.integer(optimal_episodes),
+  num_envs = as.integer(num_envs),
+  buffer_size = as.integer(buffer_size),
+  buy_probability = buy_probability,
+  median_hold = as.integer(median_hold),
+  initial_balance = initial_balance,
+  short_wait_penalty = short_wait_penalty
+)
+t1 <- Sys.time()
 
-    push = function(state, action, reward, next_state, done) {
-      experience <- list(
-        state = state,
-        action = action,
-        reward = reward,
-        next_state = next_state,
-        done = done
-      )
+cat(strrep("-", 80), "\n")
+training_time <- as.numeric(difftime(t1, t0, units = "secs"))
+cat(sprintf("Training complete (%.1f sec)\n", training_time))
+cat(sprintf("Buy exp: %d | Sell exp: %d\n\n", 
+            length(results$agent$buy_memory), 
+            length(results$agent$sell_memory)))
 
-      if (length(self$buffer) < self$capacity) {
-        self$buffer <- c(self$buffer, list(experience))
-      } else {
-        self$position <- (self$position %% self$capacity) + 1
-        self$buffer[[self$position]] <- experience
-      }
-    },
+# Test on portfolio of all stocks
+cat("Testing on multi-stock portfolio...\n")
+cat(strrep("=", 80), "\n\n")
 
-    sample = function(batch_size) {
-      batch_size <- as.integer(batch_size)
-      indices <- sample(1:length(self$buffer), min(batch_size, length(self$buffer)))
-      self$buffer[indices]
-    },
+# Prepare test data dict
+test_data_dict <- list()
+for (ticker in tickers) {
+  test_data_dict[[ticker]] <- all_test_data[[ticker]]
+}
 
-    size = function() {
-      length(self$buffer)
-    }
-  )
+# Run portfolio test
+test_results <- py$test_dual_dqn_portfolio(
+  test_data_dict = test_data_dict,
+  agent = results$agent,
+  initial_balance = initial_balance
 )
 
-# CORRECTED: DQN Agent with fixed history access
-DQNAgent <- R6Class(
-  "DQNAgent",
-  public = list(
-    state_size = NULL,
-    action_size = NULL,
-    model = NULL,
-    target_model = NULL,
-    memory = NULL,
-    gamma = 0.95,
-    epsilon = 1.0,
-    epsilon_min = 0.01,
-    epsilon_decay = 0.995,
-    learning_rate = 0.001,
-    update_target_freq = 10,
-    train_step = 0,
-
-    initialize = function(state_size, action_size) {
-      self$state_size <- as.integer(state_size)
-      self$action_size <- as.integer(action_size)
-      self$memory <- ReplayBuffer$new(capacity = 10000)
-      self$model <- create_dqn_model(state_size, action_size, self$learning_rate)
-      self$target_model <- create_dqn_model(state_size, action_size, self$learning_rate)
-      self$update_target_network()
-    },
-
-    update_target_network = function() {
-      self$target_model$set_weights(self$model$get_weights())
-    },
-
-    remember = function(state, action, reward, next_state, done) {
-      self$memory$push(state, action, reward, next_state, done)
-    },
-
-    act = function(state) {
-      if (runif(1) <= self$epsilon) {
-        return(as.integer(sample(1:self$action_size, 1)))
-      }
-
-      state_matrix <- array(as.numeric(state), dim = c(1, length(state)))
-      q_values <- self$model$predict(state_matrix, verbose = 0)
-      return(as.integer(which.max(q_values[1, ])))
-    },
-
-    replay = function(batch_size = 32) {
-      batch_size <- as.integer(batch_size)
-
-      if (self$memory$size() < batch_size) {
-        return(NULL)
-      }
-
-      minibatch <- self$memory$sample(batch_size)
-
-      states <- do.call(rbind, lapply(minibatch, function(x) as.numeric(x$state)))
-      next_states <- do.call(rbind, lapply(minibatch, function(x) as.numeric(x$next_state)))
-
-      states <- array(as.numeric(states), dim = dim(states))
-      next_states <- array(as.numeric(next_states), dim = dim(next_states))
-
-      q_values <- self$model$predict(states, verbose = 0)
-      next_q_values <- self$target_model$predict(next_states, verbose = 0)
-
-      for (i in 1:length(minibatch)) {
-        exp <- minibatch[[i]]
-        target <- as.numeric(exp$reward)
-
-        if (!exp$done) {
-          target <- as.numeric(exp$reward) + self$gamma * max(next_q_values[i, ])
-        }
-
-        q_values[i, exp$action] <- target
-      }
-
-      q_values <- array(as.numeric(q_values), dim = dim(q_values))
-
-      # CORRECTED: Access history correctly
-      history <- self$model$fit(
-        x = states,
-        y = q_values,
-        epochs = as.integer(1),
-        verbose = 0,
-        batch_size = batch_size
-      )
-
-      # CORRECTED: Access loss from history$history$loss
-      loss <- NULL
-      tryCatch({
-        # Try different ways to access loss based on Keras version
-        if (!is.null(history$history)) {
-          loss <- tail(history$history$loss, 1)
-        } else if (!is.null(history$metrics)) {
-          loss <- history$metrics$loss
-        }
-      }, error = function(e) {
-        loss <- NA
-      })
-
-      # Decay epsilon
-      if (self$epsilon > self$epsilon_min) {
-        self$epsilon <- self$epsilon * self$epsilon_decay
-      }
-
-      # Update target network periodically
-      self$train_step <- self$train_step + 1
-      if (self$train_step %% self$update_target_freq == 0) {
-        self$update_target_network()
-      }
-
-      return(loss)
-    },
-
-    save_model = function(filepath) {
-      self$model$save(filepath)
-    },
-
-    load_model = function(filepath) {
-      self$model <- load_model_tf(filepath)
-      self$update_target_network()
-    }
-  )
+# Calculate buy-and-hold benchmark
+buyhold_results <- py$calculate_buyhold_portfolio(
+  test_data_dict = test_data_dict,
+  initial_balance = initial_balance
 )
 
-# Trading Environment
-TradingEnvironment <- R6Class(
-  "TradingEnvironment",
-  public = list(
-    data = NULL,
-    current_step = 0,
-    initial_balance = 10000,
-    balance = 10000,
-    shares = 0,
-    position = 0,
-    transaction_cost = 0.001,
-    max_steps = NULL,
+# Calculate returns
+portfolio_vals <- unlist(test_results$portfolio_values)
+buyhold_vals <- unlist(buyhold_results$portfolio_values)
 
-    initialize = function(data, initial_balance = 10000) {
-      self$data <- data
-      self$initial_balance <- initial_balance
-      self$balance <- initial_balance
-      self$max_steps <- as.integer(nrow(data) - 1)
-    },
+final_dqn <- as.numeric(tail(portfolio_vals, 1))
+final_buyhold <- as.numeric(tail(buyhold_vals, 1))
 
-    reset = function() {
-      self$current_step <- as.integer(1)
-      self$balance <- self$initial_balance
-      self$shares <- 0
-      self$position <- 0
-      return(self$get_state())
-    },
+dqn_return <- (final_dqn - initial_balance) / initial_balance
+buyhold_return <- (final_buyhold - initial_balance) / initial_balance
 
-    get_state = function() {
-      current_features <- as.numeric(self$data[self$current_step, -1])
-      portfolio_features <- c(
-        self$position,
-        self$shares * self$data$price[self$current_step] / self$initial_balance,
-        self$balance / self$initial_balance
-      )
-      return(as.numeric(c(current_features, portfolio_features)))
-    },
+cat("PORTFOLIO RESULTS:\n")
+cat(strrep("-", 80), "\n")
+cat(sprintf("Initial:     $%s\n", format(initial_balance, big.mark=",", scientific=FALSE)))
+cat(sprintf("DQN Final:   $%s (%+.2f%%)\n", format(round(final_dqn), big.mark=",", scientific=FALSE), 
+            dqn_return * 100))
+cat(sprintf("B&H Final:   $%s (%+.2f%%)\n", format(round(final_buyhold), big.mark=",", scientific=FALSE),
+            buyhold_return * 100))
+cat(sprintf("Outperformance: %+.2f%%\n", (dqn_return - buyhold_return) * 100))
+cat(strrep("-", 80), "\n\n")
 
-    step = function(action) {
-      current_price <- self$data$price[self$current_step]
-      next_price <- self$data$price[self$current_step + 1]
+# Pattern analysis on AAPL
+cat("Running pattern analysis on AAPL...\n")
+buy_patterns <- py$analyze_buy_patterns(results$agent, all_test_data[["AAPL"]], initial_balance)
+sell_patterns <- py$analyze_sell_patterns(results$agent, all_test_data[["AAPL"]], initial_balance)
+py$print_pattern_analysis(buy_patterns, sell_patterns)
 
-      reward <- 0
+# Plots
+cat("Generating plots...\n\n")
 
-      if (action == 1 && self$position == 0) {
-        # Buy
-        self$shares <- floor(self$balance / (current_price * (1 + self$transaction_cost)))
-        cost <- self$shares * current_price * (1 + self$transaction_cost)
-        self$balance <- self$balance - cost
-        self$position <- 1
+# Plot 1: Training progress
+training_values <- unlist(results$values)
+plot(1:length(training_values), training_values, type = 'l', col = 'darkgreen', lwd = 2,
+     main = "Training Progress: Portfolio Value",
+     xlab = "Episode", ylab = "Portfolio Value ($)")
+abline(h = initial_balance, col = 'gray', lty = 2)
 
-      } else if (action == 2 && self$position == 1) {
-        # Sell
-        proceeds <- self$shares * current_price * (1 - self$transaction_cost)
-        self$balance <- self$balance + proceeds
-        self$shares <- 0
-        self$position <- 0
-      }
+# Plot 2: Portfolio performance comparison
+test_steps <- 1:length(portfolio_vals)
+plot(test_steps, portfolio_vals, type = 'l', col = 'blue', lwd = 2,
+     main = "Portfolio Performance: DQN vs Buy-and-Hold",
+     xlab = "Time Steps", ylab = "Portfolio Value ($)",
+     ylim = c(min(portfolio_vals, buyhold_vals) * 0.95,
+              max(portfolio_vals, buyhold_vals) * 1.05))
+lines(test_steps, buyhold_vals, col = 'red', lwd = 2)
+abline(h = initial_balance, col = 'gray', lty = 2)
 
-      self$current_step <- self$current_step + 1
+legend("topleft",
+       legend = c(
+         sprintf("DQN: %+.2f%%", dqn_return * 100),
+         sprintf("Buy & Hold: %+.2f%%", buyhold_return * 100),
+         "Initial"
+       ),
+       col = c("blue", "red", "gray"),
+       lty = c(1, 1, 2),
+       lwd = c(2, 2, 1),
+       bg = "white")
 
-      current_portfolio_value <- self$balance + self$shares * next_price
-      previous_portfolio_value <- self$initial_balance
+# Plot 3: Normalized comparison
+portfolio_norm <- (portfolio_vals / portfolio_vals[1]) * 100
+buyhold_norm <- (buyhold_vals / buyhold_vals[1]) * 100
 
-      if (self$current_step > 1) {
-        previous_portfolio_value <- self$balance + self$shares * current_price
-      }
+plot(test_steps, portfolio_norm, type = 'l', col = 'blue', lwd = 2,
+     main = "Portfolio Performance (Normalized to 100)",
+     xlab = "Time Steps", ylab = "Normalized Value",
+     ylim = c(min(portfolio_norm, buyhold_norm) * 0.98,
+              max(portfolio_norm, buyhold_norm) * 1.02))
+lines(test_steps, buyhold_norm, col = 'red', lwd = 2)
+abline(h = 100, col = 'gray', lty = 2)
 
-      reward <- (current_portfolio_value - previous_portfolio_value) / previous_portfolio_value
+legend("topleft",
+       legend = c("DQN Strategy", "Buy & Hold", "Starting Point"),
+       col = c("blue", "red", "gray"),
+       lty = c(1, 1, 2),
+       lwd = c(2, 2, 1),
+       bg = "white")
 
-      done <- self$current_step >= self$max_steps
-      next_state <- self$get_state()
+cat("Plots displayed\n\n")
 
-      return(list(
-        next_state = next_state,
-        reward = as.numeric(reward),
-        done = done,
-        portfolio_value = current_portfolio_value
-      ))
-    },
+# Save models
+portfolio_k <- round(final_dqn / 1000)
 
-    get_portfolio_value = function() {
-      current_price <- self$data$price[self$current_step]
-      return(self$balance + self$shares * current_price)
-    }
-  )
-)
+buy_path <- sprintf("models/buy_%dk.keras", portfolio_k)
+sell_path <- sprintf("models/sell_%dk.keras", portfolio_k)
 
-# Training function
-train_dqn <- function(env, agent, episodes = 100, batch_size = 32) {
-  episodes <- as.integer(episodes)
-  batch_size <- as.integer(batch_size)
-  portfolio_values <- list()
+cat(sprintf("Saving models:\n"))
+cat(sprintf("  %s\n", buy_path))
+cat(sprintf("  %s\n", sell_path))
 
-  for (episode in 1:episodes) {
-    state <- env$reset()
-    total_reward <- 0
-    episode_values <- c()
-    step_count <- 0
+results$agent$buy_model$save(buy_path)
+results$agent$sell_model$save(sell_path)
 
-    while (TRUE) {
-      action <- agent$act(state)
-      result <- env$step(action)
-
-      agent$remember(state, action, result$reward, result$next_state, result$done)
-
-      state <- result$next_state
-      total_reward <- total_reward + result$reward
-      episode_values <- c(episode_values, result$portfolio_value)
-      step_count <- step_count + 1
-
-      if (result$done) {
-        break
-      }
-
-      if (agent$memory$size() > batch_size) {
-        agent$replay(batch_size)
-      }
-    }
-
-    portfolio_values[[episode]] <- episode_values
-    final_value <- tail(episode_values, 1)
-
-    cat(sprintf("Episode: %d/%d, Steps: %d, Final Portfolio: $%.2f, Return: %.2f%%, Epsilon: %.3f\n",
-                episode, episodes, step_count, final_value,
-                (final_value - env$initial_balance) / env$initial_balance * 100,
-                agent$epsilon))
-  }
-
-  return(portfolio_values)
-}
-
-# Test function
-test_agent <- function(env, agent) {
-  agent$epsilon <- 0
-  state <- env$reset()
-  portfolio_values <- c(env$initial_balance)
-  actions_taken <- c()
-
-  while (TRUE) {
-    action <- agent$act(state)
-    result <- env$step(action)
-
-    actions_taken <- c(actions_taken, action)
-    portfolio_values <- c(portfolio_values, result$portfolio_value)
-
-    state <- result$next_state
-
-    if (result$done) {
-      break
-    }
-  }
-
-  return(list(
-    portfolio_values = portfolio_values,
-    actions = actions_taken
-  ))
-}
-
-# Main execution
-cat("Preparing data...\n")
-train_size <- floor(0.8 * nrow(features))
-train_data <- features[1:train_size, ]
-test_data <- features[(train_size + 1):nrow(features), ]
-
-cat(sprintf("Training data: %d samples\n", nrow(train_data)))
-cat(sprintf("Test data: %d samples\n", nrow(test_data)))
-
-cat("\nInitializing environment and agent...\n")
-state_size <- ncol(train_data) - 1 + 3
-action_size <- 3
-
-cat(sprintf("State size: %d\n", state_size))
-cat(sprintf("Action size: %d\n", action_size))
-
-env <- TradingEnvironment$new(train_data)
-agent <- DQNAgent$new(state_size, action_size)
-
-cat("\nStarting training...\n")
-training_history <- train_dqn(env, agent, episodes = 50, batch_size = 32)
-
-cat("\nSaving model...\n")
-agent$save_model("dqn_trading_model")
-
-cat("\nTesting on unseen data...\n")
-test_env <- TradingEnvironment$new(test_data)
-test_results <- test_agent(test_env, agent)
-
-# Results
-initial_value <- test_env$initial_balance
-final_value <- tail(test_results$portfolio_values, 1)
-total_return <- (final_value - initial_value) / initial_value
-
-cat(sprintf("\n=== Test Results ===\n"))
-cat(sprintf("Initial Portfolio Value: $%.2f\n", initial_value))
-cat(sprintf("Final Portfolio Value: $%.2f\n", final_value))
-cat(sprintf("Total Return: %.2f%%\n", total_return * 100))
-
-buy_hold_return <- (test_data$price[nrow(test_data)] - test_data$price[1]) / test_data$price[1]
-cat(sprintf("Buy-and-Hold Return: %.2f%%\n", buy_hold_return * 100))
-
-# Action statistics
-action_counts <- table(test_results$actions)
-cat(sprintf("\nAction Distribution:\n"))
-cat(sprintf("  Buy:  %d (%.1f%%)\n",
-            ifelse(is.na(action_counts["1"]), 0, action_counts["1"]),
-            ifelse(is.na(action_counts["1"]), 0, action_counts["1"]/length(test_results$actions)*100)))
-cat(sprintf("  Sell: %d (%.1f%%)\n",
-            ifelse(is.na(action_counts["2"]), 0, action_counts["2"]),
-            ifelse(is.na(action_counts["2"]), 0, action_counts["2"]/length(test_results$actions)*100)))
-cat(sprintf("  Hold: %d (%.1f%%)\n",
-            ifelse(is.na(action_counts["3"]), 0, action_counts["3"]),
-            ifelse(is.na(action_counts["3"]), 0, action_counts["3"]/length(test_results$actions)*100)))
-
-# Plot results
-par(mfrow = c(2, 1))
-
-# Portfolio value over time
-plot(test_results$portfolio_values, type = 'l', col = 'blue', lwd = 2,
-     main = "DQN Trading Strategy - Portfolio Value",
-     xlab = "Time Steps", ylab = "Portfolio Value ($)")
-abline(h = initial_value, col = 'red', lty = 2)
-legend("topleft", legend = c("DQN Strategy", "Initial Value"),
-       col = c("blue", "red"), lty = c(1, 2), lwd = c(2, 1))
-
-# Actions over time
-plot(test_results$actions, type = 'p', pch = 20, col = 'darkgreen',
-     main = "Trading Actions Over Time",
-     xlab = "Time Steps", ylab = "Action (1=Buy, 2=Sell, 3=Hold)",
-     ylim = c(0.5, 3.5))
-abline(h = c(1, 2, 3), col = 'gray', lty = 3)
-
-par(mfrow = c(1, 1))
+cat("\nDone!\n")
