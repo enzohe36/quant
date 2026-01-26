@@ -2,6 +2,7 @@
 
 analysis/
 data/
+models/
 
 temp*
 old*

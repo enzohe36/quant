@@ -20,6 +20,9 @@ mc_dir <- paste0(data_dir, "mc/")
 val_dir <- paste0(data_dir, "val/")
 
 data_combined_path <- paste0(data_dir, "data_combined.rds")
+norm_params_path <- paste0(data_dir, "norm_params.rds")
+train_path <- paste0(data_dir, "train.rds")
+test_path <- paste0(data_dir, "test.rds")
 
 analysis_dir <- "analysis/"
 
@@ -36,6 +39,10 @@ osc_lookback <- 40
 max_osc_diff <- 1.9
 price_rms_high <- 1.5
 price_rms_low <- -1
+
+last_td <- eval(last_td_expr)
+train_start <- last_td %m-% years(3)
+test_start <- last_td %m-% years(1)
 
 # MAIN SCRIPT ==================================================================
 
@@ -195,3 +202,61 @@ plan(sequential)
 
 saveRDS(data_combined, data_combined_path)
 tsprint(str_glue("Combined {length(data_combined)} stocks."))
+
+plan(multisession, workers = availableCores() - 1)
+
+data_combined_filtered <- foreach(
+  data = data_combined,
+  .combine = "c"
+) %dofuture% {
+  data <- data %>%
+    mutate(price = lead(open)) %>%
+    generate_differences(
+      oscillator, price_rms, volume_rms,
+      n = c(1, 2, 3, 5, 8, 13, 21, 34, 55)
+    ) %>%
+    filter(date >= train_start) %>%
+    na.omit()
+
+  first_qualified <- which(
+    data$mc_quarter >= 5 * 10^9 &
+      data$mc_quarter <= 5 * 10^11 &
+      data$to_quarter >= 0.01 &
+      data$mc_quarter / data$np_deduct > 0 &
+      data$mc_quarter / data$np_deduct <= 300
+  ) %>%
+    min()
+  data <- filter(data, row_number() >= first_qualified)
+  if (nrow(data) == 0) {
+    return(NULL)
+  }
+  if (all(data$date >= test_start)) {
+    return(NULL)
+  }
+
+  data <- data %>%
+    select(
+      symbol, date, price,
+      starts_with("oscillator"),
+      starts_with("price_rms"),
+      starts_with("volume_rms")
+    )
+  return(list(data))
+} %>%
+  rbindlist()
+
+plan(sequential)
+
+train <- filter(
+  data_combined_filtered,
+  date >= train_start & date < test_start
+)
+test <- filter(
+  data_combined_filtered,
+  date >= test_start
+)
+saveRDS(train, train_path)
+saveRDS(test, test_path)
+
+tsprint(str_glue("Training set: {nrow(train)} rows."))
+tsprint(str_glue("Test set: {nrow(test)} rows."))
