@@ -19,10 +19,11 @@ adjust_dir <- paste0(data_dir, "adjust/")
 mc_dir <- paste0(data_dir, "mc/")
 val_dir <- paste0(data_dir, "val/")
 
+spot_combined_path <- paste0(data_dir, "spot_combined.csv")
+
 data_combined_path <- paste0(data_dir, "data_combined.rds")
-norm_params_path <- paste0(data_dir, "norm_params.rds")
-train_path <- paste0(data_dir, "train.rds")
-test_path <- paste0(data_dir, "test.rds")
+train_path <- paste0(data_dir, "train.csv")
+test_path <- paste0(data_dir, "test.csv")
 
 analysis_dir <- "analysis/"
 
@@ -41,13 +42,15 @@ price_rms_high <- 1.5
 price_rms_low <- -1
 
 last_td <- eval(last_td_expr)
-train_start <- last_td %m-% years(3)
+train_start <- last_td %m-% years(5)
 test_start <- last_td %m-% years(1)
 
 # MAIN SCRIPT ==================================================================
 
 dir.create(analysis_dir)
 dir.create(logs_dir)
+
+spot_combined <- read_csv(spot_combined_path, show_col_types = FALSE)
 
 quarters_start <- unique(quarter(all_td, "date_first"))
 quarters_start_td <- as_tradeday(quarters_start)
@@ -162,8 +165,8 @@ data_combined <- foreach(
       ) %>%
       fill(mc_quarter, to_quarter, .direction = "down") %>%
       select(
-        symbol, names(hist), avg_cost, mc, np, np_deduct, equity, revenue, cf,
-        quarter, mc_quarter, to_quarter
+        symbol, names(hist), avg_price, avg_cost, mc, np, np_deduct, equity,
+        revenue, cf, quarter, mc_quarter, to_quarter
       ),
     silent = TRUE
   )
@@ -210,36 +213,38 @@ data_combined_filtered <- foreach(
   .combine = "c"
 ) %dofuture% {
   data <- data %>%
-    mutate(price = lead(open)) %>%
-    generate_differences(
-      oscillator, price_rms, volume_rms,
-      n = c(1, 2, 3, 5, 8, 13, 21, 34, 55)
+    mutate(
+      price = avg_price,
+      mc_sma60 = run_mean(mc, 60),
+      to_sma60 = run_mean(to, 60),
+      close_geq_kama = as.numeric(close >= kama),
+      close_geq_avg_cost = as.numeric(close >= avg_cost),
+      low_geq_kama = as.numeric(low >= kama),
+      low_geq_avg_cost = as.numeric(low >= avg_cost),
+      high_geq_kama = as.numeric(high >= kama),
+      high_geq_avg_cost = as.numeric(high >= avg_cost),
+      kama = kama / atr,
+      avg_cost = avg_cost / atr,
+      delist = 0
     ) %>%
     filter(date >= train_start) %>%
     na.omit()
+  if (nrow(data) == 0) return(NULL)
 
-  first_qualified <- which(
-    data$mc_quarter >= 5 * 10^9 &
-      data$mc_quarter <= 5 * 10^11 &
-      data$to_quarter >= 0.01 &
-      data$mc_quarter / data$np_deduct > 0 &
-      data$mc_quarter / data$np_deduct <= 300
-  ) %>%
-    min()
-  data <- filter(data, row_number() >= first_qualified)
-  if (nrow(data) == 0) {
-    return(NULL)
-  }
-  if (all(data$date >= test_start)) {
-    return(NULL)
-  }
+  delist <- filter(spot_combined, symbol == unique(data$symbol)) %>%
+    pull(delist)
+  if (delist) data[nrow(data), "delist"] <- 1
 
   data <- data %>%
     select(
       symbol, date, price,
-      starts_with("oscillator"),
-      starts_with("price_rms"),
-      starts_with("volume_rms")
+      mc_sma60, to_sma60,
+      close_geq_kama, close_geq_avg_cost,
+      low_geq_kama, low_geq_avg_cost,
+      high_geq_kama, high_geq_avg_cost,
+      kama, avg_cost,
+      oscillator, price_rms, volume_rms,
+      delist
     )
   return(list(data))
 } %>%
@@ -255,8 +260,8 @@ test <- filter(
   data_combined_filtered,
   date >= test_start
 )
-saveRDS(train, train_path)
-saveRDS(test, test_path)
+write_csv(train, train_path)
+write_csv(test, test_path)
 
 tsprint(str_glue("Training set: {nrow(train)} rows."))
 tsprint(str_glue("Test set: {nrow(test)} rows."))
