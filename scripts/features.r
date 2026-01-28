@@ -27,6 +27,13 @@ run_max <- function(x, n) {
   )
 }
 
+run_any <- function(x, n) {
+  sapply(
+    seq_along(x),
+    function(i) if (i < n) NA_character_ else any(x[(i - n + 1):i])
+  )
+}
+
 cumsum_na <- function(x) {
   first_non_na <- which(!is.na(x))[1]
   result <- x
@@ -135,9 +142,9 @@ normalize <- function(x, n_bins = NULL, plot = TRUE, silent = FALSE) {
   # Print fitted parameters and transformation info
   if (!silent) {
     cat("Fitted Skewed Normal Parameters:\n")
-    cat(sprintf("  Location (ξ):     %.4f\n", xi))
-    cat(sprintf("  Scale (ω):        %.4f\n", omega))
-    cat(sprintf("  Shape/Skew (α):   %.4f\n", alpha))
+    cat(sprintf("  Location (xi):     %.4f\n", xi))
+    cat(sprintf("  Scale (omega):        %.4f\n", omega))
+    cat(sprintf("  Shape/Skew (alpha):   %.4f\n", alpha))
     cat("\nTransformation: Skewed Normal -> Standard Normal N(0,1)\n")
     cat(sprintf("Original skewness:    %.4f\n",
                 moments::skewness(x, na.rm = TRUE)))

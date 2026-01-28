@@ -111,69 +111,58 @@ class DualHeadLSTMDQN(nn.Module):
 
 
 # =============================================================================
-# REPLAY BUFFER (GPU-based for max speed)
+# REPLAY BUFFER (Index-based to save memory)
 # =============================================================================
 
-class GPUReplayBuffer:
-    """Replay buffer entirely on GPU - no CPU-GPU transfers during training"""
+class IndexReplayBuffer:
+    """Stores indices into shared data arrays instead of copying data"""
 
     def __init__(self, capacity: int):
         self.capacity = capacity
-        self.indices = torch.zeros(capacity, dtype=torch.long, device=device)
-        self.buy_actions = torch.zeros(capacity, dtype=torch.long, device=device)
-        self.sell_actions = torch.zeros(capacity, dtype=torch.long, device=device)
-        self.buy_rewards = torch.zeros(capacity, dtype=torch.float32, device=device)
-        self.sell_rewards = torch.zeros(capacity, dtype=torch.float32, device=device)
-        self.dones = torch.zeros(capacity, dtype=torch.float32, device=device)
+        self.buffer = np.zeros((capacity, 4), dtype=np.int64)  # idx, buy_act, sell_act, done
+        self.rewards_buy = np.zeros(capacity, dtype=np.float32)
+        self.rewards_sell = np.zeros(capacity, dtype=np.float32)
         self.position = 0
         self.size = 0
 
-    def push_batch(self, indices: torch.Tensor, buy_actions: torch.Tensor, sell_actions: torch.Tensor,
-                   buy_rewards: torch.Tensor, sell_rewards: torch.Tensor, dones: torch.Tensor):
+    def push_batch(self, indices: np.ndarray, buy_actions: np.ndarray, sell_actions: np.ndarray,
+                   buy_rewards: np.ndarray, sell_rewards: np.ndarray, dones: np.ndarray):
         batch_size = len(indices)
 
-        # Handle wraparound
-        end_pos = self.position + batch_size
-        if end_pos <= self.capacity:
-            self.indices[self.position:end_pos] = indices
-            self.buy_actions[self.position:end_pos] = buy_actions
-            self.sell_actions[self.position:end_pos] = sell_actions
-            self.buy_rewards[self.position:end_pos] = buy_rewards
-            self.sell_rewards[self.position:end_pos] = sell_rewards
-            self.dones[self.position:end_pos] = dones
-        else:
-            first_part = self.capacity - self.position
-            self.indices[self.position:] = indices[:first_part]
-            self.indices[:end_pos - self.capacity] = indices[first_part:]
-            self.buy_actions[self.position:] = buy_actions[:first_part]
-            self.buy_actions[:end_pos - self.capacity] = buy_actions[first_part:]
-            self.sell_actions[self.position:] = sell_actions[:first_part]
-            self.sell_actions[:end_pos - self.capacity] = sell_actions[first_part:]
-            self.buy_rewards[self.position:] = buy_rewards[:first_part]
-            self.buy_rewards[:end_pos - self.capacity] = buy_rewards[first_part:]
-            self.sell_rewards[self.position:] = sell_rewards[:first_part]
-            self.sell_rewards[:end_pos - self.capacity] = sell_rewards[first_part:]
-            self.dones[self.position:] = dones[:first_part]
-            self.dones[:end_pos - self.capacity] = dones[first_part:]
+        for i in range(batch_size):
+            pos = self.position
+            self.buffer[pos, 0] = indices[i]
+            self.buffer[pos, 1] = buy_actions[i]
+            self.buffer[pos, 2] = sell_actions[i]
+            self.buffer[pos, 3] = dones[i]
+            self.rewards_buy[pos] = buy_rewards[i]
+            self.rewards_sell[pos] = sell_rewards[i]
 
-        self.position = end_pos % self.capacity
-        self.size = min(self.size + batch_size, self.capacity)
+            self.position = (self.position + 1) % self.capacity
+            self.size = min(self.size + 1, self.capacity)
 
-    def sample(self, batch_size: int, all_sequences: torch.Tensor):
-        idxs = torch.randint(0, self.size, (batch_size,), device=device)
+    def sample(self, batch_size: int, all_states: np.ndarray) -> Tuple[torch.Tensor, ...]:
+        idxs = np.random.randint(0, self.size, size=batch_size)
 
-        state_indices = self.indices[idxs]
-        states = all_sequences[state_indices]
-        next_states = all_sequences[state_indices + 1]
+        state_indices = self.buffer[idxs, 0]
+        buy_actions = self.buffer[idxs, 1]
+        sell_actions = self.buffer[idxs, 2]
+        dones = self.buffer[idxs, 3].astype(np.float32)
+        buy_rewards = self.rewards_buy[idxs]
+        sell_rewards = self.rewards_sell[idxs]
+
+        # Fetch actual states and next_states from shared array
+        states = all_states[state_indices]
+        next_states = all_states[state_indices + 1]  # next_state = states[idx + 1]
 
         return (
-            states,
-            self.buy_actions[idxs],
-            self.sell_actions[idxs],
-            self.buy_rewards[idxs],
-            self.sell_rewards[idxs],
-            next_states,
-            self.dones[idxs]
+            torch.FloatTensor(states).to(device),
+            torch.LongTensor(buy_actions).to(device),
+            torch.LongTensor(sell_actions).to(device),
+            torch.FloatTensor(buy_rewards).to(device),
+            torch.FloatTensor(sell_rewards).to(device),
+            torch.FloatTensor(next_states).to(device),
+            torch.FloatTensor(dones).to(device)
         )
 
     def __len__(self) -> int:
@@ -205,12 +194,12 @@ def create_sequences_for_stock(args: Tuple) -> Optional[Dict]:
         'sequences': sequences,
         'rewards_buy': rewards_buy[sequence_length:].astype(np.float32),
         'rewards_sell': rewards_sell[sequence_length:].astype(np.float32),
-        'n_transitions': n_sequences - 1
+        'n_transitions': n_sequences - 1  # Can form n_sequences - 1 (state, next_state) pairs
     }
 
 
 class PreprocessedData:
-    """Container for preprocessed data - stores everything on GPU for max speed"""
+    """Container for preprocessed data - stores sequences contiguously"""
 
     def __init__(self, data_by_stock: Dict, sequence_length: int):
         args_list = [
@@ -222,44 +211,42 @@ class PreprocessedData:
         with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
             results = [r for r in executor.map(create_sequences_for_stock, args_list) if r]
 
-        # Count total sequences
+        # Count total sequences (not transitions)
         total_sequences = sum(len(r['sequences']) for r in results)
         num_features = results[0]['sequences'].shape[2] if results else 0
 
-        # Build numpy arrays first
-        all_sequences = np.zeros((total_sequences, sequence_length, num_features), dtype=np.float32)
-        all_rewards_buy = np.zeros(total_sequences, dtype=np.float32)
-        all_rewards_sell = np.zeros(total_sequences, dtype=np.float32)
-        all_dones = np.zeros(total_sequences, dtype=np.float32)
+        # Allocate contiguous arrays
+        self.all_sequences = np.zeros((total_sequences, sequence_length, num_features), dtype=np.float32)
+        self.all_rewards_buy = np.zeros(total_sequences, dtype=np.float32)
+        self.all_rewards_sell = np.zeros(total_sequences, dtype=np.float32)
+        self.all_dones = np.zeros(total_sequences, dtype=np.float32)
 
-        transition_indices = []
+        # Fill arrays and track transition indices
+        self.transition_indices = []  # Valid indices where (i, i+1) forms a transition
         pos = 0
 
         for r in results:
             n_seq = len(r['sequences'])
-            all_sequences[pos:pos + n_seq] = r['sequences']
-            all_rewards_buy[pos:pos + n_seq] = r['rewards_buy']
-            all_rewards_sell[pos:pos + n_seq] = r['rewards_sell']
+            self.all_sequences[pos:pos + n_seq] = r['sequences']
+            self.all_rewards_buy[pos:pos + n_seq] = r['rewards_buy']
+            self.all_rewards_sell[pos:pos + n_seq] = r['rewards_sell']
 
+            # Transitions: indices 0 to n_seq-2 (so next_state = idx+1 is valid)
             for i in range(n_seq - 1):
-                transition_indices.append(pos + i)
+                self.transition_indices.append(pos + i)
 
+            # Mark last sequence of this stock as "done" for the transition ending there
+            # The transition at index (pos + n_seq - 2) ends at state (pos + n_seq - 1)
             if n_seq >= 2:
-                all_dones[pos + n_seq - 2] = 1.0
+                self.all_dones[pos + n_seq - 2] = 1.0
 
             pos += n_seq
 
-        # Move everything to GPU
-        self.all_sequences = torch.tensor(all_sequences, device=device)
-        self.all_rewards_buy = torch.tensor(all_rewards_buy, device=device)
-        self.all_rewards_sell = torch.tensor(all_rewards_sell, device=device)
-        self.all_dones = torch.tensor(all_dones, device=device)
-        self.transition_indices = torch.tensor(transition_indices, dtype=torch.long, device=device)
-
+        self.transition_indices = np.array(self.transition_indices, dtype=np.int64)
         self.total_transitions = len(self.transition_indices)
         self.n_stocks = len(results)
 
-        print(f"Preprocessed {self.n_stocks} stocks with {self.total_transitions:,} transitions (on {device})")
+        print(f"Preprocessed {self.n_stocks} stocks with {self.total_transitions:,} transitions")
 
 
 def load_data(filepath: str) -> Tuple[Dict, int, int]:
@@ -284,26 +271,26 @@ def load_data(filepath: str) -> Tuple[Dict, int, int]:
 # TRAINING
 # =============================================================================
 
-def select_actions_batch(model: nn.Module, states: torch.Tensor, epsilon: float) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Epsilon-greedy action selection for both heads (all on GPU)"""
+def select_actions_batch(model: nn.Module, states: torch.Tensor, epsilon: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Epsilon-greedy action selection for both heads"""
     batch_size = states.shape[0]
 
     with torch.no_grad():
         buy_q, sell_q = model(states)
-        buy_actions = buy_q.argmax(dim=1)
-        sell_actions = sell_q.argmax(dim=1)
+        buy_actions = buy_q.argmax(dim=1).cpu().numpy()
+        sell_actions = sell_q.argmax(dim=1).cpu().numpy()
 
-    # Apply random actions (on GPU)
-    random_mask_buy = torch.rand(batch_size, device=device) < epsilon
-    random_mask_sell = torch.rand(batch_size, device=device) < epsilon
-    buy_actions[random_mask_buy] = torch.randint(0, 2, (random_mask_buy.sum(),), device=device)
-    sell_actions[random_mask_sell] = torch.randint(0, 2, (random_mask_sell.sum(),), device=device)
+    # Apply random actions
+    random_mask_buy = np.random.random(batch_size) < epsilon
+    random_mask_sell = np.random.random(batch_size) < epsilon
+    buy_actions[random_mask_buy] = np.random.randint(0, 2, size=random_mask_buy.sum())
+    sell_actions[random_mask_sell] = np.random.randint(0, 2, size=random_mask_sell.sum())
 
     return buy_actions, sell_actions
 
 
 def train_dqn(train_data: PreprocessedData, num_features: int) -> Tuple[nn.Module, Dict]:
-    """Train dual-head LSTM-DQN (all operations on GPU)"""
+    """Train dual-head LSTM-DQN"""
 
     policy_net = DualHeadLSTMDQN(num_features).to(device)
     target_net = DualHeadLSTMDQN(num_features).to(device)
@@ -314,9 +301,9 @@ def train_dqn(train_data: PreprocessedData, num_features: int) -> Tuple[nn.Modul
     criterion = nn.MSELoss()
 
     buffer_size = math.ceil(train_data.total_transitions / 100000) * 100000
-    replay_buffer = GPUReplayBuffer(buffer_size)
+    replay_buffer = IndexReplayBuffer(buffer_size)
 
-    # Epsilon decay
+    # Epsilon decay: drops from max to min over 80% of episodes
     decay_episodes = int(0.8 * NUM_EPISODES)
     epsilon_decay = (EPSILON_MIN / EPSILON_MAX) ** (1.0 / decay_episodes)
     epsilon = EPSILON_MAX
@@ -338,9 +325,7 @@ def train_dqn(train_data: PreprocessedData, num_features: int) -> Tuple[nn.Modul
     print("-" * 82)
 
     for episode in range(NUM_EPISODES):
-        # Shuffle on GPU
-        perm = torch.randperm(n_transitions, device=device)
-        shuffled_indices = transition_indices[perm]
+        shuffled_indices = np.random.permutation(transition_indices)
 
         ep_reward_buy, ep_reward_sell, ep_loss = 0.0, 0.0, 0.0
         num_updates, total_buys, total_sells, step_count = 0, 0, 0, 0
@@ -348,31 +333,32 @@ def train_dqn(train_data: PreprocessedData, num_features: int) -> Tuple[nn.Modul
         policy_net.train()
 
         for batch_start in range(0, n_transitions, ACTION_BATCH_SIZE):
-            batch_end = min(batch_start + ACTION_BATCH_SIZE, n_transitions)
-            batch_idx = shuffled_indices[batch_start:batch_end]
+            batch_idx = shuffled_indices[batch_start:batch_start + ACTION_BATCH_SIZE]
             batch_size = len(batch_idx)
 
-            # All data already on GPU
+            # Get states for action selection
             batch_states = all_sequences[batch_idx]
+            states_tensor = torch.FloatTensor(batch_states).to(device)
+
+            # Select actions
+            policy_net.eval()
+            buy_actions, sell_actions = select_actions_batch(policy_net, states_tensor, epsilon)
+            policy_net.train()
+
+            # Get rewards based on actions
             batch_rewards_buy_data = all_rewards_buy[batch_idx]
             batch_rewards_sell_data = all_rewards_sell[batch_idx]
             batch_dones = all_dones[batch_idx]
 
-            # Select actions (on GPU)
-            policy_net.eval()
-            buy_actions, sell_actions = select_actions_batch(policy_net, batch_states, epsilon)
-            policy_net.train()
+            buy_rewards = np.where(buy_actions == 1, batch_rewards_buy_data, 0.0).astype(np.float32)
+            sell_rewards = np.where(sell_actions == 1, batch_rewards_sell_data, 0.0).astype(np.float32)
 
-            # Compute rewards (on GPU)
-            buy_rewards = torch.where(buy_actions == 1, batch_rewards_buy_data, torch.zeros_like(batch_rewards_buy_data))
-            sell_rewards = torch.where(sell_actions == 1, batch_rewards_sell_data, torch.zeros_like(batch_rewards_sell_data))
+            ep_reward_buy += buy_rewards.sum()
+            ep_reward_sell += sell_rewards.sum()
+            total_buys += buy_actions.sum()
+            total_sells += sell_actions.sum()
 
-            ep_reward_buy += buy_rewards.sum().item()
-            ep_reward_sell += sell_rewards.sum().item()
-            total_buys += buy_actions.sum().item()
-            total_sells += sell_actions.sum().item()
-
-            # Store in replay buffer (on GPU)
+            # Store in replay buffer
             replay_buffer.push_batch(batch_idx, buy_actions, sell_actions,
                                      buy_rewards, sell_rewards, batch_dones)
 
@@ -440,50 +426,46 @@ def train_dqn(train_data: PreprocessedData, num_features: int) -> Tuple[nn.Modul
 # =============================================================================
 
 def evaluate_model(model: nn.Module, test_data: PreprocessedData) -> Dict:
-    """Evaluate model on test data (all on GPU)"""
+    """Evaluate model on test data (buy and sell tested separately)"""
     model.eval()
 
     indices = test_data.transition_indices
     n_samples = len(indices)
 
-    all_buy_actions = []
-    all_sell_actions = []
-    all_buy_rewards = []
-    all_sell_rewards = []
+    all_buy_actions, all_sell_actions = [], []
+    all_buy_rewards, all_sell_rewards = [], []
 
     with torch.no_grad():
         for i in range(0, n_samples, 1024):
             batch_idx = indices[i:i + 1024]
-            states = test_data.all_sequences[batch_idx]
+            states = torch.FloatTensor(test_data.all_sequences[batch_idx]).to(device)
 
             buy_q, sell_q = model(states)
-            buy_actions = buy_q.argmax(dim=1)
-            sell_actions = sell_q.argmax(dim=1)
+            buy_actions = buy_q.argmax(dim=1).cpu().numpy()
+            sell_actions = sell_q.argmax(dim=1).cpu().numpy()
 
-            buy_rewards = torch.where(buy_actions == 1, test_data.all_rewards_buy[batch_idx],
-                                      torch.zeros(len(batch_idx), device=device))
-            sell_rewards = torch.where(sell_actions == 1, test_data.all_rewards_sell[batch_idx],
-                                       torch.zeros(len(batch_idx), device=device))
+            buy_rewards = np.where(buy_actions == 1, test_data.all_rewards_buy[batch_idx], 0.0)
+            sell_rewards = np.where(sell_actions == 1, test_data.all_rewards_sell[batch_idx], 0.0)
 
-            all_buy_actions.append(buy_actions)
-            all_sell_actions.append(sell_actions)
-            all_buy_rewards.append(buy_rewards)
-            all_sell_rewards.append(sell_rewards)
+            all_buy_actions.extend(buy_actions)
+            all_sell_actions.extend(sell_actions)
+            all_buy_rewards.extend(buy_rewards)
+            all_sell_rewards.extend(sell_rewards)
 
-    all_buy_actions = torch.cat(all_buy_actions)
-    all_sell_actions = torch.cat(all_sell_actions)
-    all_buy_rewards = torch.cat(all_buy_rewards)
-    all_sell_rewards = torch.cat(all_sell_rewards)
+    all_buy_actions = np.array(all_buy_actions)
+    all_sell_actions = np.array(all_sell_actions)
+    all_buy_rewards = np.array(all_buy_rewards)
+    all_sell_rewards = np.array(all_sell_rewards)
 
     results = {
         'n_samples': n_samples,
-        'buy_rate': all_buy_actions.float().mean().item(),
-        'sell_rate': all_sell_actions.float().mean().item(),
-        'avg_buy_reward': all_buy_rewards.sum().item() / n_samples,
-        'avg_sell_reward': all_sell_rewards.sum().item() / n_samples,
-        'avg_total_reward': (all_buy_rewards.sum().item() + all_sell_rewards.sum().item()) / n_samples,
-        'rewards_buy_data': test_data.all_rewards_buy[indices].cpu().numpy(),
-        'rewards_sell_data': test_data.all_rewards_sell[indices].cpu().numpy(),
+        'buy_rate': all_buy_actions.mean(),
+        'sell_rate': all_sell_actions.mean(),
+        'avg_buy_reward': all_buy_rewards.sum() / n_samples,
+        'avg_sell_reward': all_sell_rewards.sum() / n_samples,
+        'avg_total_reward': (all_buy_rewards.sum() + all_sell_rewards.sum()) / n_samples,
+        'rewards_buy_data': test_data.all_rewards_buy[indices],
+        'rewards_sell_data': test_data.all_rewards_sell[indices],
     }
 
     print(f"\n=== Model Evaluation ===")
@@ -544,8 +526,8 @@ def always_trade_baseline(test_data: PreprocessedData) -> Dict:
     indices = test_data.transition_indices
     n = len(indices)
 
-    buy_reward = test_data.all_rewards_buy[indices].sum().item() / n
-    sell_reward = test_data.all_rewards_sell[indices].sum().item() / n
+    buy_reward = test_data.all_rewards_buy[indices].sum() / n
+    sell_reward = test_data.all_rewards_sell[indices].sum() / n
 
     print(f"\n=== Always Trade Baseline ===")
     print(f"  Buy avg_reward/obs:  {buy_reward:.6f}")

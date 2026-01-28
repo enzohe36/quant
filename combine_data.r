@@ -19,8 +19,6 @@ adjust_dir <- paste0(data_dir, "adjust/")
 mc_dir <- paste0(data_dir, "mc/")
 val_dir <- paste0(data_dir, "val/")
 
-spot_combined_path <- paste0(data_dir, "spot_combined.csv")
-
 data_combined_path <- paste0(data_dir, "data_combined.rds")
 train_path <- paste0(data_dir, "train.csv")
 test_path <- paste0(data_dir, "test.csv")
@@ -45,12 +43,13 @@ last_td <- eval(last_td_expr)
 train_start <- last_td %m-% years(5)
 test_start <- last_td %m-% years(1)
 
+pred_length <- 20
+z_threshold <- 2.33
+
 # MAIN SCRIPT ==================================================================
 
 dir.create(analysis_dir)
 dir.create(logs_dir)
-
-spot_combined <- read_csv(spot_combined_path, show_col_types = FALSE)
 
 quarters_start <- unique(quarter(all_td, "date_first"))
 quarters_start_td <- as_tradeday(quarters_start)
@@ -206,6 +205,8 @@ plan(sequential)
 saveRDS(data_combined, data_combined_path)
 tsprint(str_glue("Combined {length(data_combined)} stocks."))
 
+# data_combined <- readRDS(data_combined_path)
+
 plan(multisession, workers = availableCores() - 1)
 
 data_combined_filtered <- foreach(
@@ -214,7 +215,18 @@ data_combined_filtered <- foreach(
 ) %dofuture% {
   data <- data %>%
     mutate(
-      price = avg_price,
+      reward_buy = as.numeric(
+        -z_threshold + scale(
+          lead(run_max(avg_price, pred_length), pred_length) /
+            avg_price - 1
+        )
+      ),
+      reward_sell = as.numeric(
+        -z_threshold + scale(
+          avg_price /
+            lead(run_min(avg_price, pred_length), pred_length) - 1
+        )
+      ),
       mc_sma60 = run_mean(mc, 60),
       to_sma60 = run_mean(to, 60),
       close_geq_kama = as.numeric(close >= kama),
@@ -224,30 +236,24 @@ data_combined_filtered <- foreach(
       high_geq_kama = as.numeric(high >= kama),
       high_geq_avg_cost = as.numeric(high >= avg_cost),
       kama = kama / atr,
-      avg_cost = avg_cost / atr,
-      delist = 0
+      avg_cost = avg_cost / atr
     ) %>%
-    filter(date >= train_start) %>%
-    na.omit()
-  if (nrow(data) == 0) return(NULL)
-
-  delist <- filter(spot_combined, symbol == unique(data$symbol)) %>%
-    pull(delist)
-  if (delist) data[nrow(data), "delist"] <- 1
-
-  data <- data %>%
     select(
-      symbol, date, price,
+      symbol, date, reward_buy, reward_sell,
       mc_sma60, to_sma60,
       close_geq_kama, close_geq_avg_cost,
       low_geq_kama, low_geq_avg_cost,
       high_geq_kama, high_geq_avg_cost,
       kama, avg_cost,
-      oscillator, price_rms, volume_rms,
-      delist
+      oscillator, price_rms, volume_rms
     )
-  return(list(data))
+
+  data <- data %>%
+    filter(date >= train_start) %>%
+    na.omit()
+  if (nrow(data) == 0) return(NULL) else return(list(data))
 } %>%
+  # .[sample(length(.), 10)] %>%
   rbindlist()
 
 plan(sequential)
@@ -262,6 +268,7 @@ test <- filter(
 )
 write_csv(train, train_path)
 write_csv(test, test_path)
+# write_csv(train[1:3, ], "data/example.csv")
 
 tsprint(str_glue("Training set: {nrow(train)} rows."))
 tsprint(str_glue("Test set: {nrow(test)} rows."))

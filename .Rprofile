@@ -12,8 +12,6 @@ if (.Platform$OS.type == "windows") {
       options(device = function(...) httpgd::hgd(silent = FALSE))
     }
   }
-
-  Sys.setlocale("LC_ALL", "chs")
 }
 
 options(warn = -1)
