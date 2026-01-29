@@ -20,8 +20,8 @@ mc_dir <- paste0(data_dir, "mc/")
 val_dir <- paste0(data_dir, "val/")
 
 data_combined_path <- paste0(data_dir, "data_combined.rds")
-train_path <- paste0(data_dir, "train.csv")
-test_path <- paste0(data_dir, "test.csv")
+# train_path <- paste0(data_dir, "train_buy.csv")
+# test_path <- paste0(data_dir, "test_buy.csv")
 
 analysis_dir <- "analysis/"
 
@@ -44,7 +44,10 @@ train_start <- last_td %m-% years(5)
 test_start <- last_td %m-% years(1)
 
 pred_length <- 20
-z_threshold <- 2.33
+freq_buy <- 0.025
+freq_sell <- 0.025
+
+set.seed(42)
 
 # MAIN SCRIPT ==================================================================
 
@@ -215,18 +218,10 @@ data_combined_filtered <- foreach(
 ) %dofuture% {
   data <- data %>%
     mutate(
-      reward_buy = as.numeric(
-        -z_threshold + scale(
-          lead(run_max(avg_price, pred_length), pred_length) /
-            avg_price - 1
-        )
-      ),
-      reward_sell = as.numeric(
-        -z_threshold + scale(
-          avg_price /
-            lead(run_min(avg_price, pred_length), pred_length) - 1
-        )
-      ),
+      reward_buy = lead(run_max(avg_price, pred_length), pred_length) /
+        avg_price - 1,
+      reward_sell = avg_price /
+        lead(run_min(avg_price, pred_length), pred_length) - 1,
       mc_sma60 = run_mean(mc, 60),
       to_sma60 = run_mean(to, 60),
       close_geq_kama = as.numeric(close >= kama),
@@ -253,22 +248,82 @@ data_combined_filtered <- foreach(
     na.omit()
   if (nrow(data) == 0) return(NULL) else return(list(data))
 } %>%
-  # .[sample(length(.), 10)] %>%
   rbindlist()
 
 plan(sequential)
 
-train <- filter(
-  data_combined_filtered,
-  date >= train_start & date < test_start
+cutoff_buy <- quantile(data_combined_filtered$reward_buy, 1 - freq_buy)
+cutoff_sell <- quantile(data_combined_filtered$reward_sell, 1 - freq_sell)
+data_combined_filtered <- data_combined_filtered %>%
+  mutate(
+    reward_buy = reward_buy - cutoff_buy,
+    reward_sell = reward_sell - cutoff_sell
+  )
+write_csv(
+  tibble(
+    reward_type = c("buy", "sell"),
+    cutoff = c(cutoff_buy, cutoff_sell)
+  ),
+  "data/reward_cutoff.csv"
 )
-test <- filter(
-  data_combined_filtered,
-  date >= test_start
-)
-write_csv(train, train_path)
-write_csv(test, test_path)
-# write_csv(train[1:3, ], "data/example.csv")
 
-tsprint(str_glue("Training set: {nrow(train)} rows."))
-tsprint(str_glue("Test set: {nrow(test)} rows."))
+symbols_tr <- sample(unique(data_combined_filtered$symbol), 100)
+
+train_buy <- data_combined_filtered %>%
+  mutate(
+    reward = reward_buy,
+    across(contains("reward_"), ~ NULL)
+  ) %>%
+  filter(date < test_start)
+write_csv(train_buy, "data/train_buy.csv")
+tsprint(str_glue("train_buy: {nrow(train_buy)} stocks."))
+
+train_buy_tr <- train_buy %>%
+  filter(symbol %in% symbols_tr)
+write_csv(train_buy_tr, "data/train_buy_tr.csv")
+tsprint(str_glue("train_buy_tr: {nrow(train_buy_tr)} stocks."))
+
+test_buy <- data_combined_filtered %>%
+  mutate(
+    reward = reward_buy,
+    across(contains("reward_"), ~ NULL)
+  ) %>%
+  filter(date >= test_start)
+write_csv(test_buy, "data/test_buy.csv")
+tsprint(str_glue("test_buy: {nrow(test_buy)} stocks."))
+
+test_buy_tr <- test_buy %>%
+  filter(symbol %in% symbols_tr)
+write_csv(test_buy_tr, "data/test_buy_tr.csv")
+tsprint(str_glue("test_buy_tr: {nrow(test_buy_tr)} stocks."))
+
+train_sell <- data_combined_filtered %>%
+  mutate(
+    reward = reward_sell,
+    across(contains("reward_"), ~ NULL)
+  ) %>%
+  filter(date < test_start)
+write_csv(train_sell, "data/train_sell.csv")
+tsprint(str_glue("train_sell: {nrow(train_sell)} stocks."))
+
+train_sell_tr <- train_sell %>%
+  filter(symbol %in% symbols_tr)
+write_csv(train_sell_tr, "data/train_sell_tr.csv")
+tsprint(str_glue("train_sell_tr: {nrow(train_sell_tr)} stocks."))
+
+test_sell <- data_combined_filtered %>%
+  mutate(
+    reward = reward_sell,
+    across(contains("reward_"), ~ NULL)
+  ) %>%
+  filter(date >= test_start)
+write_csv(test_sell, "data/test_sell.csv")
+tsprint(str_glue("test_sell: {nrow(test_sell)} stocks."))
+
+test_sell_tr <- test_sell %>%
+  filter(symbol %in% symbols_tr)
+write_csv(test_sell_tr, "data/test_sell_tr.csv")
+tsprint(str_glue("test_sell_tr: {nrow(test_sell_tr)} stocks."))
+
+example <- train_buy[1:10, ]
+write_csv(example, "data/example.csv")
