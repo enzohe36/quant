@@ -84,62 +84,61 @@ calculate_avg_cost <- function(avg_price, to) {
   return(avg_cost)
 }
 
-normalize <- function(x, n_bins = NULL, plot = TRUE, silent = FALSE) {
+normalize_sn <- function(x, silent = FALSE) {
   x <- replace_missing(x, NA_real_)
-  if (is.null(n_bins)) n_bins <- ceiling(sqrt(length(na.omit(x))))
 
-  # Calculate probability histogram
-  if (plot & !silent) {
+  if (!silent) {
     par(mfrow = c(1, 2))
-    hist(x, breaks = n_bins, probability = TRUE,
-         main = "Original Distribution",
-         xlab = "x", ylab = "Density")
-  }
-
-  # Fit skewed normal distribution
-  fit <- selm(x ~ 1, family = "SN")
-  params <- coef(fit, param.type = "DP")
-
-  xi <- params["xi"]          # location
-  omega <- params["omega"]    # scale
-  alpha <- params["alpha"]    # shape
-
-  # Add fitted curve to original plot
-  if (plot & !silent) {
-    x_seq <- seq(
+    q_orig <- quantile(x, probs = c(0.001, 0.999), na.rm = TRUE)
+    breaks_orig <- c(
       min(x, na.rm = TRUE),
-      max(x, na.rm = TRUE),
-      length.out = 1000
+      seq(q_orig[1], q_orig[2], length.out = 31),
+      max(x, na.rm = TRUE)
     )
-    lines(x_seq, dsn(x_seq, xi = xi, omega = omega, alpha = alpha),
-          col = "red", lwd = 2)
+    hist(
+      x, breaks = breaks_orig, probability = TRUE,
+      main = "Original Distribution",
+      xlab = "x", ylab = "Density",
+      xlim = q_orig
+    )
   }
 
-  # Transform to symmetric normal using probability integral transformation
-  # Step 1: Transform to uniform [0,1] using CDF of fitted skewed normal
-  u <- psn(x, xi = xi, omega = omega, alpha = alpha)
+  fit_sn <- selm(x ~ 1, family = "SN")
+  xi <- coef(fit_sn, param.type = "DP")["xi"]
+  omega <- coef(fit_sn, param.type = "DP")["omega"]
+  alpha <- coef(fit_sn, param.type = "DP")["alpha"]
 
-  # Step 2: Transform to standard normal using inverse CDF (quantile function)
+  if (!silent) {
+    x_seq <- seq(q_orig[1], q_orig[2], length.out = 1000)
+    lines(
+      x_seq, dsn(x_seq, xi = xi, omega = omega, alpha = alpha),
+      col = "red", lwd = 2
+    )
+  }
+
+  eps <- .Machine$double.eps
+  u <- psn(x, xi = xi, omega = omega, alpha = alpha)
+  u <- pmax(pmin(u, 1 - eps), eps)
   x_symmetric <- qnorm(u)
 
-  # Plot transformed data
-  if (plot & !silent) {
-    hist(x_symmetric, breaks = n_bins, probability = TRUE,
-         main = "Transformed Distribution",
-         xlab = "Transformed x", ylab = "Density")
-
-    # Overlay theoretical N(0,1) curve
-    z_seq <- seq(
+  if (!silent) {
+    q_trans <- quantile(x_symmetric, probs = c(0.001, 0.999), na.rm = TRUE)
+    breaks_trans <- c(
       min(x_symmetric, na.rm = TRUE),
-      max(x_symmetric, na.rm = TRUE),
-      length.out = 1000
+      seq(q_trans[1], q_trans[2], length.out = 31),
+      max(x_symmetric, na.rm = TRUE)
     )
+    hist(
+      x_symmetric, breaks = breaks_trans, probability = TRUE,
+      main = "Transformed Distribution",
+      xlab = "Transformed x", ylab = "Density",
+      xlim = q_trans
+    )
+    z_seq <- seq(q_trans[1], q_trans[2], length.out = 1000)
     lines(z_seq, dnorm(z_seq, mean = 0, sd = 1), col = "blue", lwd = 2)
-
     par(mfrow = c(1, 1))
   }
 
-  # Print fitted parameters and transformation info
   if (!silent) {
     cat("Fitted Skewed Normal Parameters:\n")
     cat(sprintf("  Location (xi):     %.4f\n", xi))
@@ -155,29 +154,39 @@ normalize <- function(x, n_bins = NULL, plot = TRUE, silent = FALSE) {
   return(x_symmetric)
 }
 
-generate_differences <- function(data, ..., n) {
-  if (!is.data.frame(data)) {
-    stop("data must be a data frame")
+calculate_scale_params <- function(data, ..., robust = FALSE) {
+  center_fn <- if (robust) {
+    \(x) median(x, na.rm = TRUE)
+  } else {
+    \(x) mean(x, na.rm = TRUE)
   }
-
-  if (!is.numeric(n) || any(n < 1) || any(n != floor(n))) {
-    stop("n must be a vector of positive integers")
+  disp_fn <- if (robust) {
+    \(x) mad(x, na.rm = TRUE)
+  } else {
+    \(x) sd(x, na.rm = TRUE)
   }
+  data %>%
+    select(...) %>%
+    summarise(
+      across(everything(), list(center = center_fn, disp = disp_fn))
+    ) %>%
+    pivot_longer(
+      everything(),
+      names_to = c("column", ".value"),
+      names_sep = "_(?=(center|disp)$)"
+    )
+}
 
-  lag_fns <- purrr::map(n, function(lag_n) {
-    function(x) x - dplyr::lag(x, n = lag_n)
-  })
-
-  names(lag_fns) <- paste0("d", n)
-
-  result <- data %>%
+scale_features <- function(data, scale_params) {
+  params_list <- split(scale_params, scale_params$column)
+  data %>%
     mutate(
       across(
-        .cols = c(...),
-        .fns = lag_fns,
-        .names = "{.col}_{.fn}"
+        all_of(scale_params$column),
+        ~ {
+          p <- params_list[[cur_column()]]
+          (. - p$center) / p$disp
+        }
       )
     )
-
-  return(result)
 }

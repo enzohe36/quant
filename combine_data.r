@@ -20,11 +20,14 @@ mc_dir <- paste0(data_dir, "mc/")
 val_dir <- paste0(data_dir, "val/")
 
 data_combined_path <- paste0(data_dir, "data_combined.rds")
-# train_path <- paste0(data_dir, "train_buy.csv")
-# test_path <- paste0(data_dir, "test_buy.csv")
+scale_params_path <- paste0(data_dir, "scale_params.csv")
+train_path <- paste0(data_dir, "train.csv")
+test_path <- paste0(data_dir, "test.csv")
+train_tr_path <- paste0(data_dir, "train_tr.csv")
+test_tr_path <- paste0(data_dir, "test_tr.csv")
+example_path <- paste0(data_dir, "example.csv")
 
 analysis_dir <- "analysis/"
-
 logs_dir <- paste0(analysis_dir, "logs/")
 log_path <- paste0(logs_dir, format(now(), "%Y%m%d_%H%M%S"), ".log")
 
@@ -39,13 +42,9 @@ max_osc_diff <- 1.9
 price_rms_high <- 1.5
 price_rms_low <- -1
 
-last_td <- eval(last_td_expr)
-train_start <- last_td %m-% years(5)
-test_start <- last_td %m-% years(1)
-
-pred_length <- 20
-freq_buy <- 0.025
-freq_sell <- 0.025
+last_td <- as_date("2026-01-23")
+train_start <- last_td %m-% years(10)
+test_start <- last_td %m-% years(2)
 
 set.seed(42)
 
@@ -54,9 +53,9 @@ set.seed(42)
 dir.create(analysis_dir)
 dir.create(logs_dir)
 
-quarters_start <- unique(quarter(all_td, "date_first"))
-quarters_start_td <- as_tradeday(quarters_start)
-quarters_end <- quarters_start - 1
+quarters_end <- quarter(all_td %m-% months(3), "date_last") %>%
+  unique() %>%
+  sort()
 
 symbols <- str_remove(list.files(hist_dir), "\\.csv$")
 tsprint(str_glue("Found {length(symbols)} stock histories."))
@@ -113,7 +112,7 @@ data_combined <- foreach(
           revenue = run_sum(revenue, 4),
           np = run_sum(np, 4),
           np_deduct = run_sum(np_deduct, 4),
-          cfps = run_sum(cfps, 4)
+          ocfps = run_sum(ocfps, 4)
         ),
       silent = TRUE
     )
@@ -140,35 +139,18 @@ data_combined <- foreach(
       mutate(
         mc = close * shares,
         equity = bvps * shares,
-        cf = cfps * shares,
+        ocf = ocfps * shares,
         across(c(open, high, low, close, avg_price), ~ .x * adjust),
         volume = volume / adjust
       ) %>%
-      fill(np, np_deduct, equity, revenue, cf, .direction = "down") %>%
+      fill(np, np_deduct, equity, revenue, ocf, .direction = "down") %>%
       filter(date %in% pull(hist, date)) %>%
       mutate(
-        avg_cost = calculate_avg_cost(avg_price, to),
-        quarter = quarter(date, with_year = TRUE)
+        avg_cost = calculate_avg_cost(avg_price, to)
       ) %>%
-      group_by(quarter) %>%
-      mutate(
-        across(
-          c(mc, to),
-          ~ c(rep(NA_real_, n() - 1), mean(.x)),
-          .names = "{col}_quarter"
-        )
-      ) %>%
-      ungroup() %>%
-      mutate(
-        across(
-          c(mc_quarter, to_quarter),
-          ~ replace(.x, date < date[date %in% quarters_start_td][2], NA)
-        )
-      ) %>%
-      fill(mc_quarter, to_quarter, .direction = "down") %>%
       select(
         symbol, names(hist), avg_price, avg_cost, mc, np, np_deduct, equity,
-        revenue, cf, quarter, mc_quarter, to_quarter
+        revenue, ocf
       ),
     silent = TRUE
   )
@@ -212,36 +194,56 @@ tsprint(str_glue("Combined {length(data_combined)} stocks."))
 
 plan(multisession, workers = availableCores() - 1)
 
+mkt_mc <- foreach(
+  data = data_combined,
+  .combine = "c"
+) %dofuture% {
+  data %>%
+    right_join(tibble(date = all_td), by = "date") %>%
+    select(date, mc) %>%
+    filter(date <= last_td) %>%
+    fill(mc, .direction = "down") %>%
+    list()
+} %>%
+  rbindlist() %>%
+  group_by(date) %>%
+  summarize(mkt_mc = sum(mc, na.rm = TRUE))
+
 data_combined_filtered <- foreach(
   data = data_combined,
   .combine = "c"
 ) %dofuture% {
   data <- data %>%
+    left_join(mkt_mc, by = "date") %>%
     mutate(
-      reward_buy = lead(run_max(avg_price, pred_length), pred_length) /
-        avg_price - 1,
-      reward_sell = avg_price /
-        lead(run_min(avg_price, pred_length), pred_length) - 1,
-      mc_sma60 = run_mean(mc, 60),
-      to_sma60 = run_mean(to, 60),
-      close_geq_kama = as.numeric(close >= kama),
-      close_geq_avg_cost = as.numeric(close >= avg_cost),
-      low_geq_kama = as.numeric(low >= kama),
-      low_geq_avg_cost = as.numeric(low >= avg_cost),
-      high_geq_kama = as.numeric(high >= kama),
-      high_geq_avg_cost = as.numeric(high >= avg_cost),
-      kama = kama / atr,
-      avg_cost = avg_cost / atr
+      amplitude = TR(tibble(high, low, close))[, "tr"] / lag(close),
+      lr_mc_mkt = log(mc / mkt_mc),
+      pe = mc / np,
+      pe_deduct = mc / np_deduct,
+      pb = mc / equity,
+      ps = mc / revenue,
+      pc = mc / ocf,
+      npm = np / revenue,
+      roe = np / equity,
+      lr_ap_sma20 = log(avg_price / run_mean(close, 20)),
+      lr_ap_sma120 = log(avg_price / run_mean(close, 120)),
+      lr_ap_ema12 = log(avg_price / ema_na(close, 12)),
+      lr_ap_ema50 = log(avg_price / ema_na(close, 50)),
+      lr_ap_ac = log(avg_price / avg_cost),
+      lr_ap_kama = log(avg_price / kama),
+      lr_osc_sl = log(oscillator / signal_line)
     ) %>%
     select(
-      symbol, date, reward_buy, reward_sell,
-      mc_sma60, to_sma60,
-      close_geq_kama, close_geq_avg_cost,
-      low_geq_kama, low_geq_avg_cost,
-      high_geq_kama, high_geq_avg_cost,
-      kama, avg_cost,
-      oscillator, price_rms, volume_rms
-    )
+      symbol, date,
+      open, close, avg_cost, kama,
+      amplitude, to, oscillator, price_rms, volume_rms,
+      lr_mc_mkt, pe, pe_deduct, pb, ps, pc, npm, roe,
+      lr_ap_sma20, lr_ap_sma120,
+      lr_ap_ema12, lr_ap_ema50,
+      lr_ap_ac, lr_ap_kama, lr_osc_sl
+    ) %>%
+    rename_with(~ paste0("p_", .x), c(open, close, avg_cost, kama)) %>%
+    rename_with(~ paste0("n_", .x), !matches("^(symbol|date|p_)"))
 
   data <- data %>%
     filter(date >= train_start) %>%
@@ -252,78 +254,28 @@ data_combined_filtered <- foreach(
 
 plan(sequential)
 
-cutoff_buy <- quantile(data_combined_filtered$reward_buy, 1 - freq_buy)
-cutoff_sell <- quantile(data_combined_filtered$reward_sell, 1 - freq_sell)
-data_combined_filtered <- data_combined_filtered %>%
-  mutate(
-    reward_buy = reward_buy - cutoff_buy,
-    reward_sell = reward_sell - cutoff_sell
-  )
-write_csv(
-  tibble(
-    reward_type = c("buy", "sell"),
-    cutoff = c(cutoff_buy, cutoff_sell)
-  ),
-  "data/reward_cutoff.csv"
-)
+train <- filter(data_combined_filtered, date < test_start)
+scale_params <- calculate_scale_params(train, matches("^n_"), robust = TRUE)
+write_csv(scale_params, scale_params_path)
+
+train <- scale_features(train, scale_params)
+write_csv(train, train_path)
+tsprint(str_glue("nrow(train) = {nrow(train)}"))
+
+test <- filter(data_combined_filtered, date >= test_start) %>%
+  scale_features(scale_params)
+write_csv(test, test_path)
+tsprint(str_glue("nrow(test) = {nrow(test)}"))
+
+example <- train[1:10, ]
+write_csv(example, example_path)
 
 symbols_tr <- sample(unique(data_combined_filtered$symbol), 100)
 
-train_buy <- data_combined_filtered %>%
-  mutate(
-    reward = reward_buy,
-    across(contains("reward_"), ~ NULL)
-  ) %>%
-  filter(date < test_start)
-write_csv(train_buy, "data/train_buy.csv")
-tsprint(str_glue("train_buy: {nrow(train_buy)} stocks."))
+train_tr <- filter(train, symbol %in% symbols_tr)
+write_csv(train_tr, train_tr_path)
+tsprint(str_glue("nrow(train_tr) = {nrow(train_tr)}"))
 
-train_buy_tr <- train_buy %>%
-  filter(symbol %in% symbols_tr)
-write_csv(train_buy_tr, "data/train_buy_tr.csv")
-tsprint(str_glue("train_buy_tr: {nrow(train_buy_tr)} stocks."))
-
-test_buy <- data_combined_filtered %>%
-  mutate(
-    reward = reward_buy,
-    across(contains("reward_"), ~ NULL)
-  ) %>%
-  filter(date >= test_start)
-write_csv(test_buy, "data/test_buy.csv")
-tsprint(str_glue("test_buy: {nrow(test_buy)} stocks."))
-
-test_buy_tr <- test_buy %>%
-  filter(symbol %in% symbols_tr)
-write_csv(test_buy_tr, "data/test_buy_tr.csv")
-tsprint(str_glue("test_buy_tr: {nrow(test_buy_tr)} stocks."))
-
-train_sell <- data_combined_filtered %>%
-  mutate(
-    reward = reward_sell,
-    across(contains("reward_"), ~ NULL)
-  ) %>%
-  filter(date < test_start)
-write_csv(train_sell, "data/train_sell.csv")
-tsprint(str_glue("train_sell: {nrow(train_sell)} stocks."))
-
-train_sell_tr <- train_sell %>%
-  filter(symbol %in% symbols_tr)
-write_csv(train_sell_tr, "data/train_sell_tr.csv")
-tsprint(str_glue("train_sell_tr: {nrow(train_sell_tr)} stocks."))
-
-test_sell <- data_combined_filtered %>%
-  mutate(
-    reward = reward_sell,
-    across(contains("reward_"), ~ NULL)
-  ) %>%
-  filter(date >= test_start)
-write_csv(test_sell, "data/test_sell.csv")
-tsprint(str_glue("test_sell: {nrow(test_sell)} stocks."))
-
-test_sell_tr <- test_sell %>%
-  filter(symbol %in% symbols_tr)
-write_csv(test_sell_tr, "data/test_sell_tr.csv")
-tsprint(str_glue("test_sell_tr: {nrow(test_sell_tr)} stocks."))
-
-example <- train_buy[1:10, ]
-write_csv(example, "data/example.csv")
+test_tr <- filter(test, symbol %in% symbols_tr)
+write_csv(test_tr, test_tr_path)
+tsprint(str_glue("nrow(test_tr) = {nrow(test_tr)}"))

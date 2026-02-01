@@ -363,6 +363,31 @@ combine_spot <- function() {
 
 # HISTORICAL DATA ==============================================================
 
+# https://quote.eastmoney.com/center/hszs.html
+get_index_hist <- function(index, start_date, end_date) {
+  index <- filter(indices, index == !!index)
+  # date open close high low volume amount
+  aktools(
+    key = "stock_zh_index_daily_em",
+    symbol = paste0(
+      case_when(
+        str_detect(index$index, "^0") ~ "sh",
+        str_detect(index$source, "cni") ~ "sz",
+        TRUE ~ "csi"
+      ),
+      index$index
+    ),
+    start_date = format(start_date, "%Y%m%d"),
+    end_date = format(end_date, "%Y%m%d")
+  ) %>%
+    mutate(
+      date = as_date(date),
+      across(c(open, high, low, close, volume, amount), as.numeric)
+    ) %>%
+    select(date, open, high, low, close, volume, amount) %>%
+    arrange(date)
+}
+
 # https://quote.eastmoney.com/concept/sh603777.html?from=classic(示例)
 get_hist <- function(symbol, start_date, end_date) {
   # 日期 股票代码 开盘 收盘 最高 最低 成交量 成交额 振幅 涨跌幅 涨跌额 换手率
@@ -458,8 +483,8 @@ get_val <- function(symbol) {
       np = as.numeric(PARENTNETPROFIT),
       np_deduct = as.numeric(DEDU_PARENT_PROFIT),
       bvps = as.numeric(BPS),
-      cfps = as.numeric(PER_NETCASH)
+      ocfps = as.numeric(PER_NETCASH)
     ) %>%
-    select(date, val_change_date, revenue, np, np_deduct, bvps, cfps) %>%
+    select(date, val_change_date, revenue, np, np_deduct, bvps, ocfps) %>%
     arrange(date)
 }
