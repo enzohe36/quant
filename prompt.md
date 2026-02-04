@@ -1,42 +1,58 @@
-1. Input data paths are "data/train.csv" and "data/test.csv". Input data has the same format as example.csv. All columns except symbol and date are features. Do not scale or center any column unless otherwise indicated.
-2. Use all logical processors minus 1 for CPU parallelization. Use all GPUs for GPU parallelization.
-3. Print running time in console for each step.
-4. Build training and testing pools as follows. Use CPU parallelization.
-   1. Split both training and testing data by symbol.
-   2. Use the following default values: simulation_length = 240, sequence_length = 60.
-   3. Keep only the symbols whose num_rows >= required_length, where required_length = simulation_length + sequence_length.
-   4. Record (symbol, index_start, index_end) where index_end >= required_length - 1 and index_start = index_end - required_length + 1 (index starts from 0).
-   7. Pool by data set.
-5. Sample one (symbol, index_start, index_end) from all training data. Simulate each trade as follows. Use CPU parallelization.
-   1. Use stock data from index_start to index_end for simulation.
-   2. Let index_0 = sequence_length - 1 (index starts from 0; subscript is associated with index value).
-   3. Use the following initial values: cash_0 = 100, holding_0 = 0.
-   4. For subsequent calculations, scale all columns with "p_" prefix as follows: col_name = col_name / p_close_0, where col_name is prefixed by "p_".
-   5. Define portfolio_n = cash_n + holding_n * p_close_n.
-   6. For model input, center all columns with "p_" prefix as follows: col_name = col_name - 1, where col_name is prefixed by "p_".
-   7.  For model input, scale and center cash, holding and portfolio as follows: col_name = col_name / cash_0 - 1, where col_name is cash, holding or portfolio.
-   8.  Model-inferred target is a real number in [0, 1].
-   9.  Calculate trade_1 = floor(clip(target_0 * (cash_0 / open_1 + holding_0) - holding_0, -holding_0, cash_0 / open_1)).
-   10. Calculate holding_1 = holding_0 + trade_1.
-   11. Calculate cash_1 = cash_0 - trade_1 * open_1.
-   12. Calculate portfolio_1 as defined before.
-   13. Loop the above calculations from index_1 till the end of the simulation data.
-   14. Calculate GAE from index_0 to index_{simulation_length - 1}, using portfolio differences between consecutive days as TD residuals. Estimate GAE_{end} assuming a continuous gradient.
-   15. Collect experiences from index_0 to index_{simulation_length - 1}.
-6. Parallelize model inference across all GPUs.
-7. Train model with batched experiences. Use GPU parallelization.
-8. Write per-update training result to a log file. Print the latest result in console and update it in place.
-9. Save model to "models/" folder.
-10. Test model-based strategy against buy-and-hold baseline as follows. Use CPU parallelization for sampling and trade simulation. Use GPU parallelization for model inferece.
-   1. Sample 30 (symbol, index_start, index_end) without replacement from all testing data as a group.
-   2. Sample 1000 group with replacement.
-   3. Simulate trade as in training.
-   4. Calculate baseline_return = close_{end} / open_1 - 1.
-   5. Calculate model_return = portfolio_{end} / cash_0 - 1.
+1. Name the script "train_model.py".
+2. Define DATA_PATH = "data_train.csv". Input data has the same format as example.csv. All columns except symbol, date, open, and close are features. All prices are never 0. All features are already normalized.
+3. Define OUTPUT_DIR = "models/".
+4. Define all subsequent parameters (the ones in all caps) at the beginning of the script.
+5. Define NUM_CPUS = all logical processors minus 1 for CPU parallelization.
+6. Define NUM_GPUS = all GPUs for GPU parallelization.
+7. Define MACHINE_EPS = current computer's epsilon. Use it throughout the script where numeric stability is needed.
+9. Do not use "=", "-" and so on for separating sections in script comments or in console output.
+10. Print running time in console for each step.
+11. Build training and testing pools as follows. Use CPU parallelization.
+   1. Define SEQ_LEN = 60.
+   2. Define SIM_LEN = 240
+   3. Define TRAIN_SPLIT = 0.8.
+   4. Keep only symbols with number of rows >= SEQ_LEN + SIM_LEN.
+   5. Split TRAIN_SPLIT of usable symbols for training. Use the rest for testing.
+   6. Record simulation data segments as (symbol, index_start, index_end) for all consecutive SEQ_LEN + SIM_LEN rows of data from all symbols, pooled by data set.
+12. Sample simulation data from the training pool as follows.
+   1. Define n = average number simulation data segments per symbol.
+   2. Solve for total number of updates, k, by 1 - (1 - 1/n)^k > MAX_COVERAGE.
+   3. For each episodes in an update, sample one simulation data segments without replacement, stratified by symbol.
+   4. Use sampling with replacement between different updates.
+13. Simulate trade in each episode as follows. Use CPU parallelization.
+   1. Assume indexing starts from 0.
+   2. Define day_0 = row_{SEQ_LEN - 1} (i. e. SEQ_LEN-th row) of simulation data.
+   3. Define INIT_CASH = cash_0 = 1e6.
+   4. Define holding_0 = 0.
+   5. Define portfolio_n = cash_n + holding_n * close_n.
+   6. Define position_n = holding_n * close_n / portfolio_n.
+   7. Use features_n and position_n as model input. Normalize position_n by (position_n - m) / s, where m = 0.5, s = 1 / (4 * (2 * alpha + 1)) and alpha = softplus(0) + 1.
+   8. Define target_n = model-inferred target position from day_n's input. Parallelize model inference across all GPUs.
+   9. Calculate trade_n = floor(clip(target_n * (cash_n / open_{n + 1} + holding_n) - holding_n, -holding_n, cash_n / open_{n + 1})).
+   10. Calculate holding_{n + 1} = holding_n + trade_n.
+   11. Calculate cash_{n + 1} = cash_n - trade_n * open_{n + 1}.
+   12. Loop the above calculations from day_0 to day_{SIM_LEN - 1}.
+   13. Calculate portfolio_{SIM_LEN} as previously defined.
+   14. Define reward_n = portfolio_{n + 1} / portfolio_n - 1.
+   15. Calculate GAE from day_0 to day_{SIM_LEN - 1}.
+   16. Collect experiences from day_0 to day_{SIM_LEN - 1}.
+14. Train model with batched experiences. Use GPU parallelization.
+15. Write per-update training result to a log file. Print the latest result in console and update it with \r.
+16. Test model-based strategy against a buy-and-hold baseline as follows. Use CPU parallelization for sampling and trade simulation. Use GPU parallelization for model inferece.
+   1. Sample 30 simulation data segments without replacement from testing pool as one group. Associate simulation data segments with group_id.
+   2. Sample 1000 groups with replacement.
+   3. Simulate trade as in training, assuming indexing starts from 0 and day_0 = row_{SEQ_LEN - 1} (i. e. SEQ_LEN-th row) of simulation data.
+   4. Calculate baseline_return = close_{SIM_LEN} / open_1 - 1.
+   5. Calculate model_return = portfolio_{SIM_LEN} / cash_0 - 1.
    6. Record only group_id, baseline_return and model_return for each simulation.
-   7. Calculate means of baseline_return and model_return per group. Use each as one observation.
+   7. Calculate means of baseline_return and model_return per group. Consider each as one observation.
    8. Calculate means and standard deviations of baseline_return and model_return over all groups.
-11. Plot training and testing results. Save plots to "models/" folder.
-12. Define all parameters and paths at the top of the script.
-13. Do not use "=" or "-" for separating sections in script comments or in console output.
-15. Name the script "train_model.py".
+   9. Plot training and testing results. Save plot to the output folder.
+17. Use the outlined testing procedure for validation during training. Use CPU and GPU parallelization as in testing.
+   1. Define MIN_UPDATES = 100.
+   2. Define EVAL_INTERVAL = 50.
+   3. Define PATIENCE_FRAC = 0.2.
+   4. Starting from the MIN_UPDATES-th update, validate once every EVAL_INTERVAL updates.
+   5. Save intermediate models and plots to the output folder.
+   6. Stop early if there is no improvement for 0.2 * total number of updates.
+   7. Add suffix "_best" to the best model and plot.

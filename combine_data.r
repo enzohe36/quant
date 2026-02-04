@@ -21,10 +21,8 @@ val_dir <- paste0(data_dir, "val/")
 
 data_combined_path <- paste0(data_dir, "data_combined.rds")
 scale_params_path <- paste0(data_dir, "scale_params.csv")
-train_path <- paste0(data_dir, "train.csv")
-test_path <- paste0(data_dir, "test.csv")
-train_tr_path <- paste0(data_dir, "train_tr.csv")
-test_tr_path <- paste0(data_dir, "test_tr.csv")
+data_train_path <- paste0(data_dir, "data_train.csv")
+data_train_tr_path <- paste0(data_dir, "data_train_tr.csv")
 example_path <- paste0(data_dir, "example.csv")
 
 analysis_dir <- "analysis/"
@@ -44,7 +42,6 @@ price_rms_low <- -1
 
 last_td <- as_date("2026-01-23")
 train_start <- last_td %m-% years(10)
-test_start <- last_td %m-% years(2)
 
 set.seed(42)
 
@@ -209,7 +206,7 @@ mkt_mc <- foreach(
   group_by(date) %>%
   summarize(mkt_mc = sum(mc, na.rm = TRUE))
 
-data_combined_filtered <- foreach(
+data_train <- foreach(
   data = data_combined,
   .combine = "c"
 ) %dofuture% {
@@ -234,16 +231,16 @@ data_combined_filtered <- foreach(
       lr_osc_sl = log(oscillator / signal_line)
     ) %>%
     select(
-      symbol, date,
-      open, close, avg_cost, kama,
+      symbol, date, open, close,
+      avg_price, avg_cost, kama,
       amplitude, to, oscillator, price_rms, volume_rms,
       lr_mc_mkt, pe, pe_deduct, pb, ps, pc, npm, roe,
       lr_ap_sma20, lr_ap_sma120,
       lr_ap_ema12, lr_ap_ema50,
       lr_ap_ac, lr_ap_kama, lr_osc_sl
     ) %>%
-    rename_with(~ paste0("p_", .x), c(open, close, avg_cost, kama)) %>%
-    rename_with(~ paste0("n_", .x), !matches("^(symbol|date|p_)"))
+    rename_with(~ paste0("p_", .x), c(avg_price, avg_cost, kama)) %>%
+    rename_with(~ paste0("n_", .x), !matches("^(symbol|date|open|close|p_)"))
 
   data <- data %>%
     filter(date >= train_start) %>%
@@ -254,28 +251,22 @@ data_combined_filtered <- foreach(
 
 plan(sequential)
 
-train <- filter(data_combined_filtered, date < test_start)
-scale_params <- calculate_scale_params(train, matches("^n_"), robust = TRUE)
+scale_params <- data_train %>%
+  calculate_scale_params(
+    !matches("^(symbol|date|open|close)"), robust = TRUE
+  ) %>%
+  mutate(across(matches("^p"), ~ p_avg_price))
 write_csv(scale_params, scale_params_path)
 
-train <- scale_features(train, scale_params)
-write_csv(train, train_path)
-tsprint(str_glue("nrow(train) = {nrow(train)}"))
+data_train <- scale_features(data_train, scale_params)
+write_csv(data_train, data_train_path)
+tsprint(str_glue("nrow(data_train) = {nrow(data_train)}"))
 
-test <- filter(data_combined_filtered, date >= test_start) %>%
-  scale_features(scale_params)
-write_csv(test, test_path)
-tsprint(str_glue("nrow(test) = {nrow(test)}"))
+symbols_tr <- sample(unique(data_train$symbol), 100)
+data_train_tr <- data_train %>%
+  filter(symbol %in% symbols_tr)
+write_csv(data_train_tr, data_train_tr_path)
+tsprint(str_glue("nrow(data_train_tr) = {nrow(data_train_tr)}"))
 
-example <- train[1:10, ]
+example <- data_train[1:10, ]
 write_csv(example, example_path)
-
-symbols_tr <- sample(unique(data_combined_filtered$symbol), 100)
-
-train_tr <- filter(train, symbol %in% symbols_tr)
-write_csv(train_tr, train_tr_path)
-tsprint(str_glue("nrow(train_tr) = {nrow(train_tr)}"))
-
-test_tr <- filter(test, symbol %in% symbols_tr)
-write_csv(test_tr, test_tr_path)
-tsprint(str_glue("nrow(test_tr) = {nrow(test_tr)}"))

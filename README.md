@@ -1,568 +1,224 @@
-# Stock Trading Model with PPO and Beta Policy
+# Stock Trading with PPO: Technical Summary
 
-## Overview
+## Model Design
 
-This system trains a reinforcement learning agent to make portfolio allocation decisions for stock trading. The model uses an LSTM-based policy network that outputs a **Beta distribution** over continuous target positions in [0,1], enabling smooth, differentiable trading strategies.
+### Architecture
+The `TradingPolicyNetwork` is an LSTM-based actor-critic network with Beta distribution output for continuous position targeting.
 
-**Key Features:**
-- Beta distribution policy for continuous [0,1] position targets
-- Multi-GPU distributed training with PyTorch DDP
-- Generalized Advantage Estimation (GAE) for variance reduction
-- Proximal Policy Optimization (PPO) for stable training
-- Vectorized episode simulation for efficiency
+**Components:**
+- **Feature Encoder**: 2-layer LSTM (hidden_size=128) processes SEQ_LEN=60 timesteps of market features
+- **Position Encoder**: Linear layer (1→32) with ReLU encodes current position
+- **Combined Representation**: LSTM final hidden state concatenated with position embedding (160 dimensions)
+- **Policy Head**: MLP (160→64→2) outputs Beta distribution parameters (α, β)
+- **Value Head**: MLP (160→64→1) outputs state value estimate
 
----
+**Output Distribution:**
+- Alpha and beta parameters: `softplus(raw) + 1.0` ensures α,β > 1 (unimodal distribution)
+- Target position sampled from Beta(α, β) ∈ [0, 1]
 
-## Model Architecture
+**Initialization:**
+- Orthogonal weight initialization with gain √2
+- Zero bias initialization
 
-### Network Structure
+### Input Processing
+**Features:** All columns except symbol, date, open, close (pre-normalized)
 
-```
-PolicyModel
-├── LSTM (n_features → 128, 2 layers, dropout=0.1)
-│   └── Processes 60-day feature sequences
-├── State FC (3 → 32 → ReLU → 32)
-│   └── Encodes [cash, holding, portfolio] state
-└── Combined Features (160) →
-    ├── Policy Head (160 → 64 → ReLU → 2)
-    │   └── Outputs α and β for Beta(α, β)
-    └── Value Head (160 → 64 → ReLU → 1)
-        └── Estimates state value V(s)
-```
-
-### Beta Distribution Policy
-
-The model outputs parameters (α, β) for a Beta distribution:
-- **Training**: Sample `target ~ Beta(α, β)` for exploration
-- **Testing**: Use mean `target = α/(α+β)` for deterministic policy
-- **Range**: Targets are naturally in [0, 1]
-
-**Advantages of Beta Distribution:**
-- Bounded support [0, 1] matches position fractions
-- Flexible shapes (peaked, uniform, U-shaped)
-- Smooth gradients through reparameterization trick
-- Natural entropy regularization
-
----
-
-## Data Preparation
-
-### 1. Loading and Indexing
-
-**Input Format:**
-- CSV files with columns: `symbol`, `date`, and features
-- All columns except `symbol` and `date` are treated as features
-- Features starting with `p_` are price features (e.g., `p_open`, `p_close`)
-
-**Process:**
-1. Load train/test CSVs
-2. Sort by symbol and date
-3. Build symbol index: `{symbol: (start_idx, end_idx)}`
-4. Store as contiguous NumPy arrays for fast slicing
-
-### 2. Sample Pool Construction
-
-**Requirements:**
-- Simulation length: 240 days
-- Sequence length: 60 days
-- Required length: 300 days
-
-**Pool Building:**
-```python
-For each symbol with ≥ 300 days:
-    For each valid end position:
-        index_start = index_end - 299
-        Add (symbol, index_start, index_end) to pool
-```
-
-**Parallelization:**
-- Symbols chunked across CPU cores
-- Each worker builds pool for its chunk
-- Results merged into single pool
-
-### 3. Episode Extraction
-
-For each sampled (symbol, index_start, index_end):
-1. Extract 300-day window of features and prices
-2. **Scale price features** by `p_close` at day 0:
-   ```python
-   price_features /= p_close[day_0]
-   ```
-3. Store for simulation
-
-**Day Indexing:**
-- Days 0-59: Sequence history (not simulated)
-- Day 0: Reference day (index 59 in data)
-- Days 0-239: Simulation period (indices 59-298)
-
----
+**Position Normalization:**
+- Raw position: `holdings × close / portfolio`
+- Normalized: `(position - 0.5) / s` where `s = 1 / (4 × (2α₀ + 1))` and `α₀ = softplus(0) + 1`
 
 ## Trade Simulation
 
-### 1. Initial State
+Function: `simulate_trading()`
 
-```python
-index_0 = 59  # First simulation day
-cash_0 = 100.0
-holding_0 = 0.0
-portfolio_0 = cash_0 + holding_0 * p_close[index_0]
+Simulation runs for SIM_LEN=240 trading days per episode.
+
+### Indexing Convention
+- Simulation data segment: rows [0, SEQ_LEN + SIM_LEN - 1]
+- day_0 = row index SEQ_LEN - 1 (60th row, 0-indexed as 59)
+- Simulation loop: step ∈ [0, SIM_LEN - 1]
+- day_idx = SEQ_LEN - 1 + step
+
+### Step-by-Step Simulation (for each step)
+
+**Step 1: Calculate Current State**
+```
+day_idx = SEQ_LEN - 1 + step
+current_close = close_prices[day_idx]
+current_portfolio = cash + holdings × current_close
+current_position = holdings × current_close / current_portfolio
 ```
 
-### 2. Model Input Preparation
-
-At each simulation step `t`:
-
-**Sequence Features (60 days):**
-```python
-seq = features[t:t+60]  # Already scaled by p_close[day_0]
-seq[:, price_features] -= 1.0  # Center price features
+**Step 2: Prepare Model Input**
+```
+feature_window = features[step : step + SEQ_LEN]  # 60-day window
+normalized_position = (current_position - 0.5) / position_std
 ```
 
-**State Information:**
-```python
-info = [
-    cash / cash_0 - 1.0,      # Normalized cash
-    holding / cash_0 - 1.0,   # Normalized holding
-    portfolio / cash_0 - 1.0  # Normalized portfolio
-]
+**Step 3: Model Inference (batched)**
+```
+α, β, value = model(feature_window, normalized_position)
+if is_training:
+    target = sample from Beta(α, β)
+    logprob = log_prob(target)
+else:
+    target = α / (α + β)  # distribution mean
 ```
 
-**Why this normalization?**
-- Price features scaled by initial reference → relative changes
-- Cash/holding/portfolio scaled by initial cash → portfolio fractions
-- Centering by -1 → zero-centered inputs for better gradients
-
-### 3. Action Selection
-
-**Model Inference:**
-```python
-α, β, V(s) = model(seq, info)
-target = sample from Beta(α, β)  # Training
-target = α/(α+β)                  # Testing (mean)
+**Step 4: Execute Trade**
+```
+next_open = open_prices[day_idx + 1]
+max_total_shares = cash / next_open + holdings
+desired_shares = target × max_total_shares
+share_delta = desired_shares - holdings
+max_buyable = cash / next_open
+trade_quantity = floor(clip(share_delta, -holdings, max_buyable))
+holdings = holdings + trade_quantity
+cash = cash - trade_quantity × next_open
 ```
 
-### 4. Trade Execution
-
-**Trade Calculation:**
-```python
-max_position = cash / p_open[t+1] + holding
-desired_position = target * max_position
-trade = desired_position - holding
-
-# Constraints:
-# - Can't sell more than holding: trade ≥ -holding
-# - Can't buy more than cash allows: trade ≤ cash / p_open
-trade = floor(clip(trade, -holding, cash / p_open))
+**Step 5: Final Portfolio**
+```
+final_close = close_prices[SEQ_LEN - 1 + SIM_LEN]
+final_portfolio = cash + holdings × final_close
 ```
 
-**State Update:**
-```python
-holding[t+1] = holding[t] + trade
-cash[t+1] = cash[t] - trade * p_open[t+1]
-portfolio[t+1] = cash[t+1] + holding[t+1] * p_close[t+1]
+**Step 6: Calculate Rewards**
+```
+rewards = portfolio_values[1:] / portfolio_values[:-1] - 1
 ```
 
-### 5. Reward Computation
+## Generalized Advantage Estimation (GAE)
 
-**Step Reward:**
-```python
-reward[t] = (portfolio[t+1] - portfolio[t]) / portfolio[t]
-```
+Function: `compute_advantages_and_targets()`
 
-This gives portfolio return for each step, measuring performance.
-
----
-
-## Evaluation (GAE)
-
-### 1. Value Estimation
-
-After simulating all episodes, batch estimate values:
-```python
-V(s) = model.value_head(encode(seq, info))
-```
-
-For terminal states, use **target network** for bootstrap:
-```python
-V(s_final) = model.value_target(encode(seq_final, info_final))
-```
-
-Target network is a slowly-updated copy (EMA with τ=0.005) for stable bootstrapping.
-
-### 2. Generalized Advantage Estimation
+**Bootstrap Value:**
+- Compute value estimate for terminal state using final observation
 
 **GAE Computation (backward pass):**
-```python
-For t = T-1 down to 0:
-    if t == T-1:
-        V_next = V(s_final)  # Bootstrap
-    else:
-        V_next = V(s[t+1])
-
-    δ[t] = reward[t] + γ * V_next - V(s[t])
-    A[t] = δ[t] + γ * λ * A[t+1]
-
-value_target[t] = A[t] + V(s[t])
+```
+for t = num_steps-1 down to 0:
+    next_value = bootstrap (if t = num_steps-1) else values[t+1]
+    td_error = rewards[t] + γ × next_value - values[t]
+    gae = td_error + γ × λ × gae
+    advantages[t] = gae
 ```
 
-**Parameters:**
-- γ = 0.99 (discount factor)
-- λ = 0.95 (GAE parameter)
-
-**Advantage Normalization:**
-```python
-A = (A - mean(A)) / (std(A) + ε)
+**Value Targets:**
+```
+value_targets = advantages + values  # before normalization
+advantages = (advantages - mean) / (std + ε)
 ```
 
-This reduces variance and stabilizes training.
-
----
+Parameters: γ=0.99, λ=0.95
 
 ## Training
 
-### 1. Training Loop Structure
+Function: `execute_ppo_update()`
 
-```python
-For each epoch:
-    Shuffle training pool
-    Split samples across GPUs (episode-level parallelism)
+### PPO Update
 
-    For each batch of episodes (1024 episodes):
-        # Simulation phase
-        results = simulate_episodes(samples, model)
+**Per Update:**
+1. Sample EPISODES_PER_UPDATE=1024 episodes stratified by symbol
+2. Run simulation to collect experiences
+3. Compute GAE advantages and value targets
+4. Run PPO_EPOCHS=4 epochs of mini-batch updates
 
-        # Evaluation phase
-        advantages, value_targets = compute_gae(results, model)
+**Mini-batch Training:**
+```
+for each mini-batch (size=BATCH_SIZE=4096):
+    α, β, value = model(states, positions)
+    log_probs = Beta(α, β).log_prob(target)
+    ratio = exp(log_probs - old_logprobs)
 
-        # Training phase
-        metrics = train_step(model, optimizer, batch)
+    # Clipped policy loss
+    clipped_ratio = clip(ratio, 1-ε, 1+ε)
+    policy_loss = -min(ratio × advantages, clipped_ratio × advantages)
+
+    # Value loss
+    value_loss = MSE(value, value_targets)
+
+    # Entropy bonus (decaying)
+    entropy = Beta(α, β).entropy()
+
+    # Total loss
+    total_loss = policy_loss + 0.5 × value_loss - entropy_coef × entropy
 ```
 
-### 2. Loss Functions
+**Entropy Coefficient Schedule:**
+- Start: 0.05
+- End: 0.001
+- Linear decay over first 80% of training
 
-**Policy Loss (PPO Clipped Objective):**
-```python
-ratio = π_new(a|s) / π_old(a|s)
-clipped_ratio = clip(ratio, 1-ε, 1+ε)
-L_policy = -E[min(ratio * A, clipped_ratio * A)]
+**Optimizer:** AdamW (lr=3e-4, weight_decay=1e-5)
+**Learning Rate Schedule:** Cosine annealing to lr/10
+**Gradient Clipping:** max_norm=0.5
+
+### Total Updates Calculation
 ```
-
-where:
-- π(a|s) = Beta(α, β).log_prob(target)
-- ε = 0.2 (clip parameter)
-
-**Value Loss:**
-```python
-L_value = E[(V(s) - value_target)²]
+n = average segments per symbol
+k = ceil(log(1 - MAX_COVERAGE) / log(1 - 1/n))
 ```
+Where MAX_COVERAGE=0.999
 
-**Entropy Bonus:**
-```python
-L_entropy = -E[Beta(α, β).entropy()]
-```
+## Validation
 
-**Total Loss:**
-```python
-L = L_policy + 0.5 * L_value - 0.01 * L_entropy
-```
+Function: `evaluate_model()` called during training
 
-### 3. Mini-Batch Updates
-
-**PPO Epochs:**
-For each of 4 epochs:
-```python
-Shuffle experience buffer
-For each mini-batch (4096 samples):
-    Compute losses
-    Backpropagate gradients
-    Clip gradients (norm ≤ 0.5)
-    Update parameters
-```
-
-### 4. Optimization
-
-**Optimizer:** AdamW
-- Learning rate: 3e-4
-- Weight decay: 1e-5
-- Cosine annealing schedule (LR → LR/10 over training)
-
-**Gradient Clipping:**
-- Max norm: 0.5
-- Prevents exploding gradients
-
----
-
-## Multi-GPU Distributed Training
-
-### 1. DistributedDataParallel (DDP)
-
-**Architecture:**
-```
-GPU 0: Model replica, processes episodes[0::4]
-GPU 1: Model replica, processes episodes[1::4]
-GPU 2: Model replica, processes episodes[2::4]
-GPU 3: Model replica, processes episodes[3::4]
-```
-
-**Synchronization:**
-- Gradients averaged via NCCL all-reduce
-- Each GPU maintains identical model parameters
-- No GPU bottleneck (unlike DataParallel)
-
-### 2. Episode-Level Parallelism
-
-Each GPU independently:
-1. Samples different subset of episodes
-2. Simulates trades on its subset
-3. Computes GAE for its subset
-4. Computes gradients on its subset
-
-Gradients automatically averaged across GPUs during backward pass.
-
-### 3. Metric Aggregation
-
-After each update, metrics synchronized across GPUs:
-```python
-metrics_tensor = [policy_loss, value_loss, entropy, clip_frac, return]
-dist.all_reduce(metrics_tensor, op=AVERAGE)
-```
-
-This ensures consistent logging across ranks.
-
----
-
-## Testing Procedure
-
-### 1. Group Sampling
-
-**Goal:** Evaluate on 1000 groups of 30 simulations each
+**Trigger:** Every EVAL_INTERVAL=50 updates, starting from update MIN_UPDATES=100
 
 **Process:**
-```python
-For each of 1000 groups:
-    Sample 30 episodes WITHOUT replacement from test pool
-    (Different groups may overlap via WITH replacement)
-```
+1. Run evaluation procedure (same as testing)
+2. Compare mean model return against best recorded
+3. If improved: save model as best, reset patience counter
+4. If not improved: increment stale counter by EVAL_INTERVAL
 
-**Parallelization:**
-- Group sampling parallelized across CPU cores
-- Each worker samples multiple groups with different random seeds
+**Early Stopping:**
+- Patience = PATIENCE_FRAC × total_updates = 0.2 × total_updates
+- Stop if no improvement for patience updates
 
-### 2. Simulation
+**Outputs:**
+- Intermediate models: `model_{update}.pt`
+- Best model: `model_best.pt`
+- Plots: `plot_{update}.png`, `plot_best.png`
 
-Run simulations with:
-- **Deterministic policy:** Use Beta mean (α/(α+β))
-- Same trade execution as training
-- No exploration
+## Testing / Evaluation
 
-### 3. Return Calculation
+Function: `evaluate_model()`
 
-**Model Return:**
-```python
-model_return = (portfolio_final - cash_0) / cash_0
-```
+**Sampling:**
+1. Sample TEST_GROUPS=1000 groups with deterministic seeds
+2. Each group: SIMS_PER_GROUP=30 segments sampled without replacement from test pool
+3. Groups sampled with replacement across the 1000 groups
 
-**Baseline Return (Buy-and-Hold):**
-```python
-baseline_return = (p_close[final] - p_open[day_0]) / p_open[day_0]
-```
+**Simulation:**
+- Run trade simulation with is_training=False (use Beta mean instead of sampling)
+- Compute model_returns = final_portfolio / INIT_CASH - 1
+- Compute baseline_returns = final_close / first_open - 1
 
-### 4. Statistical Analysis
+**Aggregation:**
+1. Average returns within each group (30 simulations → 1 observation)
+2. Report mean and std across 1000 group means
 
-**Per-Group Aggregation:**
-```python
-For each group:
-    model_mean[group] = mean(model_returns in group)
-    baseline_mean[group] = mean(baseline_returns in group)
-```
+**Multi-GPU:**
+- Samples distributed across GPUs (rank-interleaved)
+- Results gathered via all_gather
 
-**Overall Statistics:**
-```python
-model_performance = {
-    'mean': mean(model_mean across groups),
-    'std': std(model_mean across groups)
-}
+## Reproducibility
 
-baseline_performance = {
-    'mean': mean(baseline_mean across groups),
-    'std': std(baseline_mean across groups)
-}
-```
-
-This approach:
-- Reduces variance through group averaging
-- Provides robust performance estimates
-- Enables statistical comparison
-
----
-
-## Key Design Decisions
-
-### 1. Beta Distribution vs Discrete Actions
-
-**Beta Distribution (Current):**
-- ✅ Continuous position control
-- ✅ Smooth gradients via reparameterization
-- ✅ Natural bounds [0, 1]
-- ✅ Flexible distribution shapes
-
-**Discrete Actions (Alternative):**
-- Limited to fixed position sizes
-- Requires action masking
-- Less smooth optimization landscape
-
-### 2. Position Target Formulation
-
-**Formula:** `trade = target * (cash/price + holding) - holding`
-
-**Interpretation:**
-- `cash/price + holding` = maximum position if all-in
-- `target` ∈ [0, 1] = fraction of maximum position
-- `target = 0` → hold no shares (pure cash)
-- `target = 1` → maximum long position (all-in)
-- `target = 0.5` → balanced 50/50 portfolio
-
-### 3. Normalization Strategy
-
-**Price Features:**
-- Scale by initial closing price → relative changes
-- Center by -1 → zero-centered for gradients
-
-**State Variables:**
-- Scale by initial cash → fraction of starting capital
-- Center by -1 → captures deviation from initial state
-
-This keeps inputs well-scaled regardless of absolute price levels.
-
-### 4. GAE with Target Network
-
-**Target network benefits:**
-- Stable bootstrap values
-- Reduces moving target problem
-- Smooths value estimates
-
-**Slow updates (τ=0.005):**
-- Prevents rapid fluctuations
-- Maintains consistency across episodes
-- Similar to DQN's target network
-
----
-
-## Performance Characteristics
-
-### Computational Complexity
-
-**Per Episode:**
-- Simulation: O(T × B) where T=240 steps, B=batch size
-- GAE: O(T × N) where N=episodes
-- Training: O(E × T × N / M) where E=4 epochs, M=minibatch size
-
-**GPU Utilization:**
-- Inference: Fully batched across episodes
-- GAE: Fully GPU-accelerated
-- Training: Mini-batch SGD on GPU
-
-### Scalability
-
-**Multi-GPU Efficiency:**
-- 2 GPUs: ~1.7x speedup
-- 4 GPUs: ~3.2x speedup
-- 8 GPUs: ~5.8x speedup
-
-**Bottlenecks:**
-- CPU: Episode extraction (vectorized, parallelized)
-- GPU: LSTM forward pass (batched)
-- Communication: Minimal (only gradients synced)
-
----
-
-## Configuration Reference
-
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| `SIM_LEN` | 240 | Simulation days per episode |
-| `SEQ_LEN` | 60 | LSTM sequence length |
-| `INIT_CASH` | 100.0 | Starting capital |
-| `GAMMA` | 0.99 | Discount factor |
-| `GAE_LAMBDA` | 0.95 | GAE parameter λ |
-| `CLIP_EPS` | 0.2 | PPO clipping threshold |
-| `PPO_EPOCHS` | 4 | Mini-batch epochs per update |
-| `LR` | 3e-4 | Learning rate |
-| `BATCH_SIZE` | 4096 | Mini-batch size |
-| `EPISODES_PER_UPDATE` | 1024 | Episodes between updates |
-| `NUM_EPOCHS` | 10 | Training epochs |
-| `TEST_GROUPS` | 1000 | Test groups |
-| `SIMS_PER_GROUP` | 30 | Simulations per group |
-
----
+**Seeding:**
+- Global seed (SEED=42) set via `set_seed()` for random, numpy, torch
+- Worker seeds: SEED + rank
+- Stratified sampling: deterministic seed per update (update_idx × world_size + rank)
+- Evaluation: deterministic seeds from `random.Random(SEED)`
 
 ## Output Files
 
-**Models:**
-- `models/trading_model.pt` - Trained model weights
-
-**Logs:**
-- `models/training.log` - Per-update training metrics
-
-**Plots:**
-- `models/training_results.png` - Training curves and test results
-  - Policy loss over time
-  - Value loss over time
-  - Training returns over time
-  - Policy entropy over time
-  - Test return distributions
-  - Model vs baseline scatter plot
-
----
-
-## Usage
-
-```bash
-# Ensure data files exist
-# data/train.csv
-# data/test.csv
-
-# Run training (uses all available GPUs)
-python train_model.py
-
-# Output will show:
-# - Data loading progress
-# - Pool construction progress
-# - Per-update training metrics
-# - Final test performance
-```
-
-**Console Output Example:**
-```
-Stock Trading with PPO and Beta Policy
-System: 15 CPUs, 4 GPUs
-
-Loading data
-  Train: 8,234,567 rows, 4,997 symbols [2.3s]
-  Test: 2,123,456 rows, 1,234 symbols [0.8s]
-  Features: 26 (6 price features)
-
-Building sample pools
-  Train: 4,459,380 samples, 4,997 symbols [11.3s]
-  Test: 1,123,456 samples, 1,234 symbols [3.2s]
-
-Launching 4 training processes
-Model initialized: 1,234,567 parameters, 4 GPUs
-
-Training: 1089 updates/epoch, 10890 total
-Epoch | Update     | PolLoss | ValLoss | Entropy | Clip   | Return
-    1 | 1/10890    |  0.1234 |  0.2345 |  0.4567 |  0.078 |  0.0234
-    ...
-   10 | 10890/10890|  0.0567 |  0.1234 |  0.3456 |  0.045 |  0.0678
-
-Training completed [2345.6s]
-Model saved: models/trading_model.pt
-
-Testing
-  Model:    mean=0.0456, std=0.0234
-  Baseline: mean=0.0234, std=0.0123
-Testing completed [45.6s]
-Plots saved: models/training_results.png [0.8s]
-
-Training pipeline completed
-```
+| File | Description |
+|------|-------------|
+| training.log | Per-update metrics |
+| model_{n}.pt | Checkpoint at update n |
+| model_best.pt | Best validation model |
+| model_final.pt | Final model (best weights) |
+| plot_{n}.png | Training/validation plots |
+| plot_final.png | Final test results |

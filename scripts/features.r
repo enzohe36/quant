@@ -165,6 +165,7 @@ calculate_scale_params <- function(data, ..., robust = FALSE) {
   } else {
     \(x) sd(x, na.rm = TRUE)
   }
+
   data %>%
     select(...) %>%
     summarise(
@@ -172,20 +173,28 @@ calculate_scale_params <- function(data, ..., robust = FALSE) {
     ) %>%
     pivot_longer(
       everything(),
-      names_to = c("column", ".value"),
+      names_to = c("column", "stat"),
       names_sep = "_(?=(center|disp)$)"
+    ) %>%
+    pivot_wider(
+      names_from = column,
+      values_from = value
     )
 }
 
 scale_features <- function(data, scale_params) {
-  params_list <- split(scale_params, scale_params$column)
+  center_vals <- scale_params %>% filter(stat == "center") %>% select(-stat)
+  disp_vals <- scale_params %>% filter(stat == "disp") %>% select(-stat)
+
+  cols_to_scale <- setdiff(names(scale_params), "stat")
+
   data %>%
     mutate(
       across(
-        all_of(scale_params$column),
+        all_of(cols_to_scale),
         ~ {
-          p <- params_list[[cur_column()]]
-          (. - p$center) / p$disp
+          col_name <- cur_column()
+          (. - center_vals[[col_name]]) / disp_vals[[col_name]]
         }
       )
     )
