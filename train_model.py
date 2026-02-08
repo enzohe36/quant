@@ -1,701 +1,629 @@
 """
-Stock Trading with PPO and Beta Policy
-Multi-GPU distributed training for portfolio optimization
+PPO + Transformer RL for stock trading.
+
+Stock CSV: symbol, date, price, <stock_feat_1>, ...
+Market CSV: date, <mkt_feat_1>, ...  (all columns except date start with "mkt_")
+
+Market features are loaded once from a single file and joined to stock features
+by date when building episodes. The model receives [stock | market] features.
+Features with "mkt_" prefix route through the cross-attention pathway.
 """
 
 import os
-import sys
-import time
-import math
-import random
 import logging
-import warnings
+import argparse
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
+
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
-from torch.distributions import Beta
-from torch.nn.parallel import DistributedDataParallel as DDP
-from multiprocessing import cpu_count
-from concurrent.futures import ProcessPoolExecutor
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-warnings.filterwarnings('ignore')
 
-DATA_PATH = "data_train.csv"
-OUTPUT_DIR = "models/"
-
-SEQ_LEN = 60
-SIM_LEN = 240
-REQ_LEN = SEQ_LEN + SIM_LEN
-INIT_CASH = 1e6
-TRAIN_SPLIT = 0.8
-
-HIDDEN_SIZE = 128
-POSITION_EMBED_SIZE = 32
-
-GAMMA = 0.99
-GAE_LAMBDA = 0.95
-POLICY_CLIP = 0.2
-VALUE_COEF = 0.5
-PPO_EPOCHS = 4
-LEARNING_RATE = 3e-4
-WEIGHT_DECAY = 1e-5
-GRAD_CLIP = 0.5
-ENTROPY_COEF_START = 0.05
-ENTROPY_COEF_END = 0.001
-ENTROPY_DECAY_FRAC = 0.8
-
-MIN_UPDATES = 100
-EVAL_INTERVAL = 50
-PATIENCE_FRAC = 0.2
-MAX_COVERAGE = 0.999
-
-EPISODES_PER_UPDATE = 1024
-BATCH_SIZE = 4096
-TEST_GROUPS = 1000
-SIMS_PER_GROUP = 30
-
-SEED = 42
-MACHINE_EPS = float(np.finfo(np.float64).eps)
-NUM_CPUS = max(1, cpu_count() - 1)
-NUM_GPUS = max(1, torch.cuda.device_count())
-
-_GLOBAL_DATA = {}
+N_WORKERS = max(1, (os.cpu_count() or 2) - 1)
+log = logging.getLogger("rl")
 
 
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+class Config:
+    train_path: str = "train.csv"
+    test_path: str = "test.csv"
+    mkt_path: str = "mkt_feats.csv"
+    save_dir: str = "checkpoints"
+    log_file: str = "training.log"
+    lookback: int = 10
+    episode_length: int = 240
+    transaction_cost: float = 0.001
+    n_actions: int = 3
+    d_model: int = 128
+    d_ff: int = 256
+    n_heads: int = 4
+    n_layers: int = 2
+    dropout: float = 0.1
+    mkt_dropout: float = 0.3
+    gamma: float = 0.99
+    gae_lambda: float = 0.95
+    clip_eps: float = 0.2
+    value_coeff: float = 0.5
+    entropy_coeff: float = 0.01
+    max_grad_norm: float = 0.5
+    n_epochs: int = 50
+    ppo_epochs: int = 4
+    batch_size: int = 256
+    inference_batch: int = 4096
+    lr: float = 3e-4
+    patience: int = 10
+    seed: int = 42
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+    def to_dict(self):
+        return {k: getattr(self, k) for k in self.__class__.__annotations__}
 
 
-def get_base_model(model):
-    return model.module if isinstance(model, DDP) else model
+# feature grouping
+
+def split_groups(cols):
+    groups = defaultdict(list)
+    for i, c in enumerate(cols):
+        groups[c.split(".")[0] if "." in c else c.split("_")[0]].append(i)
+    stk, mkt = {}, {}
+    for name, idx in groups.items():
+        (mkt if name.startswith("mkt") else stk)[name] = idx
+    stk_idx = sorted(i for v in stk.values() for i in v)
+    mkt_idx = sorted(i for v in mkt.values() for i in v)
+    return stk, mkt, stk_idx, mkt_idx
 
 
-class TradingPolicyNetwork(nn.Module):
-    def __init__(self, num_features, hidden_size=HIDDEN_SIZE, position_embed_size=POSITION_EMBED_SIZE):
+# vectorized environment
+
+class VecEnv:
+    def __init__(self, episodes, lookback, tx_cost):
+        self.N = len(episodes)
+        self.lookback = lookback
+        self.tx_cost = tx_cost
+        self.features = np.stack([e["features"] for e in episodes])
+        self.log_returns = np.stack([e["log_returns"] for e in episodes])
+        self.T = self.features.shape[1]
+        self.n_steps = self.T - lookback
+
+    def reset(self):
+        self.t = self.lookback
+        self.pos = np.zeros(self.N, dtype=np.float64)
+        return self.features[:, self.t - self.lookback: self.t]
+
+    def step(self, actions):
+        new_pos = actions.astype(np.float64) - 1.0
+        rewards = (self.pos * self.log_returns[:, self.t]
+                   - self.tx_cost * np.abs(new_pos - self.pos)).astype(np.float32)
+        self.pos = new_pos
+        self.t += 1
+        done = self.t >= self.T
+        return (None if done else
+                self.features[:, self.t - self.lookback: self.t]), rewards, done
+
+
+# model
+
+class GroupProjection(nn.Module):
+    def __init__(self, group_indices, d_model):
         super().__init__()
-        self.feature_encoder = nn.LSTM(num_features, hidden_size, num_layers=2, batch_first=True)
-        self.position_encoder = nn.Sequential(nn.Linear(1, position_embed_size), nn.ReLU())
-        combined_size = hidden_size + position_embed_size
-        self.policy_head = nn.Sequential(nn.Linear(combined_size, 64), nn.ReLU(), nn.Linear(64, 2))
-        self.value_head = nn.Sequential(nn.Linear(combined_size, 64), nn.ReLU(), nn.Linear(64, 1))
-        self._initialize_weights()
-
-    def _initialize_weights(self):
-        for name, param in self.named_parameters():
-            if 'weight' in name and param.dim() >= 2:
-                nn.init.orthogonal_(param, gain=np.sqrt(2))
-            elif 'bias' in name:
-                nn.init.zeros_(param)
-
-    def forward(self, feature_sequence, position):
-        lstm_out, _ = self.feature_encoder(feature_sequence)
-        encoded = torch.cat([lstm_out[:, -1], self.position_encoder(position)], dim=1)
-        policy_params = self.policy_head(encoded)
-        alpha = F.softplus(policy_params[:, 0]) + 1.0
-        beta = F.softplus(policy_params[:, 1]) + 1.0
-        value = self.value_head(encoded).squeeze(-1)
-        return alpha, beta, value
-
-
-def _build_segments_worker(args):
-    symbols, symbol_ranges, required_length = args
-    segments = []
-    for symbol in symbols:
-        start_idx, end_idx = symbol_ranges[symbol]
-        num_rows = end_idx - start_idx
-        for i in range(num_rows - required_length + 1):
-            segments.append((symbol, i, i + required_length - 1))
-    return segments
-
-
-def initialize_global_data(dataframe, feature_columns):
-    global _GLOBAL_DATA
-    dataframe = dataframe.sort_values(['symbol', 'date']).reset_index(drop=True)
-    symbols = dataframe['symbol'].values
-    symbol_ranges = {}
-    start_idx, prev_symbol = 0, symbols[0]
-    for i in range(1, len(symbols)):
-        if symbols[i] != prev_symbol:
-            symbol_ranges[prev_symbol] = (start_idx, i)
-            prev_symbol, start_idx = symbols[i], i
-    symbol_ranges[prev_symbol] = (start_idx, len(symbols))
-    _GLOBAL_DATA = {
-        'features': dataframe[feature_columns].values.astype(np.float32),
-        'open_prices': dataframe['open'].values.astype(np.float32),
-        'close_prices': dataframe['close'].values.astype(np.float32),
-        'symbol_ranges': symbol_ranges,
-    }
-
-
-def build_segment_pool(symbols):
-    symbol_ranges = _GLOBAL_DATA['symbol_ranges']
-    valid_symbols = [s for s in symbols if s in symbol_ranges]
-    chunk_size = max(1, len(valid_symbols) // (NUM_CPUS * 4) + 1)
-    worker_args = [
-        (valid_symbols[i:i + chunk_size], symbol_ranges, REQ_LEN)
-        for i in range(0, len(valid_symbols), chunk_size)
-    ]
-    pool = []
-    with ProcessPoolExecutor(max_workers=NUM_CPUS) as executor:
-        for chunk in executor.map(_build_segments_worker, worker_args):
-            pool.extend(chunk)
-    return pool
-
-
-def build_symbol_stratified_pools(segment_pool):
-    stratified_pools = {}
-    for symbol, start, end in segment_pool:
-        stratified_pools.setdefault(symbol, []).append((symbol, start, end))
-    return stratified_pools
-
-
-def sample_stratified_segments(stratified_pools, num_samples, rng):
-    symbols = list(stratified_pools.keys())
-    working_pools = {s: list(p) for s, p in stratified_pools.items()}
-    for s in working_pools:
-        rng.shuffle(working_pools[s])
-    samples = []
-    symbol_idx = 0
-    for _ in range(num_samples):
-        for _ in range(len(symbols)):
-            symbol = symbols[symbol_idx]
-            symbol_idx = (symbol_idx + 1) % len(symbols)
-            if working_pools[symbol]:
-                samples.append(working_pools[symbol].pop())
-                break
-        else:
-            break
-    return samples
-
-
-def extract_episode_data(samples):
-    features = _GLOBAL_DATA['features']
-    open_prices = _GLOBAL_DATA['open_prices']
-    close_prices = _GLOBAL_DATA['close_prices']
-    symbol_ranges = _GLOBAL_DATA['symbol_ranges']
-    global_starts = np.array([symbol_ranges[s][0] + i for s, i, _ in samples], dtype=np.int64)
-    row_indices = np.arange(REQ_LEN)[None, :] + global_starts[:, None]
-    return features[row_indices], open_prices[row_indices], close_prices[row_indices]
-
-
-def simulate_trading(samples, model, device, is_training=True):
-    position_mean = 0.5
-    position_alpha = F.softplus(torch.tensor(0.0)).item() + 1.0
-    position_std = 1.0 / (4.0 * (2.0 * position_alpha + 1.0))
-
-    features, open_prices, close_prices = extract_episode_data(samples)
-    num_episodes = len(samples)
-
-    cash = np.full(num_episodes, INIT_CASH, np.float32)
-    holdings = np.zeros(num_episodes, np.float32)
-
-    stored_states = np.zeros((num_episodes, SIM_LEN, SEQ_LEN, features.shape[-1]), np.float32)
-    stored_positions = np.zeros((num_episodes, SIM_LEN), np.float32)
-    stored_targets = np.zeros((num_episodes, SIM_LEN), np.float32)
-    stored_logprobs = np.zeros((num_episodes, SIM_LEN), np.float32)
-    stored_values = np.zeros((num_episodes, SIM_LEN), np.float32)
-    stored_entropies = np.zeros((num_episodes, SIM_LEN), np.float32)
-    portfolio_values = np.zeros((num_episodes, SIM_LEN + 1), np.float32)
-
-    base_model = get_base_model(model)
-    base_model.eval()
-
-    with torch.no_grad():
-        for step in range(SIM_LEN):
-            day_idx = SEQ_LEN - 1 + step
-            current_close = close_prices[:, day_idx]
-            current_portfolio = cash + holdings * current_close
-            portfolio_values[:, step] = current_portfolio
-
-            current_position = holdings * current_close / np.maximum(current_portfolio, MACHINE_EPS)
-            normalized_position = (current_position - position_mean) / position_std
-
-            feature_window = features[:, step:step + SEQ_LEN]
-            stored_states[:, step] = feature_window
-            stored_positions[:, step] = normalized_position
-
-            step_targets = np.zeros(num_episodes, np.float32)
-            step_logprobs = np.zeros(num_episodes, np.float32)
-            step_values = np.zeros(num_episodes, np.float32)
-            step_entropies = np.zeros(num_episodes, np.float32)
-
-            for batch_start in range(0, num_episodes, BATCH_SIZE):
-                batch_end = min(batch_start + BATCH_SIZE, num_episodes)
-                features_tensor = torch.from_numpy(feature_window[batch_start:batch_end]).to(device)
-                position_tensor = torch.from_numpy(
-                    normalized_position[batch_start:batch_end, None].astype(np.float32)
-                ).to(device)
-
-                alpha, beta, value = base_model(features_tensor, position_tensor)
-
-                if is_training:
-                    distribution = Beta(alpha, beta)
-                    sampled_target = distribution.sample()
-                    step_targets[batch_start:batch_end] = sampled_target.cpu().numpy()
-                    step_logprobs[batch_start:batch_end] = distribution.log_prob(sampled_target).cpu().numpy()
-                    step_entropies[batch_start:batch_end] = distribution.entropy().cpu().numpy()
-                else:
-                    step_targets[batch_start:batch_end] = (alpha / (alpha + beta)).cpu().numpy()
-                step_values[batch_start:batch_end] = value.cpu().numpy()
-
-            stored_targets[:, step] = step_targets
-            stored_logprobs[:, step] = step_logprobs
-            stored_values[:, step] = step_values
-            stored_entropies[:, step] = step_entropies
-
-            next_open = open_prices[:, day_idx + 1]
-            max_total_shares = cash / next_open + holdings
-            desired_shares = step_targets * max_total_shares
-            share_delta = desired_shares - holdings
-            max_buyable = cash / next_open
-            trade_quantity = np.floor(np.clip(share_delta, -holdings, max_buyable)).astype(np.float32)
-            cash = cash - trade_quantity * next_open
-            holdings = holdings + trade_quantity
-
-        final_close = close_prices[:, SEQ_LEN - 1 + SIM_LEN]
-        portfolio_values[:, SIM_LEN] = cash + holdings * final_close
-        rewards = portfolio_values[:, 1:] / np.maximum(portfolio_values[:, :-1], MACHINE_EPS) - 1
-
-    return {
-        'states': stored_states,
-        'positions': stored_positions,
-        'targets': stored_targets,
-        'logprobs': stored_logprobs,
-        'values': stored_values,
-        'entropies': stored_entropies,
-        'rewards': rewards,
-        'final_portfolio': portfolio_values[:, -1],
-        'first_open': open_prices[:, SEQ_LEN],
-        'final_close': final_close,
-    }
-
-
-def compute_advantages_and_targets(simulation_results, model, device):
-    base_model = get_base_model(model)
-    with torch.no_grad():
-        values = torch.from_numpy(simulation_results['values']).to(device)
-        rewards = torch.from_numpy(simulation_results['rewards']).to(device)
-        num_episodes, num_steps = values.shape
-
-        bootstrap_values = []
-        for batch_start in range(0, num_episodes, BATCH_SIZE):
-            batch_end = min(batch_start + BATCH_SIZE, num_episodes)
-            states_tensor = torch.from_numpy(simulation_results['states'][batch_start:batch_end, -1]).to(device)
-            positions_tensor = torch.from_numpy(
-                simulation_results['positions'][batch_start:batch_end, -1, None].astype(np.float32)
-            ).to(device)
-            _, _, value = base_model(states_tensor, positions_tensor)
-            bootstrap_values.append(value)
-        bootstrap = torch.cat(bootstrap_values)
-
-        advantages = torch.zeros_like(values)
-        gae = torch.zeros(num_episodes, device=device)
-        for t in reversed(range(num_steps)):
-            next_value = bootstrap if t == num_steps - 1 else values[:, t + 1]
-            td_error = rewards[:, t] + GAMMA * next_value - values[:, t]
-            gae = td_error + GAMMA * GAE_LAMBDA * gae
-            advantages[:, t] = gae
-
-        value_targets = advantages + values
-        advantages = (advantages - advantages.mean()) / (advantages.std() + MACHINE_EPS)
-
-    return advantages, value_targets
-
-
-def prepare_training_batch(simulation_results, advantages, value_targets, device):
-    num_features = simulation_results['states'].shape[-1]
-    return {
-        'states': torch.from_numpy(simulation_results['states'].reshape(-1, SEQ_LEN, num_features)).to(device),
-        'positions': torch.from_numpy(simulation_results['positions'].reshape(-1, 1).astype(np.float32)).to(device),
-        'targets': torch.from_numpy(simulation_results['targets'].reshape(-1)).to(device),
-        'old_logprobs': torch.from_numpy(simulation_results['logprobs'].reshape(-1)).to(device),
-        'advantages': advantages.reshape(-1),
-        'value_targets': value_targets.reshape(-1),
-    }
-
-
-def compute_entropy_coefficient(current_update, total_updates):
-    progress = current_update / total_updates
-    if progress < ENTROPY_DECAY_FRAC:
-        return ENTROPY_COEF_START + (ENTROPY_COEF_END - ENTROPY_COEF_START) * progress / ENTROPY_DECAY_FRAC
-    return ENTROPY_COEF_END
-
-
-def execute_ppo_update(model, optimizer, batch, entropy_coef):
-    model.train()
-    device = next(model.parameters()).device
-    num_samples = len(batch['states'])
-    metrics = {'policy_loss': 0.0, 'value_loss': 0.0, 'entropy': 0.0, 'clip_frac': 0.0}
-    num_minibatches = 0
-
-    for _ in range(PPO_EPOCHS):
-        indices = torch.randperm(num_samples, device=device)
-        for minibatch_indices in indices.split(BATCH_SIZE):
-            if len(minibatch_indices) < BATCH_SIZE // 4:
-                continue
-
-            alpha, beta, value = model(
-                batch['states'][minibatch_indices],
-                batch['positions'][minibatch_indices]
-            )
-            distribution = Beta(alpha, beta)
-            log_probs = distribution.log_prob(batch['targets'][minibatch_indices])
-            entropy = distribution.entropy().mean()
-
-            ratio = torch.exp(log_probs - batch['old_logprobs'][minibatch_indices])
-            advantages = batch['advantages'][minibatch_indices]
-            clipped_ratio = torch.clamp(ratio, 1.0 - POLICY_CLIP, 1.0 + POLICY_CLIP)
-            policy_loss = -torch.min(ratio * advantages, clipped_ratio * advantages).mean()
-
-            value_loss = F.mse_loss(value, batch['value_targets'][minibatch_indices])
-            total_loss = policy_loss + VALUE_COEF * value_loss - entropy_coef * entropy
-
-            optimizer.zero_grad()
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-            optimizer.step()
-
-            with torch.no_grad():
-                metrics['policy_loss'] += policy_loss.item()
-                metrics['value_loss'] += value_loss.item()
-                metrics['entropy'] += entropy.item()
-                metrics['clip_frac'] += ((ratio - 1).abs() > POLICY_CLIP).float().mean().item()
-                num_minibatches += 1
-
-    return {k: v / max(num_minibatches, 1) for k, v in metrics.items()}
-
-
-def _sample_test_groups_worker(args):
-    pool, num_sims, seeds = args
-    return [random.Random(seed).sample(pool, k=min(num_sims, len(pool))) for seed in seeds]
-
-
-def evaluate_model(segment_pool, model, device, rank, world_size):
-    rng = random.Random(SEED)
-    group_seeds = [rng.randint(0, 2**31) for _ in range(TEST_GROUPS)]
-
-    chunk_size = max(1, TEST_GROUPS // NUM_CPUS + 1)
-    worker_args = [
-        (segment_pool, SIMS_PER_GROUP, group_seeds[i:i + chunk_size])
-        for i in range(0, TEST_GROUPS, chunk_size)
-    ]
-
-    all_samples = []
-    with ProcessPoolExecutor(max_workers=NUM_CPUS) as executor:
-        for groups in executor.map(_sample_test_groups_worker, worker_args):
-            for group in groups:
-                all_samples.extend(group)
-
-    local_samples = all_samples[rank::world_size]
-    results = simulate_trading(local_samples, model, device, is_training=False)
-
-    final_portfolio = torch.from_numpy(results['final_portfolio']).to(device)
-    first_open = torch.from_numpy(results['first_open']).to(device)
-    final_close = torch.from_numpy(results['final_close']).to(device)
-
-    if world_size > 1:
-        gathered_portfolio = [torch.zeros_like(final_portfolio) for _ in range(world_size)]
-        gathered_open = [torch.zeros_like(first_open) for _ in range(world_size)]
-        gathered_close = [torch.zeros_like(final_close) for _ in range(world_size)]
-        dist.all_gather(gathered_portfolio, final_portfolio)
-        dist.all_gather(gathered_open, first_open)
-        dist.all_gather(gathered_close, final_close)
-        final_portfolio = torch.cat(gathered_portfolio).cpu().numpy()
-        first_open = torch.cat(gathered_open).cpu().numpy()
-        final_close = torch.cat(gathered_close).cpu().numpy()
-    else:
-        final_portfolio = final_portfolio.cpu().numpy()
-        first_open = first_open.cpu().numpy()
-        final_close = final_close.cpu().numpy()
-
-    model_returns = final_portfolio / INIT_CASH - 1
-    baseline_returns = final_close / first_open - 1
-
-    model_group_means = [
-        model_returns[i * SIMS_PER_GROUP:(i + 1) * SIMS_PER_GROUP].mean()
-        for i in range(TEST_GROUPS)
-    ]
-    baseline_group_means = [
-        baseline_returns[i * SIMS_PER_GROUP:(i + 1) * SIMS_PER_GROUP].mean()
-        for i in range(TEST_GROUPS)
-    ]
-    return model_group_means, baseline_group_means
-
-
-def create_training_plot(history, model_returns, baseline_returns, filepath):
-    fig, axes = plt.subplots(2, 3, figsize=(15, 9))
-
-    axes[0, 0].plot([h['policy_loss'] for h in history], 'b-', alpha=0.7)
-    axes[0, 0].set(xlabel='Update', ylabel='Loss', title='Policy Loss')
-    axes[0, 0].grid(True, alpha=0.3)
-
-    axes[0, 1].plot([h['value_loss'] for h in history], 'r-', alpha=0.7)
-    axes[0, 1].set(xlabel='Update', ylabel='Loss', title='Value Loss')
-    axes[0, 1].grid(True, alpha=0.3)
-
-    axes[0, 2].plot([h['entropy'] for h in history], 'm-', alpha=0.7)
-    axes[0, 2].set(xlabel='Update', ylabel='Entropy', title='Entropy')
-    axes[0, 2].grid(True, alpha=0.3)
-
-    axes[1, 0].plot([h['mean_return'] for h in history], 'g-', alpha=0.7, label='Model')
-    axes[1, 0].plot([h['mean_baseline'] for h in history], 'orange', alpha=0.7, label='Baseline')
-    axes[1, 0].axhline(0, color='k', ls='--', alpha=0.3)
-    axes[1, 0].legend(fontsize=9)
-    axes[1, 0].set(xlabel='Update', ylabel='Return', title='Training')
-    axes[1, 0].grid(True, alpha=0.3)
-
-    axes[1, 1].hist(model_returns, bins=50, alpha=0.6, label='Model', color='blue')
-    axes[1, 1].hist(baseline_returns, bins=50, alpha=0.6, label='Baseline', color='orange')
-    axes[1, 1].axvline(np.mean(model_returns), color='blue', ls='--', lw=2,
-                       label=f'Model μ={np.mean(model_returns):.3f}')
-    axes[1, 1].axvline(np.mean(baseline_returns), color='orange', ls='--', lw=2,
-                       label=f'Base μ={np.mean(baseline_returns):.3f}')
-    axes[1, 1].legend(fontsize=9)
-    axes[1, 1].set(xlabel='Return', ylabel='Freq', title='Test')
-    axes[1, 1].grid(True, alpha=0.3)
-
-    min_val = min(min(baseline_returns), min(model_returns))
-    max_val = max(max(baseline_returns), max(model_returns))
-    axes[1, 2].scatter(baseline_returns, model_returns, alpha=0.3, s=10, color='green')
-    axes[1, 2].plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.5, lw=2, label='y=x')
-    axes[1, 2].legend()
-    axes[1, 2].set(xlabel='Baseline', ylabel='Model', title='Comparison')
-    axes[1, 2].grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(filepath, dpi=150)
-    plt.close()
-
-
-def training_worker(rank, world_size, train_stratified_pools, test_pool, total_updates, num_features, data):
-    global _GLOBAL_DATA
-    _GLOBAL_DATA = data
-
-    set_seed(SEED + rank)
-
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
-    backend = "gloo" if world_size == 1 else "nccl"
-    dist.init_process_group(backend, rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
-    device = torch.device(f'cuda:{rank}')
-
-    logger = None
-    if rank == 0:
-        logger = logging.getLogger('training')
-        logger.setLevel(logging.INFO)
-        logger.handlers.clear()
-        handler = logging.FileHandler(os.path.join(OUTPUT_DIR, 'training.log'), mode='w')
-        handler.setFormatter(logging.Formatter('%(message)s'))
-        logger.addHandler(handler)
-
-    model = TradingPolicyNetwork(num_features).to(device)
-    if world_size > 1:
-        model = DDP(model, device_ids=[rank], find_unused_parameters=False)
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, total_updates, LEARNING_RATE / 10)
-
-    patience_limit = int(total_updates * PATIENCE_FRAC) + 1
-    best_validation_return = float('-inf')
-    best_model_state = None
-    updates_without_improvement = 0
-
-    if rank == 0:
-        num_params = sum(p.numel() for p in get_base_model(model).parameters() if p.requires_grad)
-        print(f"Model: {num_params:,} params, {world_size} GPUs")
-        print(f"Training: {total_updates} max updates, patience={patience_limit}")
-        header = (f"{'update':>11} | {'pol_loss':>8} | {'val_loss':>8} | {'entropy':>8} | "
-                  f"{'ent_coef':>8} | {'pol_clip':>8} | {'return':>8} | {'baseline':>8}")
-        print(header)
-        if logger:
-            logger.info(header)
-
-    training_history = []
-    start_time = time.time()
-    final_update_count = total_updates
-    stopped_early = False
-
-    for update_idx in range(total_updates):
-        sample_rng = random.Random(update_idx * world_size + rank)
-        samples = sample_stratified_segments(train_stratified_pools, EPISODES_PER_UPDATE, sample_rng)
-
-        sim_results = simulate_trading(samples, model, device, is_training=True)
-        advantages, value_targets = compute_advantages_and_targets(sim_results, model, device)
-        batch = prepare_training_batch(sim_results, advantages, value_targets, device)
-
-        entropy_coef = compute_entropy_coefficient(update_idx, total_updates)
-        metrics = execute_ppo_update(model, optimizer, batch, entropy_coef)
-        scheduler.step()
-
-        mean_return = sim_results['final_portfolio'].mean() / INIT_CASH - 1
-        mean_baseline = (sim_results['final_close'] / sim_results['first_open'] - 1).mean()
-
-        sync_tensor = torch.tensor([
-            metrics['policy_loss'], metrics['value_loss'], metrics['entropy'],
-            metrics['clip_frac'], mean_return, mean_baseline
-        ], device=device)
-        if world_size > 1:
-            dist.all_reduce(sync_tensor, op=dist.ReduceOp.AVG)
-        pol_loss, val_loss, ent, clip_frac, mean_ret, mean_base = sync_tensor.tolist()
-
-        metrics = {
-            'policy_loss': pol_loss, 'value_loss': val_loss, 'entropy': ent,
-            'clip_frac': clip_frac, 'mean_return': mean_ret, 'mean_baseline': mean_base
+        self.names = sorted(group_indices)
+        n = len(self.names)
+        base, rem = d_model // n, d_model % n
+        self.proj = nn.ModuleDict()
+        for i, name in enumerate(self.names):
+            self.proj[name] = nn.Linear(len(group_indices[name]),
+                                        base + (1 if i < rem else 0))
+            self.register_buffer(f"i_{name}",
+                                 torch.tensor(group_indices[name], dtype=torch.long))
+
+    def forward(self, x):
+        return torch.cat([self.proj[n](x[..., getattr(self, f"i_{n}")])
+                          for n in self.names], dim=-1)
+
+
+class Policy(nn.Module):
+    def __init__(self, stk_groups, n_mkt, stk_idx, mkt_idx, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.register_buffer("stk_idx", torch.tensor(stk_idx, dtype=torch.long))
+        self.register_buffer("mkt_idx", torch.tensor(mkt_idx, dtype=torch.long))
+        self.has_mkt = n_mkt > 0
+
+        self.stk_proj = GroupProjection(stk_groups, cfg.d_model)
+        self.stk_norm = nn.LayerNorm(cfg.d_model)
+        self.pos_emb = nn.Parameter(torch.randn(1, cfg.lookback, cfg.d_model) * 0.02)
+
+        if self.has_mkt:
+            self.mkt_proj = nn.Sequential(
+                nn.Linear(n_mkt, cfg.d_model), nn.LayerNorm(cfg.d_model))
+            self.cross_attn = nn.MultiheadAttention(
+                cfg.d_model, cfg.n_heads, dropout=cfg.dropout, batch_first=True)
+            self.cross_norm = nn.LayerNorm(cfg.d_model)
+
+        enc = nn.TransformerEncoderLayer(
+            cfg.d_model, cfg.n_heads, cfg.d_ff,
+            cfg.dropout, batch_first=True, activation="gelu")
+        self.transformer = nn.TransformerEncoder(enc, cfg.n_layers)
+
+        self.pi = nn.Sequential(
+            nn.Linear(cfg.d_model, 64), nn.ReLU(), nn.Linear(64, cfg.n_actions))
+        self.vf = nn.Sequential(
+            nn.Linear(cfg.d_model, 64), nn.ReLU(), nn.Linear(64, 1))
+
+    def forward(self, x):
+        h = self.stk_norm(self.stk_proj(x[..., self.stk_idx])) + self.pos_emb
+        if self.has_mkt:
+            m = self.mkt_proj(x[..., self.mkt_idx])
+            if self.training and self.cfg.mkt_dropout > 0:
+                mask = torch.bernoulli(torch.full(
+                    (m.shape[0], 1, 1), 1 - self.cfg.mkt_dropout,
+                    device=m.device, dtype=m.dtype))
+                m = m * mask / (1 - self.cfg.mkt_dropout)
+            out, _ = self.cross_attn(query=h, key=m, value=m)
+            h = self.cross_norm(h + out)
+        h = self.transformer(h).mean(dim=1)
+        return self.pi(h), self.vf(h).squeeze(-1)
+
+
+def get_action(model, states, deterministic=False):
+    logits, values = model(states)
+    dist = torch.distributions.Categorical(logits=logits)
+    actions = logits.argmax(-1) if deterministic else dist.sample()
+    return actions, dist.log_prob(actions), values
+
+
+def eval_actions(model, states, actions):
+    logits, values = model(states)
+    dist = torch.distributions.Categorical(logits=logits)
+    return dist.log_prob(actions), dist.entropy(), values
+
+
+# rollout buffer
+
+class Buffer:
+    def __init__(self):
+        self.s, self.a, self.r, self.lp, self.v, self.d = [], [], [], [], [], []
+
+    def add_episode(self, states, actions, rewards, log_probs, values):
+        n = len(rewards)
+        self.s.extend(states); self.a.extend(actions); self.r.extend(rewards)
+        self.lp.extend(log_probs); self.v.extend(values)
+        self.d.extend([False] * (n - 1) + [True])
+
+    def tensors(self, device, gamma, lam):
+        v = np.array(self.v, dtype=np.float32)
+        r = np.array(self.r, dtype=np.float32)
+        d = np.array(self.d, dtype=np.float32)
+        T = len(r)
+        adv = np.zeros(T, dtype=np.float32)
+        g = 0.0
+        for t in reversed(range(T)):
+            nv = 0.0 if t == T - 1 else v[t + 1] * (1 - d[t])
+            delta = r[t] + gamma * nv - v[t]
+            g = delta + gamma * lam * (1 - d[t]) * g
+            adv[t] = g
+        ret = adv + v
+        std = adv.std()
+        if std > 1e-8:
+            adv = (adv - adv.mean()) / std
+        return {
+            "s": torch.tensor(np.array(self.s), dtype=torch.float32, device=device),
+            "a": torch.tensor(np.array(self.a), dtype=torch.long, device=device),
+            "lp": torch.tensor(np.array(self.lp), dtype=torch.float32, device=device),
+            "adv": torch.tensor(adv, dtype=torch.float32, device=device),
+            "ret": torch.tensor(ret, dtype=torch.float32, device=device),
         }
 
-        if rank == 0:
-            training_history.append(metrics)
-            line = (f"{update_idx + 1:>5}/{total_updates:<5} | {pol_loss:>8.3f} | {val_loss:>8.3f} | "
-                    f"{ent:>8.3f} | {entropy_coef:>8.3f} | {clip_frac:>8.3f} | "
-                    f"{mean_ret:>8.3f} | {mean_base:>8.3f}")
-            if logger:
-                logger.info(line)
-            sys.stdout.write(f"\r{line}")
-            sys.stdout.flush()
+    def clear(self):
+        self.__init__()
 
-        if (update_idx + 1) >= MIN_UPDATES and (update_idx + 1) % EVAL_INTERVAL == 0:
-            val_start = time.time()
-            val_model_ret, val_base_ret = evaluate_model(test_pool, model, device, rank, world_size)
-            val_mean = np.mean(val_model_ret)
 
-            if rank == 0:
-                base_model = get_base_model(model)
-                torch.save(base_model.state_dict(), os.path.join(OUTPUT_DIR, f'model_{update_idx + 1}.pt'))
-                create_training_plot(training_history, val_model_ret, val_base_ret,
-                                     os.path.join(OUTPUT_DIR, f'plot_{update_idx + 1}.png'))
-                print(f"\n  [Val] mean={val_mean:.4f}, std={np.std(val_model_ret):.4f}, "
-                      f"base={np.mean(val_base_ret):.4f} [{time.time() - val_start:.1f}s]")
-                if logger:
-                    logger.info(f"  [Val] mean={val_mean:.4f}")
+# data loading
 
-            if val_mean > best_validation_return:
-                best_validation_return = val_mean
-                updates_without_improvement = 0
-                best_model_state = {k: v.cpu().clone() for k, v in get_base_model(model).state_dict().items()}
-                if rank == 0:
-                    torch.save(best_model_state, os.path.join(OUTPUT_DIR, 'model_best.pt'))
-                    create_training_plot(training_history, val_model_ret, val_base_ret,
-                                         os.path.join(OUTPUT_DIR, 'plot_best.png'))
-                    print(f"  [Val] New best: {val_mean:.4f}")
-                    if logger:
-                        logger.info(f"  [Val] New best: {val_mean:.4f}")
-            else:
-                updates_without_improvement += EVAL_INTERVAL
-                if rank == 0:
-                    print(f"  [Val] No improvement, patience: {patience_limit - updates_without_improvement}")
-                    if logger:
-                        logger.info(f"  [Val] patience: {patience_limit - updates_without_improvement}")
+def load_data(path):
+    df = pd.read_csv(path).sort_values(["symbol", "date"]).reset_index(drop=True)
+    feat_cols = [c for c in df.columns if c not in ("symbol", "date", "price")]
+    data = {}
+    for sym, g in df.groupby("symbol"):
+        p = g["price"].values.astype(np.float64)
+        lr = np.zeros(len(p), dtype=np.float32)
+        lr[1:] = np.log(p[1:] / p[:-1]).astype(np.float32)
+        data[str(sym)] = {
+            "features": g[feat_cols].values.astype(np.float32),
+            "log_returns": lr,
+            "dates": g["date"].tolist(),
+            "prices": p,
+        }
+    return data, feat_cols
 
-            if updates_without_improvement >= patience_limit:
-                if rank == 0:
-                    print(f"\n  Early stop at update {update_idx + 1}")
-                    if logger:
-                        logger.info(f"  Early stop at update {update_idx + 1}")
-                final_update_count = update_idx + 1
-                stopped_early = True
-                break
 
-    if rank == 0:
-        elapsed = time.time() - start_time
-        status = 'Early stopped' if stopped_early else 'Completed'
-        print(f"\n\n{status} at update {final_update_count} [{elapsed:.1f}s]")
+def load_mkt_data(path):
+    df = pd.read_csv(path).sort_values("date").reset_index(drop=True)
+    cols = [c for c in df.columns if c != "date"]
+    return {
+        "features": df[cols].values.astype(np.float32),
+        "date_to_idx": {d: i for i, d in enumerate(df["date"])},
+        "cols": cols,
+    }
 
-        base_model = get_base_model(model)
-        if best_model_state:
-            base_model.load_state_dict(best_model_state)
-        torch.save(base_model.state_dict(), os.path.join(OUTPUT_DIR, 'model_final.pt'))
-        print("Models saved")
 
-    if world_size > 1:
-        dist.barrier()
+# chunk generation
 
-    if rank == 0:
-        print("\nTesting")
-    test_start = time.time()
-    test_model_ret, test_base_ret = evaluate_model(test_pool, model, device, rank, world_size)
+def _chunk_starts(args):
+    sym, T, lookback, ep_len, seed = args
+    cs = lookback + ep_len
+    if T < cs:
+        return sym, []
+    rng = np.random.default_rng(seed)
+    anchor = rng.integers(0, T)
+    starts = set()
+    s = anchor
+    while s + cs <= T:
+        starts.add(s); s += ep_len
+    s = anchor - ep_len
+    while s >= 0:
+        if s + cs <= T:
+            starts.add(s)
+        s -= ep_len
+    return sym, sorted(starts)
 
-    if rank == 0:
-        print(f"  Model:    mean={np.mean(test_model_ret):.4f}, std={np.std(test_model_ret):.4f}")
-        print(f"  Baseline: mean={np.mean(test_base_ret):.4f}, std={np.std(test_base_ret):.4f}")
-        print(f"  [{time.time() - test_start:.1f}s]")
-        create_training_plot(training_history, test_model_ret, test_base_ret,
-                             os.path.join(OUTPUT_DIR, 'plot_final.png'))
-        print("Plots saved")
 
-    dist.destroy_process_group()
+def gen_chunks(data, mkt, cfg, rng):
+    syms = list(data)
+    seeds = rng.integers(0, 2**63, size=len(syms))
+    args = [(s, len(data[s]["features"]), cfg.lookback,
+             cfg.episode_length, int(seeds[i])) for i, s in enumerate(syms)]
+    with ProcessPoolExecutor(max_workers=N_WORKERS) as pool:
+        results = list(pool.map(_chunk_starts, args))
 
+    cs = cfg.lookback + cfg.episode_length
+    date_to_idx = mkt["date_to_idx"]
+    mkt_feats = mkt["features"]
+    eps = []
+    for sym, starts in results:
+        d = data[sym]
+        for s in starts:
+            chunk_dates = d["dates"][s:s+cs]
+            mkt_rows = [date_to_idx.get(dt) for dt in chunk_dates]
+            if any(r is None for r in mkt_rows):
+                continue
+            combined = np.concatenate(
+                [d["features"][s:s+cs], mkt_feats[mkt_rows]], axis=1)
+            eps.append({
+                "symbol": sym, "features": combined,
+                "log_returns": d["log_returns"][s:s+cs],
+                "dates": chunk_dates, "prices": d["prices"][s:s+cs],
+            })
+    return eps
+
+
+# rollout collection
+
+def collect(model, episodes, cfg):
+    buf = Buffer()
+    model.eval()
+    with torch.no_grad():
+        for bs in range(0, len(episodes), cfg.inference_batch):
+            batch = episodes[bs:bs+cfg.inference_batch]
+            N = len(batch)
+            env = VecEnv(batch, cfg.lookback, cfg.transaction_cost)
+            states = env.reset()
+            ns, nF = env.n_steps, states.shape[-1]
+            aS = np.empty((ns, N, cfg.lookback, nF), dtype=np.float32)
+            aA = np.empty((ns, N), dtype=np.int64)
+            aR = np.empty((ns, N), dtype=np.float32)
+            aL = np.empty((ns, N), dtype=np.float32)
+            aV = np.empty((ns, N), dtype=np.float32)
+            for t in range(ns):
+                aS[t] = states
+                act, lp, val = get_action(model, torch.from_numpy(states).to(cfg.device))
+                an = act.cpu().numpy()
+                aA[t], aL[t], aV[t] = an, lp.cpu().numpy(), val.cpu().numpy()
+                states, aR[t], _ = env.step(an)
+            for i in range(N):
+                buf.add_episode(aS[:,i], aA[:,i], aR[:,i], aL[:,i], aV[:,i])
+    return buf
+
+
+# PPO update
+
+def ppo_update(model, optimizer, buf, cfg):
+    model.train()
+    d = buf.tensors(cfg.device, cfg.gamma, cfg.gae_lambda)
+    n = len(d["s"])
+    tpl = tvl = te = 0.0
+    nu = 0
+    base = model.module if hasattr(model, "module") else model
+    for _ in range(cfg.ppo_epochs):
+        idx = torch.randperm(n, device=cfg.device)
+        for start in range(0, n, cfg.batch_size):
+            i = idx[start:min(start+cfg.batch_size, n)]
+            lp, ent, val = eval_actions(model, d["s"][i], d["a"][i])
+            ratio = torch.exp(lp - d["lp"][i])
+            adv = d["adv"][i]
+            pl = -torch.min(ratio * adv,
+                            torch.clamp(ratio, 1-cfg.clip_eps, 1+cfg.clip_eps) * adv).mean()
+            vl = F.mse_loss(val, d["ret"][i])
+            loss = pl + cfg.value_coeff * vl - cfg.entropy_coeff * ent.mean()
+            optimizer.zero_grad(); loss.backward()
+            nn.utils.clip_grad_norm_(base.parameters(), cfg.max_grad_norm)
+            optimizer.step()
+            tpl += pl.item(); tvl += vl.item(); te += ent.mean().item(); nu += 1
+    return {"pl": tpl/max(nu,1), "vl": tvl/max(nu,1), "ent": te/max(nu,1)}
+
+
+# buy and hold worker
+
+def _bh_batch(args):
+    lr_list, lookback, tx_cost = args
+    lr = np.stack(lr_list)
+    N, T = lr.shape
+    ns = T - lookback
+    pos = np.zeros(N, dtype=np.float64)
+    rw = np.empty((ns, N), dtype=np.float32)
+    for t in range(ns):
+        new = np.ones(N, dtype=np.float64)
+        rw[t] = (pos * lr[:, lookback+t] - tx_cost * np.abs(new - pos)).astype(np.float32)
+        pos = new
+    return rw
+
+
+# evaluation
+
+def evaluate(model, episodes, cfg, verbose=False):
+    ne = len(episodes)
+    if ne == 0:
+        return {"model_return": 0, "bh_return": 0, "excess": 0,
+                "beat_rate": 0, "metrics": [], "rows": []}
+    ns = cfg.episode_length
+    mr = np.empty((ns, ne), dtype=np.float32)
+    mp = np.empty((ns, ne), dtype=np.int64)
+
+    model.eval()
+    with torch.no_grad():
+        for bs in range(0, ne, cfg.inference_batch):
+            batch = episodes[bs:bs+cfg.inference_batch]
+            N = len(batch)
+            env = VecEnv(batch, cfg.lookback, cfg.transaction_cost)
+            st = env.reset()
+            for t in range(ns):
+                act, _, _ = get_action(model, torch.from_numpy(st).to(cfg.device), True)
+                an = act.cpu().numpy()
+                mp[t, bs:bs+N] = an - 1
+                st, rw, _ = env.step(an)
+                mr[t, bs:bs+N] = rw
+
+    bsz = max(1, ne // N_WORKERS)
+    bh_args = [([e["log_returns"] for e in episodes[i:i+bsz]],
+                cfg.lookback, cfg.transaction_cost) for i in range(0, ne, bsz)]
+    br = np.empty((ns, ne), dtype=np.float32)
+    with ProcessPoolExecutor(max_workers=N_WORKERS) as pool:
+        for i, rw in enumerate(pool.map(_bh_batch, bh_args)):
+            s = i * bsz
+            br[:, s:s+rw.shape[1]] = rw
+
+    rows, metrics = [], []
+    for i in range(ne):
+        m, b = mr[:, i], br[:, i]
+        ms, bs_ = m.std(), b.std()
+        mret = float(m.mean() / ms) if ms > 1e-8 else 0.0
+        bret = float(b.mean() / bs_) if bs_ > 1e-8 else 0.0
+        pos = mp[:, i]
+        nt = int(np.sum(np.diff(pos) != 0))
+        td = (m != 0).sum()
+        wr = float((m[m != 0] > 0).mean()) if td > 0 else 0.0
+        cum = np.cumsum(m)
+        dd = float((np.maximum.accumulate(cum) - cum).max()) if len(cum) else 0.0
+        metrics.append({"symbol": episodes[i]["symbol"], "model": mret, "bh": bret,
+                        "excess": mret - bret, "dd": dd, "trades": nt, "wr": wr})
+        dates = episodes[i]["dates"][cfg.lookback:]
+        prices = episodes[i]["prices"][cfg.lookback:]
+        for t in range(ns):
+            rows.append({"symbol": episodes[i]["symbol"], "date": dates[t],
+                         "price": prices[t], "position": int(pos[t]),
+                         "model_pnl": float(m[t]), "bh_pnl": float(b[t])})
+
+    mrets = [x["model"] for x in metrics]
+    brets = [x["bh"] for x in metrics]
+    excs = [x["excess"] for x in metrics]
+    beat = float(np.mean([e > 0 for e in excs]))
+
+    if verbose:
+        log.info("")
+        log.info(f"{'Sym':>8} {'Model':>8} {'B&H':>8} {'Excess':>8} "
+                 f"{'DD':>7} {'Trd':>5} {'WR':>6}")
+        for x in metrics:
+            log.info(f"{x['symbol']:>8} {x['model']:8.4f} {x['bh']:8.4f} "
+                     f"{x['excess']:+8.4f} {x['dd']:7.4f} {x['trades']:5d} {x['wr']:6.3f}")
+        log.info("")
+        log.info(f"{'':>10} {'Mean':>8} {'Median':>8}")
+        log.info(f"{'Model':>10} {np.mean(mrets):8.4f} {np.median(mrets):8.4f}")
+        log.info(f"{'B&H':>10} {np.mean(brets):8.4f} {np.median(brets):8.4f}")
+        log.info(f"{'Excess':>10} {np.mean(excs):+8.4f} {np.median(excs):+8.4f}")
+        log.info(f"  Beat rate: {beat:.1%}  |  Episodes: {ne}")
+
+    return {"model_return": float(np.mean(mrets)), "bh_return": float(np.mean(brets)),
+            "excess": float(np.mean(excs)), "beat_rate": beat,
+            "metrics": metrics, "rows": rows}
+
+
+# plotting
+
+def plot(h, path):
+    ep = range(1, len(h["tr_mod"]) + 1)
+    fig, ax = plt.subplots(2, 2, figsize=(14, 10))
+
+    ax[0,0].plot(ep, h["tr_mod"], "b-", label="Train", alpha=.8)
+    ax[0,0].plot(ep, h["vl_mod"], "r-", label="Val", alpha=.8)
+    ax[0,0].plot(ep, h["tr_bh"], "b--", label="Train B&H", alpha=.5)
+    ax[0,0].plot(ep, h["vl_bh"], "r--", label="Val B&H", alpha=.5)
+    ax[0,0].set_ylabel("Return (mean/std)"); ax[0,0].set_title("Return")
+    ax[0,0].legend(fontsize=8); ax[0,0].grid(True, alpha=.3)
+
+    ax[0,1].plot(ep, h["tr_exc"], "b-", label="Train", alpha=.8)
+    ax[0,1].plot(ep, h["vl_exc"], "r-", label="Val", alpha=.8)
+    ax[0,1].axhline(0, color="k", ls="--", alpha=.3)
+    ax[0,1].set_ylabel("Excess over B&H"); ax[0,1].set_title("Excess")
+    ax[0,1].legend(fontsize=8); ax[0,1].grid(True, alpha=.3)
+
+    ax[1,0].plot(ep, h["pl"], "b-", label="Policy", alpha=.8)
+    ax[1,0].plot(ep, h["vl_loss"], "r-", label="Value", alpha=.8)
+    ax[1,0].set_xlabel("Epoch"); ax[1,0].set_ylabel("Loss")
+    ax[1,0].set_title("Losses"); ax[1,0].legend(fontsize=8); ax[1,0].grid(True, alpha=.3)
+
+    ax[1,1].plot(ep, h["ent"], "g-", label="Entropy", alpha=.8)
+    a2 = ax[1,1].twinx()
+    a2.plot(ep, h["beat"], "r-", label="Beat rate", alpha=.8)
+    a2.set_ylabel("Beat rate", color="r"); a2.set_ylim(0, 1)
+    ax[1,1].set_xlabel("Epoch"); ax[1,1].set_ylabel("Entropy", color="g")
+    ax[1,1].set_title("Entropy & Beat Rate"); ax[1,1].grid(True, alpha=.3)
+    l1, lb1 = ax[1,1].get_legend_handles_labels()
+    l2, lb2 = a2.get_legend_handles_labels()
+    ax[1,1].legend(l1+l2, lb1+lb2, fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
+
+
+# training loop
+
+def train(cfg):
+    os.makedirs(cfg.save_dir, exist_ok=True)
+    logging.basicConfig(
+        filename=os.path.join(cfg.save_dir, cfg.log_file),
+        filemode="w", level=logging.INFO,
+        format="%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+    torch.manual_seed(cfg.seed); np.random.seed(cfg.seed)
+    rng = np.random.default_rng(cfg.seed)
+
+    train_data, stk_cols = load_data(cfg.train_path)
+    test_data, _ = load_data(cfg.test_path)
+    mkt = load_mkt_data(cfg.mkt_path)
+    all_cols = stk_cols + mkt["cols"]
+    log.info(f"Train: {len(train_data)} symbols, {len(stk_cols)} stock feats, "
+             f"{len(mkt['cols'])} market feats")
+    log.info(f"Test:  {len(test_data)} symbols")
+
+    val_eps = gen_chunks(test_data, mkt, cfg,
+                         np.random.default_rng(cfg.seed + 1000))
+    log.info(f"Val episodes: {len(val_eps)} (fixed)")
+
+    stk_g, mkt_g, stk_i, mkt_i = split_groups(all_cols)
+    log.info(f"Stock groups: {len(stk_g)} ({len(stk_i)} feats)  "
+             f"Market groups: {len(mkt_g)} ({len(mkt_i)} feats)  "
+             f"Mkt dropout: {cfg.mkt_dropout}")
+
+    model = Policy(stk_g, len(mkt_i), stk_i, mkt_i, cfg).to(cfg.device)
+    n_gpus = torch.cuda.device_count()
+    dp = nn.DataParallel(model) if n_gpus > 1 else model
+    log.info(f"Params: {sum(p.numel() for p in model.parameters()):,}  "
+             f"Device: {f'{n_gpus} GPUs' if n_gpus > 1 else cfg.device}  "
+             f"Workers: {N_WORKERS}")
+
+    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr, eps=1e-5)
+    hist = defaultdict(list)
+    best_val, patience_ctr = -float("inf"), 0
+
+    hdr = (f"{'Ep':>4} {'PL':>7} {'VL':>7} {'Ent':>6} "
+           f"{'TrMod':>7} {'TrExc':>7} {'VlMod':>7} {'VlExc':>7} {'Beat':>6} {'#Ep':>5}")
+    log.info(f"Training up to {cfg.n_epochs} epochs, patience {cfg.patience}")
+    log.info(hdr)
+
+    for epoch in range(1, cfg.n_epochs + 1):
+        for pg in opt.param_groups:
+            pg["lr"] = cfg.lr * (1 - (epoch - 1) / cfg.n_epochs)
+
+        tr_eps = gen_chunks(train_data, mkt, cfg, rng)
+        buf = collect(dp, tr_eps, cfg)
+        loss = ppo_update(dp, opt, buf, cfg)
+        buf.clear()
+
+        tr = evaluate(dp, tr_eps, cfg)
+        vl = evaluate(dp, val_eps, cfg)
+
+        for k, v in [("tr_mod", tr["model_return"]), ("tr_bh", tr["bh_return"]),
+                      ("tr_exc", tr["excess"]), ("vl_mod", vl["model_return"]),
+                      ("vl_bh", vl["bh_return"]), ("vl_exc", vl["excess"]),
+                      ("beat", vl["beat_rate"]), ("pl", loss["pl"]),
+                      ("vl_loss", loss["vl"]), ("ent", loss["ent"])]:
+            hist[k].append(v)
+
+        log.info(f"{epoch:4d} {loss['pl']:7.4f} {loss['vl']:7.4f} {loss['ent']:6.4f} "
+                 f"{tr['model_return']:7.4f} {tr['excess']:+7.4f} "
+                 f"{vl['model_return']:7.4f} {vl['excess']:+7.4f} "
+                 f"{vl['beat_rate']:6.1%} {len(tr_eps):5d}")
+
+        _save(model, cfg, all_cols, stk_g, mkt_g, stk_i, mkt_i,
+              os.path.join(cfg.save_dir, "model_latest.pt"), epoch)
+        plot(dict(hist), os.path.join(cfg.save_dir, "training_curves.png"))
+
+        if vl["model_return"] > best_val:
+            best_val = vl["model_return"]
+            patience_ctr = 0
+            _save(model, cfg, all_cols, stk_g, mkt_g, stk_i, mkt_i,
+                  os.path.join(cfg.save_dir, "model_best.pt"), epoch)
+            log.info(f"  new best val {best_val:.4f}")
+        else:
+            patience_ctr += 1
+
+        if patience_ctr >= cfg.patience:
+            log.info(f"Early stop at epoch {epoch} (patience {cfg.patience})")
+            break
+
+    log.info(f"Done. Best val: {best_val:.4f}")
+
+    ckpt = torch.load(os.path.join(cfg.save_dir, "model_best.pt"),
+                      map_location=cfg.device, weights_only=False)
+    model.load_state_dict(ckpt["model_state_dict"])
+
+    log.info("FINAL EVAL (best model, fresh chunks)")
+    final_eps = gen_chunks(test_data, mkt, cfg,
+                           np.random.default_rng(cfg.seed + 9999))
+    log.info(f"Episodes: {len(final_eps)}")
+    res = evaluate(dp, final_eps, cfg, verbose=True)
+    pd.DataFrame(res["rows"]).to_csv(
+        os.path.join(cfg.save_dir, "test_results.csv"), index=False)
+    log.info(f"Results saved to {os.path.join(cfg.save_dir, 'test_results.csv')}")
+
+
+def _save(model, cfg, all_cols, stk_g, mkt_g, stk_i, mkt_i, path, epoch):
+    torch.save({"model_state_dict": model.state_dict(), "config": cfg.to_dict(),
+                "feature_cols": all_cols, "stock_groups": stk_g,
+                "market_groups": mkt_g, "stock_indices": stk_i,
+                "market_indices": mkt_i, "epoch": epoch}, path)
+
+
+# CLI
 
 def main():
-    global _GLOBAL_DATA
-
-    set_seed(SEED)
-
-    print("\nStock Trading with PPO")
-    print(f"System: {NUM_CPUS} CPUs, {NUM_GPUS} GPUs")
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    print("\nLoading data")
-    t0 = time.time()
-    dataframe = pd.read_csv(DATA_PATH)
-    dataframe['date'] = pd.to_datetime(dataframe['date'])
-    print(f"  {len(dataframe):,} rows, {dataframe['symbol'].nunique():,} symbols [{time.time() - t0:.1f}s]")
-
-    feature_columns = [c for c in dataframe.columns if c not in ['symbol', 'date', 'open', 'close']]
-    print(f"  Features: {len(feature_columns)}")
-
-    print("\nFiltering symbols")
-    t0 = time.time()
-    symbol_counts = dataframe.groupby('symbol').size()
-    valid_symbols = symbol_counts[symbol_counts >= REQ_LEN].index.tolist()
-    print(f"  Valid: {len(valid_symbols)} (excluded {len(symbol_counts) - len(valid_symbols)}) [{time.time() - t0:.1f}s]")
-
-    print("\nSplitting train/test")
-    t0 = time.time()
-    split_rng = random.Random(SEED)
-    split_rng.shuffle(valid_symbols)
-    num_train = int(len(valid_symbols) * TRAIN_SPLIT)
-    train_symbols, test_symbols = valid_symbols[:num_train], valid_symbols[num_train:]
-    print(f"  Train: {len(train_symbols)}, Test: {len(test_symbols)} [{time.time() - t0:.1f}s]")
-
-    print("\nInitializing data")
-    t0 = time.time()
-    initialize_global_data(dataframe[dataframe['symbol'].isin(valid_symbols)], feature_columns)
-    shared_data = _GLOBAL_DATA.copy()
-    print(f"  [{time.time() - t0:.1f}s]")
-
-    print("\nBuilding pools")
-    t0 = time.time()
-    train_pool = build_segment_pool(train_symbols)
-    test_pool = build_segment_pool(test_symbols)
-    train_stratified_pools = build_symbol_stratified_pools(train_pool)
-    print(f"  Train: {len(train_pool):,}, Test: {len(test_pool):,} [{time.time() - t0:.1f}s]")
-
-    avg_segments_per_symbol = len(train_pool) / max(len(train_symbols), 1)
-    total_updates = math.ceil(math.log(1 - MAX_COVERAGE) / math.log(1 - 1 / max(avg_segments_per_symbol, 1)))
-    print(f"  Avg segments/symbol: {avg_segments_per_symbol:.1f}")
-    print(f"  Total updates: {total_updates}")
-
-    print(f"\nLaunching {NUM_GPUS} processes")
-    if NUM_GPUS == 1:
-        training_worker(0, 1, train_stratified_pools, test_pool, total_updates, len(feature_columns), shared_data)
-    else:
-        torch.multiprocessing.spawn(
-            training_worker,
-            args=(NUM_GPUS, train_stratified_pools, test_pool, total_updates, len(feature_columns), shared_data),
-            nprocs=NUM_GPUS,
-            join=True
-        )
-    print("\nDone")
+    p = argparse.ArgumentParser()
+    p.add_argument("--train"); p.add_argument("--test"); p.add_argument("--mkt")
+    p.add_argument("--save_dir"); p.add_argument("--log_file")
+    p.add_argument("--epochs", type=int); p.add_argument("--lr", type=float)
+    p.add_argument("--lookback", type=int); p.add_argument("--episode_length", type=int)
+    p.add_argument("--tx_cost", type=float); p.add_argument("--mkt_dropout", type=float)
+    p.add_argument("--patience", type=int); p.add_argument("--seed", type=int)
+    a = p.parse_args()
+    cfg = Config()
+    if a.train: cfg.train_path = a.train
+    if a.test: cfg.test_path = a.test
+    if a.mkt: cfg.mkt_path = a.mkt
+    if a.save_dir: cfg.save_dir = a.save_dir
+    if a.log_file: cfg.log_file = a.log_file
+    if a.epochs: cfg.n_epochs = a.epochs
+    if a.lr: cfg.lr = a.lr
+    if a.lookback: cfg.lookback = a.lookback
+    if a.episode_length: cfg.episode_length = a.episode_length
+    if a.tx_cost: cfg.transaction_cost = a.tx_cost
+    if a.mkt_dropout is not None: cfg.mkt_dropout = a.mkt_dropout
+    if a.patience: cfg.patience = a.patience
+    if a.seed: cfg.seed = a.seed
+    train(cfg)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,9 @@
 # PRESET =======================================================================
 
 # library(sn)
+# library(patchwork)
+# library(bestNormalize)
+
 
 # HELPER FUNCTIONS =============================================================
 
@@ -12,6 +15,15 @@ run_sum <- function(x, n) {
 }
 
 run_mean <- function(x, n) run_sum(x, n) / n
+
+run_sd <- function(x, n) {
+  sapply(
+    seq_along(x),
+    function(i) if (i < n) NA_real_ else sd(x[(i - n + 1):i])
+  )
+}
+
+run_norm <- function(x, n) (x - run_mean(x, n)) / sd(x, n)
 
 run_min <- function(x, n) {
   sapply(
@@ -68,134 +80,199 @@ atr_na <- function(HLC, n = 14, ...) {
   return(result)
 }
 
-replace_missing <- function(x, replacement) {
-  x[is.infinite(x) | is.na(x)] <- replacement
-  return(x)
+
+# PLOTTING =====================================================================
+
+plot_dual_y <- function(x, y1, y2,
+                        xlab = "x",
+                        y1lab = "y1",
+                        y2lab = "y2",
+                        title = "",
+                        y1_color = "blue",
+                        y2_color = "red") {
+  # Calculate ranges for both series
+  min_y1 <- min(y1, na.rm = TRUE)
+  max_y1 <- max(y1, na.rm = TRUE)
+  range_y1 <- max_y1 - min_y1
+
+  min_y2 <- min(y2, na.rm = TRUE)
+  max_y2 <- max(y2, na.rm = TRUE)
+  range_y2 <- max_y2 - min_y2
+
+  # Scale y2 to match y1's range
+  df <- data.frame(
+    x = x,
+    y1 = y1,
+    y2 = y2,
+    y2_scaled = (y2 - min_y2) / range_y2 * range_y1 + min_y1
+  )
+
+  p <- ggplot(df, aes(x = x)) +
+    geom_line(aes(y = y1, color = "y1"), linewidth = 0.5) +
+    geom_line(aes(y = y2_scaled, color = "y2"), linewidth = 0.5) +
+    scale_y_continuous(
+      name = y1lab,
+      sec.axis = sec_axis(~ (. - min_y1) / range_y1 * range_y2 + min_y2,
+                         name = y2lab)
+    ) +
+    scale_color_manual(
+      values = c("y1" = y1_color, "y2" = y2_color),
+      labels = c(y1lab, y2lab)
+    ) +
+    labs(title = title, x = xlab, color = "") +
+    theme_minimal() +
+    theme(
+      axis.title.y.left = element_text(color = y1_color),
+      axis.text.y.left = element_text(color = y1_color),
+      axis.title.y.right = element_text(color = y2_color),
+      axis.text.y.right = element_text(color = y2_color)
+    )
+
+  print(p)
+  invisible(p)
 }
 
-calculate_avg_cost <- function(avg_price, to) {
-  n <- length(avg_price)
-  avg_cost <- numeric(n)
-  avg_cost[1] <- avg_price[1]
-  for (i in 2:n) {
-    avg_cost[i] <- (1 - to[i]) * avg_cost[i - 1] + to[i] * avg_price[i]
-  }
-  avg_cost[which(is.na(cumsum_na(to)) | cumsum_na(to) <= 1)] <- NA_real_
-  return(avg_cost)
-}
 
-normalize_sn <- function(x, silent = FALSE) {
-  x <- replace_missing(x, NA_real_)
+# NORMALIZERS ==================================================================
 
-  if (!silent) {
-    par(mfrow = c(1, 2))
-    q_orig <- quantile(x, probs = c(0.001, 0.999), na.rm = TRUE)
-    breaks_orig <- c(
-      min(x, na.rm = TRUE),
-      seq(q_orig[1], q_orig[2], length.out = 31),
-      max(x, na.rm = TRUE)
-    )
-    hist(
-      x, breaks = breaks_orig, probability = TRUE,
-      main = "Original Distribution",
-      xlab = "x", ylab = "Density",
-      xlim = q_orig
-    )
-  }
+# Main creation function
+create_normalizers <- function(
+  data, ..., method = c("scale", "robust_scale", "orderNorm")
+) {
+  method <- match.arg(method)
 
-  fit_sn <- selm(x ~ 1, family = "SN")
-  xi <- coef(fit_sn, param.type = "DP")["xi"]
-  omega <- coef(fit_sn, param.type = "DP")["omega"]
-  alpha <- coef(fit_sn, param.type = "DP")["alpha"]
-
-  if (!silent) {
-    x_seq <- seq(q_orig[1], q_orig[2], length.out = 1000)
-    lines(
-      x_seq, dsn(x_seq, xi = xi, omega = omega, alpha = alpha),
-      col = "red", lwd = 2
-    )
-  }
-
-  eps <- .Machine$double.eps
-  u <- psn(x, xi = xi, omega = omega, alpha = alpha)
-  u <- pmax(pmin(u, 1 - eps), eps)
-  x_symmetric <- qnorm(u)
-
-  if (!silent) {
-    q_trans <- quantile(x_symmetric, probs = c(0.001, 0.999), na.rm = TRUE)
-    breaks_trans <- c(
-      min(x_symmetric, na.rm = TRUE),
-      seq(q_trans[1], q_trans[2], length.out = 31),
-      max(x_symmetric, na.rm = TRUE)
-    )
-    hist(
-      x_symmetric, breaks = breaks_trans, probability = TRUE,
-      main = "Transformed Distribution",
-      xlab = "Transformed x", ylab = "Density",
-      xlim = q_trans
-    )
-    z_seq <- seq(q_trans[1], q_trans[2], length.out = 1000)
-    lines(z_seq, dnorm(z_seq, mean = 0, sd = 1), col = "blue", lwd = 2)
-    par(mfrow = c(1, 1))
-  }
-
-  if (!silent) {
-    cat("Fitted Skewed Normal Parameters:\n")
-    cat(sprintf("  Location (xi):     %.4f\n", xi))
-    cat(sprintf("  Scale (omega):        %.4f\n", omega))
-    cat(sprintf("  Shape/Skew (alpha):   %.4f\n", alpha))
-    cat("\nTransformation: Skewed Normal -> Standard Normal N(0,1)\n")
-    cat(sprintf("Original skewness:    %.4f\n",
-                moments::skewness(x, na.rm = TRUE)))
-    cat(sprintf("Transformed skewness: %.4f (should be ≈0)\n",
-                moments::skewness(x_symmetric, na.rm = TRUE)))
-  }
-
-  return(x_symmetric)
-}
-
-calculate_scale_params <- function(data, ..., robust = FALSE) {
-  center_fn <- if (robust) {
-    \(x) median(x, na.rm = TRUE)
-  } else {
-    \(x) mean(x, na.rm = TRUE)
-  }
-  disp_fn <- if (robust) {
-    \(x) mad(x, na.rm = TRUE)
-  } else {
-    \(x) sd(x, na.rm = TRUE)
-  }
-
-  data %>%
+  selected_cols <- data %>%
     select(...) %>%
-    summarise(
-      across(everything(), list(center = center_fn, disp = disp_fn))
-    ) %>%
-    pivot_longer(
-      everything(),
-      names_to = c("column", "stat"),
-      names_sep = "_(?=(center|disp)$)"
-    ) %>%
-    pivot_wider(
-      names_from = column,
-      values_from = value
-    )
+    names()
+
+  normalizers <- map(selected_cols, function(col) {
+    if (method %in% c("scale", "robust_scale")) {
+      create_scale_normalizer(
+        data[[col]], col, robust = method == "robust_scale"
+      )
+    } else {
+      # Use bestNormalize::orderNorm directly
+      create_ordernorm_wrapper(data[[col]], col)
+    }
+  })
+
+  names(normalizers) <- selected_cols
+  structure(normalizers, class = "normalizer_list")
 }
 
-scale_features <- function(data, scale_params) {
-  center_vals <- scale_params %>% filter(stat == "center") %>% select(-stat)
-  disp_vals <- scale_params %>% filter(stat == "disp") %>% select(-stat)
+combine_normalizers <- function(...) {
+  all_norms <- list(...)
+  combined <- unlist(all_norms, recursive = FALSE)
+  structure(combined, class = "normalizer_list")
+}
 
-  cols_to_scale <- setdiff(names(scale_params), "stat")
+# Create scale normalizer (z-score or robust)
+create_scale_normalizer <- function(x, col_name, robust = FALSE) {
+  center <- if (robust) median(x, na.rm = TRUE) else mean(x, na.rm = TRUE)
+  disp <- if (robust) mad(x, na.rm = TRUE) else sd(x, na.rm = TRUE)
 
-  data %>%
-    mutate(
-      across(
-        all_of(cols_to_scale),
-        ~ {
-          col_name <- cur_column()
-          (. - center_vals[[col_name]]) / disp_vals[[col_name]]
-        }
-      )
-    )
+  structure(
+    list(
+      column = col_name,
+      method = if (robust) "robust_scale" else "scale",
+      center = center,
+      dispersion = disp
+    ),
+    class = "scale_normalizer"
+  )
+}
+
+# Wrapper for bestNormalize::orderNorm object
+create_ordernorm_wrapper <- function(x, col_name) {
+  # Create the actual orderNorm object
+  orq_obj <- orderNorm(x, warn = FALSE)
+
+  # Wrap it with column info
+  structure(
+    list(
+      column = col_name,
+      method = "orderNorm",
+      orq_object = orq_obj  # Store the actual bestNormalize object
+    ),
+    class = "ordernorm_wrapper"
+  )
+}
+
+# Apply scale normalization to new data
+predict.scale_normalizer <- function(object, newdata, ...) {
+  (newdata - object$center) / object$dispersion
+}
+
+# Apply orderNorm using bestNormalize's predict method
+predict.ordernorm_wrapper <- function(object, newdata, ...) {
+  predict(object$orq_object, newdata = newdata, warn = FALSE)
+}
+
+# Apply all normalizers in a list to new data
+predict.normalizer_list <- function(object, newdata, ...) {
+  result <- newdata
+
+  for (col_name in names(object)) {
+    if (col_name %in% names(newdata)) {
+      result[[col_name]] <- predict(object[[col_name]], newdata[[col_name]])
+    }
+  }
+
+  result
+}
+
+# Print method for scale normalizer
+print.scale_normalizer <- function(x, ...) {
+  cat(sprintf("<%s Normalizer>\n", x$method))
+  cat(sprintf("Column: %s\n", x$column))
+  cat(sprintf("Center: %s\n", format(x$center, digits = 6)))
+  cat(sprintf("Dispersion: %s\n", format(x$dispersion, digits = 6)))
+  invisible(x)
+}
+
+# Print method for orderNorm wrapper
+print.ordernorm_wrapper <- function(x, ...) {
+  cat(sprintf("<%s Normalizer>\n", x$method))
+  cat(sprintf("Column: %s\n", x$column))
+  cat("bestNormalize::orderNorm object:\n")
+  print(x$orq_object)
+  invisible(x)
+}
+
+# Print method for normalizer list (brief overview)
+print.normalizer_list <- function(x, ...) {
+  cat(sprintf("Normalizer List (%d columns)\n", length(x)))
+  cat(strrep("=", 50), "\n")
+
+  methods <- sapply(x, function(obj) obj$method)
+  for (method_type in unique(methods)) {
+    cols <- names(x)[methods == method_type]
+    cat(sprintf("\n%s (%d):\n", method_type, length(cols)))
+    cat("  ", paste(cols, collapse = ", "), "\n")
+  }
+
+  cat("\nUse summary() for detailed information\n")
+  invisible(x)
+}
+
+# Summary method for normalizer list (detailed view)
+summary.normalizer_list <- function(object, ...) {
+  cat(sprintf("Normalizer List Summary (%d columns)\n", length(object)))
+  cat(strrep("=", 70), "\n\n")
+
+  for (col_name in names(object)) {
+    norm <- object[[col_name]]
+    cat(sprintf("[%s] %s\n", norm$method, col_name))
+
+    if (inherits(norm, "scale_normalizer")) {
+      cat(sprintf("  Center: %s, Dispersion: %s\n",
+                  format(norm$center, digits = 6),
+                  format(norm$dispersion, digits = 6)))
+    } else if (inherits(norm, "ordernorm_wrapper")) {
+      cat(sprintf("  N observations: %d\n", norm$orq_object$n))
+      cat(sprintf("  Ties present: %s\n", norm$orq_object$ties_status))
+    }
+  }
+
+  invisible(object)
 }

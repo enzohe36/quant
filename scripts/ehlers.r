@@ -1,707 +1,516 @@
-# https://www.tradingview.com/scripts/ehlers/
-# https://www.tradingview.com/script/e8DZtqQL/
-# https://www.tradingview.com/script/559mGm7c/
+# ehlers_ensemble.R
+# Ehlers DSP feature ensemble for RL training.
+# All filters built on the Ultimate Smoother (2-pole Butterworth, zero-lag passband).
+# All outputs bounded: [-3,+3] RMS-normalized, [-1,+1] oscillators, raw fundamentals.
+# Bars within warmup period are set to NA_real_ (IIR transient not yet settled).
+# Fundamental features are raw ratios — normalize cross-sectionally with
+# bestNormalize::orderNorm() across all stocks per date before feeding to RL.
 
-# PRESET =======================================================================
+HP_PERIOD  <- 120
+LP_PERIOD  <- 20
+RMS_PERIOD <- 60
+GRID       <- c(30, 60, 120)
 
-# library(xts)
-# library(DSTrading)
-# library(patchwork)
 
-# HELPER FUNCTIONS =============================================================
+# FILTERS ======================================================================
 
-supersmoother <- function(src, length) {
-  a1 <- exp(-sqrt(2) * pi / length)
-  b1 <- 2.0 * a1 * cos(sqrt(2) * pi / length)
-  c2 <- b1
-  c3 <- -a1 * a1
-  c1 <- 1 - c2 - c3
-
-  src_avg <- (src + c(src[1], src[-length(src)])) / 2
-
-  ss <- stats::filter(
-    x = c1 * src_avg,
-    filter = c(c2, c3),
-    method = "recursive",
-    init = rep(0, 2)
-  )
-
-  return(as.numeric(ss))
+# Shared 2-pole Butterworth coefficients.
+# Ehlers: a1 = exp(-sqrt(2)*PI/Period), c2 = 2*a1*cos(sqrt(2)*PI/Period)
+.bw_coefs <- function(period) {
+  alpha <- sqrt(2) * pi / period
+  a1    <- exp(-alpha)
+  list(c2 = 2 * a1 * cos(alpha), c3 = -a1^2)
 }
 
-hsv_to_rgb <- function(h, s, v) {
-  c <- v * s
-  x <- c * (1 - abs((h / 60) %% 2 - 1))
-  m <- v - c
+# 2-pole Butterworth highpass.
+# Ehlers: HP[i] = c1*(x[i] - 2*x[i-1] + x[i-2]) + c2*HP[i-1] + c3*HP[i-2]
+highpass <- function(x, period = HP_PERIOD) {
+  bw <- .bw_coefs(period)
+  c1 <- (1 + bw$c2 - bw$c3) / 4
+  u  <- stats::filter(x, filter = c(c1, -2*c1, c1), method = "convolution", sides = 1)
+  u[is.na(u)] <- 0
+  as.numeric(stats::filter(u, filter = c(bw$c2, bw$c3), method = "recursive", init = c(0, 0)))
+}
 
-  r <- g <- b <- 0
+# 1-pole highpass.
+# Ehlers: a1 = (1 - sin(2*PI/P)) / cos(2*PI/P)
+#         HP[i] = 0.5*(1+a1)*(x[i] - x[i-1]) + a1*HP[i-1]
+highpass1 <- function(x, period = HP_PERIOD) {
+  a1 <- (1 - sin(2 * pi / period)) / cos(2 * pi / period)
+  dx <- 0.5 * (1 + a1) * c(0, diff(x))
+  as.numeric(stats::filter(dx, filter = a1, method = "recursive", init = 0))
+}
 
-  if (h < 60) {
-    r <- c; g <- x; b <- 0
-  } else if (h < 120) {
-    r <- x; g <- c; b <- 0
-  } else if (h < 180) {
-    r <- 0; g <- c; b <- x
-  } else if (h < 240) {
-    r <- 0; g <- x; b <- c
-  } else if (h < 300) {
-    r <- x; g <- 0; b <- c
-  } else {
-    r <- c; g <- 0; b <- x
+# Ultimate Smoother (zero-lag passband, 2-pole Butterworth).
+# Ehlers: US[i] = (1-c1)*x[i] + (2*c1-c2)*x[i-1] - (c1+c3)*x[i-2]
+#                 + c2*US[i-1] + c3*US[i-2]
+# LTI decomposition: FIR input side → IIR feedback via stats::filter.
+ultimate_smoother <- function(x, period = LP_PERIOD) {
+  bw <- .bw_coefs(period)
+  c1 <- (1 + bw$c2 - bw$c3) / 4
+  u  <- stats::filter(x, filter = c(1 - c1, 2*c1 - bw$c2, -(c1 + bw$c3)),
+                      method = "convolution", sides = 1)
+  u[is.na(u)] <- 0
+  as.numeric(stats::filter(u, filter = c(bw$c2, bw$c3), method = "recursive", init = c(0, 0)))
+}
+
+# Roofing filter: 2-pole HP → Ultimate Smoother bandpass.
+roofing <- function(x, hp_period = HP_PERIOD, lp_period = LP_PERIOD) {
+  ultimate_smoother(highpass(x, hp_period), lp_period)
+}
+
+# Laguerre 4-stage IIR filter. Gamma controls lag/smoothness tradeoff.
+# Ehlers: L0[i] = (1-g)*x[i] + g*L0[i-1]
+#         Lk[i] = -g*L_{k-1}[i] + L_{k-1}[i-1] + g*Lk[i-1]   (k = 1,2,3)
+#         Output = (L0 + 2*L1 + 2*L2 + L3) / 6
+# Each stage is a 1st-order IIR with fixed gamma → stats::filter.
+laguerre <- function(x, gamma) {
+  n <- length(x)
+  g <- gamma
+
+  # Stage 0: L0[i] = (1-g)*x[i] + g*L0[i-1], L0[1] = x[1]
+  # stats::filter: y[i] = input[i] + g*y[i-1]; init=x[1] gives y[1]=(1-g)*x[1]+g*x[1]=x[1]
+  L0 <- as.numeric(stats::filter((1 - g) * x, filter = g, method = "recursive", init = x[1]))
+
+  # Stages 1-3: Lk[i] = (-g*L_{k-1}[i] + L_{k-1}[i-1]) + g*Lk[i-1], Lk[1] = 0
+  laguerre_stage <- function(prev) {
+    u    <- -g * prev + c(0, prev[-n])
+    u[1] <- 0
+    as.numeric(stats::filter(u, filter = g, method = "recursive", init = 0))
   }
 
-  return(list(
-    r = as.integer((r + m) * 255),
-    g = as.integer((g + m) * 255),
-    b = as.integer((b + m) * 255)
-  ))
+  L1 <- laguerre_stage(L0)
+  L2 <- laguerre_stage(L1)
+  L3 <- laguerre_stage(L2)
+  (L0 + 2*L1 + 2*L2 + L3) / 6
 }
 
-crossover <- function(x, y) replace_missing((x > y) & lag(x <= y), FALSE)
 
-crossunder <- function(x, y) replace_missing((x < y) & lag(x >= y), FALSE)
+# NORMALIZATION ================================================================
 
-momentum <- function(x) c(0, diff(x))
-
-calculate_highpass_coefs <- function(highpass_cutoff) {
-  exp_term <- exp(-sqrt(2) * pi / highpass_cutoff)
-  cos_term <- 2 * exp_term * cos(sqrt(2) * pi / highpass_cutoff)
-  exp_term_squared <- exp_term * exp_term
-
-  hpc1 <- (1 + cos_term - exp_term_squared) / 4
-  hpc2 <- cos_term
-  hpc3 <- -exp_term_squared
-
-  return(list(hpc1 = hpc1, hpc2 = hpc2, hpc3 = hpc3))
+# Exponential RMS AGC. Output clamped to [-limit, +limit].
+rms_normalize <- function(x, period = RMS_PERIOD, limit = 3) {
+  alpha <- 2 / (period + 1)
+  ms  <- as.numeric(stats::filter(alpha * x^2, filter = 1 - alpha,
+                                   method = "recursive", init = 0))
+  clamp(ifelse(ms > 0, x / sqrt(ms), 0), limit)
 }
 
-calculate_smoothing_coefs <- function(lowpass_cutoff) {
-  exp_term <- exp(-sqrt(2) * pi / lowpass_cutoff)
-  cos_term <- 2 * exp_term * cos(sqrt(2) * pi / lowpass_cutoff)
-  exp_term_squared <- exp_term * exp_term
+clamp <- function(x, limit = 3) pmax(-limit, pmin(limit, x))
 
-  sc1 <- 1 - cos_term - exp_term_squared
-  sc2 <- cos_term
-  sc3 <- -exp_term_squared
-
-  return(list(sc1 = sc1, sc2 = sc2, sc3 = sc3))
+# Set rows 1:warmup to NA_real_. Applied at end of each feat_* function.
+.set_warmup <- function(out, warmup) {
+  if (warmup > 0 && warmup < nrow(out)) out[1:warmup, ] <- NA_real_
+  out
 }
 
-# SUPERSMOOTHER MA OSCILLATOR ==================================================
+# Vectorized rolling Pearson correlation via cumulative sums. O(n).
+rolling_cor <- function(a, b, win) {
+  n <- length(a)
+  if (win > n) return(rep(0, n))
 
-calculate_oscillator <- function(
-  data,
-  smoothing_length = 5,
-  fast_length = 20,
-  slow_length = 50,
-  hue_multiplier = 100
-) {
-  close <- data$close
-  hlc <- xts(data[, c("high", "low", "close")], order.by = data$date)
+  cum_a  <- c(0, cumsum(a))
+  cum_b  <- c(0, cumsum(b))
+  cum_ab <- c(0, cumsum(a * b))
+  cum_a2 <- c(0, cumsum(a^2))
+  cum_b2 <- c(0, cumsum(b^2))
 
-  smoothed_price <- supersmoother(close, smoothing_length)
+  idx <- (win + 1):(n + 1)
+  j   <- idx - win
+  sa  <- cum_a[idx]  - cum_a[j]
+  sb  <- cum_b[idx]  - cum_b[j]
+  sab <- cum_ab[idx] - cum_ab[j]
+  sa2 <- cum_a2[idx] - cum_a2[j]
+  sb2 <- cum_b2[idx] - cum_b2[j]
 
-  fast_ma <- ema_na(smoothed_price, fast_length)
-  slow_ma <- ema_na(smoothed_price, slow_length)
-
-  atr <- as.numeric(atr_na(hlc, 20)[, "atr"]) %>%
-    replace_na(0) %>%
-    supersmoother(smoothing_length)
-
-  oscillator <- (fast_ma - slow_ma) / atr
-  signal_line <- ema_na(oscillator, 25)
-
-  osc_d1 <- momentum(oscillator)
-  osc_d1_norm <- tanh(osc_d1 * hue_multiplier)
-
-  hue_raw <- 60 - osc_d1_norm * 60
-  hue <- stats::filter(
-    x = replace_missing(hue_raw, 0),
-    filter = 0.5,
-    method = "recursive"
-  )
-
-  result <- data.frame(
-    date = data$date,
-    atr = atr,
-    oscillator = oscillator,
-    signal_line = signal_line,
-    hue = hue
-  ) %>%
-    mutate(
-      across(
-        everything(),
-        ~ replace(.x, row_number() <= slow_length * 2, NA_real_)
-      )
-    )
-  return(result)
+  den <- (win * sa2 - sa^2) * (win * sb2 - sb^2)
+  r   <- ifelse(den > 0, (win * sab - sa * sb) / sqrt(den), 0)
+  r[is.na(r)] <- 0
+  c(rep(0, win - 1), r)
 }
 
-# KAMA =========================================================================
 
-calculate_kama <- function(data) {
-  hlc <- xts(data[, c("high", "low", "close")], order.by = data$date)
-  try_error <- try(
-    kama <- as.numeric(KAMA(hlc, priceMethod = "Ehlers's")),
-    silent = TRUE
-  )
-  if (inherits(try_error, "try-error")) kama <- rep(NA_real_, nrow(data))
-  result <- data.frame(
-    date = data$date,
-    kama = kama
-  )
-  return(result)
+# REGIME DETECTION =============================================================
+
+# Correlation Trend Indicator: Pearson correlation of price vs linear ramp.
+# Vectorized with cumulative sums. Output [-1, +1].
+cti <- function(x, period) {
+  n <- length(x)
+  if (n < period) return(rep(0, n))
+
+  y   <- seq_len(period)
+  sy  <- sum(y)
+  syy <- sum(y^2)
+
+  cum_x  <- c(0, cumsum(x))
+  cum_x2 <- c(0, cumsum(x^2))
+  cum_jx <- c(0, cumsum(seq_len(n) * x))
+
+  bars <- period:n
+  a    <- bars - period + 1
+  sx   <- cum_x[bars + 1]  - cum_x[a]
+  sx2  <- cum_x2[bars + 1] - cum_x2[a]
+  sxy  <- (cum_jx[bars + 1] - cum_jx[a]) - (a - 1) * sx
+
+  den <- sqrt((period * sx2 - sx^2) * (period * syy - sy^2))
+  r   <- ifelse(den > 0, (period * sxy - sx * sy) / den, 0)
+  c(rep(0, period - 1), r)
 }
 
-# EHLERS LOOPS =================================================================
 
-calculate_rms <- function(
-  data,
-  highpass_cutoff = 20,
-  lowpass_cutoff = 125,
-  alpha = 0.0242
-) {
-  close <- data$close
-  volume <- data$volume
-  n <- length(close)
+# FEATURE GENERATORS ===========================================================
 
-  highpass_coefs <- calculate_highpass_coefs(highpass_cutoff)
-  smoothing_coefs <- calculate_smoothing_coefs(lowpass_cutoff)
-
-  hpc1 <- highpass_coefs$hpc1
-  hpc2 <- highpass_coefs$hpc2
-  hpc3 <- highpass_coefs$hpc3
-
-  sc1 <- smoothing_coefs$sc1
-  sc2 <- smoothing_coefs$sc2
-  sc3 <- smoothing_coefs$sc3
-
-  # Price processing
-  price_diff <- momentum(momentum(close))
-
-  highpass_price <- stats::filter(
-    x = replace_missing(hpc1 * price_diff, 0),
-    filter = c(hpc2, hpc3),
-    method = "recursive",
-    init = c(0, 0)
-  )
-  highpass_price <- as.numeric(highpass_price)
-
-  highpass_price_avg <- (highpass_price + lag(highpass_price)) / 2
-
-  smoothed_price <- stats::filter(
-    x = replace_missing(sc1 * highpass_price_avg, 0),
-    filter = c(sc2, sc3),
-    method = "recursive",
-    init = c(0, 0)
-  )
-  smoothed_price <- as.numeric(smoothed_price)
-
-  price_ms <- stats::filter(
-    x = alpha * smoothed_price^2,
-    filter = 1 - alpha,
-    method = "recursive",
-    init = 0
-  )
-  price_ms <- as.numeric(price_ms)
-
-  price_rms <- smoothed_price / sqrt(pmax(price_ms, 1e-10))
-  price_rms[is.nan(price_rms) | is.infinite(price_rms)] <- 0
-
-  # Volume processing
-  volume_diff <- momentum(momentum(volume))
-
-  highpass_volume <- stats::filter(
-    x = replace_missing(hpc1 * volume_diff, 0),
-    filter = c(hpc2, hpc3),
-    method = "recursive",
-    init = c(0, 0)
-  )
-  highpass_volume <- as.numeric(highpass_volume)
-
-  highpass_volume_avg <- (highpass_volume + lag(highpass_volume)) / 2
-
-  smoothed_volume <- stats::filter(
-    x = replace_missing(sc1 * highpass_volume_avg, 0),
-    filter = c(sc2, sc3),
-    method = "recursive",
-    init = c(0, 0)
-  )
-  smoothed_volume <- as.numeric(smoothed_volume)
-
-  volume_ms <- stats::filter(
-    x = alpha * smoothed_volume^2,
-    filter = 1 - alpha,
-    method = "recursive",
-    init = 0
-  )
-  volume_ms <- as.numeric(volume_ms)
-
-  volume_rms <- smoothed_volume / sqrt(pmax(volume_ms, 1e-10))
-  volume_rms[is.nan(volume_rms) | is.infinite(volume_rms)] <- 0
-
-  result <- data.frame(
-    date = data$date,
-    price_rms = price_rms,
-    volume_rms = volume_rms
-  ) %>%
-    mutate(
-      across(
-        everything(),
-        ~ replace(.x, row_number() <= lowpass_cutoff * 2, NA_real_)
-      )
-    )
-  return(result)
+# Roofing + RMS at grid periods. Output [-3, +3].
+# Warmup: max of HP, LP periods, and RMS settling.
+feat_roofing <- function(x, periods = GRID) {
+  out <- list()
+  for (p in periods) out[[paste0("roof_", p)]] <- rms_normalize(roofing(x, HP_PERIOD, p))
+  .set_warmup(as.data.frame(out), max(c(HP_PERIOD, periods, RMS_PERIOD)))
 }
 
-# BULLISH CONDITION TEST =======================================================
+# Ultimate Smoother spread, slope, cross-scale. Output [-3, +3].
+# Warmup: max of US periods and RMS settling.
+feat_ultimate <- function(x, periods = GRID) {
+  us_list <- list()
+  out     <- list()
+  for (p in periods) {
+    us <- ultimate_smoother(x, p)
+    us_list[[as.character(p)]] <- us
+    out[[paste0("us_spread_", p)]] <- rms_normalize(x - us)
+    out[[paste0("us_slope_", p)]]  <- rms_normalize(c(0, diff(us)))
+  }
+  for (i in 1:(length(periods) - 1))
+    out[[paste0("us_xscale_", periods[i], "_", periods[i+1])]] <-
+      rms_normalize(us_list[[as.character(periods[i])]] -
+                    us_list[[as.character(periods[i+1])]])
+  .set_warmup(as.data.frame(out), max(c(periods, RMS_PERIOD)))
+}
 
-if_buy <- function(
-  result,
-  zero_threshold = 0.05,
-  price_lookback = 10,
-  min_price_diff = 0.5,
-  price_lookforward = 5,
-  min_signal = 0.35,
-  min_osc_d1 = -0.01,
-  osc_lookback = 40,
-  max_osc_diff = 1.9,
-  price_rms_high = 1.5,
-  price_rms_low = -1
-) {
-  oscillator <- result$oscillator
-  signal_line <- result$signal_line
-  price_rms <- result$price_rms
-  volume_rms <- result$volume_rms
-  n <- nrow(result)
+# Even Better Sinewave. Matched bandpass: same period for HP1 and US.
+# Ehlers: HP1 → UltimateSmoother → AGC(0.95/0.05).
+# AGC via stats::filter: pwr is EMA of filt^2 with alpha=0.05.
+# Output [-1, +1].
+even_better_sinewave <- function(x, period) {
+  filt <- ultimate_smoother(highpass1(x, period), period)
+  pwr  <- as.numeric(stats::filter(0.05 * filt^2, filter = 0.95,
+                                    method = "recursive", init = 0))
+  wave <- ifelse(pwr > 0, filt / sqrt(pwr), 0)
+  pmax(-1, pmin(1, wave))
+}
 
-  # Price start conditions
-  price_d1 <- momentum(price_rms)
-  price_d2 <- momentum(price_d1)
-  price_near_max <- (abs(price_d1) <= zero_threshold) & (price_d2 < 0)
+# Warmup: max of matched bandpass periods (HP1+US both at p).
+feat_ebsw <- function(x, periods = GRID) {
+  out <- list()
+  for (p in periods) out[[paste0("ebsw_", p)]] <- even_better_sinewave(x, p)
+  .set_warmup(as.data.frame(out), max(periods))
+}
 
-  price_diff <- price_rms - run_min(price_rms, price_lookback)
+# Elegant Oscillator: 2-bar deriv → RMS → IFT(tanh) → UltimateSmoother.
+# Ehlers: Deriv = Close - Close[2]; nDeriv = Deriv / RMS(Deriv);
+#         Elegant = UltimateSmoother(tanh(nDeriv)).
+# Output [-1, +1].
+# Warmup: max of US periods and RMS rolling window.
+feat_elegant <- function(x, periods = GRID) {
+  n     <- length(x)
+  deriv <- c(0, 0, x[3:n] - x[1:(n-2)])
 
-  price_start <- (
-    (price_near_max) & (price_diff >= min_price_diff)
-  ) | (
-    (price_d1 < -zero_threshold)
+  # Vectorized rolling RMS via cumulative sums
+  cum_sq    <- c(0, cumsum(deriv^2))
+  idx       <- seq_len(n)
+  start_idx <- pmax(1L, idx - RMS_PERIOD + 1L)
+  rms_v     <- sqrt((cum_sq[idx + 1] - cum_sq[start_idx]) / (idx - start_idx + 1L))
+
+  ift <- tanh(ifelse(rms_v > 0, deriv / rms_v, 0))
+
+  out <- list()
+  for (p in periods) out[[paste0("eleg_", p)]] <- clamp(ultimate_smoother(ift, p), 1)
+  .set_warmup(as.data.frame(out), max(c(periods, RMS_PERIOD)))
+}
+
+# Correlation Trend Indicator at grid periods + change rate.
+# Output [-1, +1] and [0, 1].
+# Warmup: max of CTI rolling window periods.
+feat_cti <- function(x, periods = GRID) {
+  out <- list()
+  for (p in periods) out[[paste0("cti_", p)]] <- cti(x, p)
+  out[["cti_chg"]] <- clamp(c(0, abs(diff(cti(x, periods[2])))), 1)
+  .set_warmup(as.data.frame(out), max(periods))
+}
+
+# Laguerre spread at three gamma values. Output [-3, +3].
+# Warmup: RMS settling (Laguerre settles in ~4/(1-gamma) bars, well under RMS_PERIOD).
+feat_laguerre <- function(x, gammas = c(0.3, 0.6, 0.8)) {
+  out <- list()
+  for (g in gammas)
+    out[[paste0("lag_spread_", sub("\\.", "", as.character(g)))]] <-
+      rms_normalize(x - laguerre(x, g))
+  .set_warmup(as.data.frame(out), RMS_PERIOD)
+}
+
+# Volume features: filtered volume + price-volume correlation.
+# Output: filtered [-3,+3], correlation [-1,+1].
+# Warmup: max of HP, LP periods, RMS settling, and rolling_cor window.
+feat_volume <- function(close, volume, periods = GRID) {
+  out <- list()
+  for (p in periods) {
+    filt_p <- roofing(close,  HP_PERIOD, p)
+    filt_v <- roofing(volume, HP_PERIOD, p)
+    out[[paste0("vol_roof_", p)]]  <- rms_normalize(filt_v)
+    out[[paste0("vol_pcorr_", p)]] <- rolling_cor(filt_p, filt_v, max(p, 30))
+  }
+  .set_warmup(as.data.frame(out), max(c(HP_PERIOD, periods, RMS_PERIOD)))
+}
+
+
+# AVERAGE COST =================================================================
+# Turnover-weighted EMA of VWAP (CYQ chip distribution theory).
+# avg_cost[i] = (1 - to[i]) * avg_cost[i-1] + to[i] * (amount[i] / volume[i])
+# Time-varying alpha (to[i]) — cannot use stats::filter; requires loop.
+# Becomes meaningful after cumulative turnover exceeds 1x (full float rotation).
+
+calculate_avg_cost <- function(amount, volume, to) {
+  n         <- length(amount)
+  avg_price <- amount / volume
+  avg_cost  <- numeric(n)
+  avg_cost[1] <- avg_price[1]
+  for (i in 2:n) avg_cost[i] <- (1 - to[i]) * avg_cost[i-1] + to[i] * avg_price[i]
+  first_valid <- which(cumsum(to) >= 1)[1]
+  if (is.na(first_valid)) first_valid <- n
+  if (first_valid > 1) avg_cost[1:(first_valid - 1)] <- avg_cost[first_valid]
+  avg_cost
+}
+
+# Cost basis features. Output [-3, +3].
+# Warmup: max of US periods and RMS settling.
+feat_cost <- function(close, avg_cost, periods = GRID) {
+  out <- list()
+  out[["cost_spread"]] <- rms_normalize(close - avg_cost)
+  out[["cost_slope"]]  <- rms_normalize(c(0, diff(avg_cost)))
+  for (p in periods)
+    out[[paste0("cost_xscale_", p)]] <- rms_normalize(ultimate_smoother(close, p) - avg_cost)
+  .set_warmup(as.data.frame(out), max(c(periods, RMS_PERIOD)))
+}
+
+
+# OHLC INTRABAR FEATURES =======================================================
+# Fully vectorized. Range/gap [-3,+3], ratios [0,1].
+# Warmup: RMS settling on range and gap signals.
+
+feat_ohlc <- function(open, high, low, close) {
+  n         <- length(close)
+  range_raw <- high - low
+  range_raw[range_raw == 0] <- 1e-8
+
+  .set_warmup(data.frame(
+    ohlc_range      = rms_normalize(range_raw / close),
+    ohlc_body_pos   = (close - low) / range_raw,
+    ohlc_upper_wick = (high - pmax(open, close)) / range_raw,
+    ohlc_lower_wick = (pmin(open, close) - low) / range_raw,
+    ohlc_gap        = rms_normalize(c(0, open[-1] - close[-n]) / close)
+  ), RMS_PERIOD)
+}
+
+
+# FUNDAMENTAL FEATURES =========================================================
+# Raw ratios — normalize cross-sectionally (across all stocks per date)
+# with bestNormalize::orderNorm() before feeding to the RL model.
+# No warmup — pure point-in-time ratios.
+
+feat_fundamental <- function(mc, np, np_deduct, equity, revenue, ocf) {
+  safe_div <- function(a, b) ifelse(b != 0, a / b, 0)
+  data.frame(
+    fund_ey      = safe_div(np, mc),
+    fund_eyd     = safe_div(np_deduct, mc),
+    fund_by      = safe_div(equity, mc),
+    fund_sy      = safe_div(revenue, mc),
+    fund_cfy     = safe_div(ocf, mc),
+    fund_roe     = safe_div(np, equity),
+    fund_accrual = safe_div(np - ocf, mc)
   )
+}
 
-  # Volume end conditions
-  volume_d1 <- momentum(volume_rms)
-  volume_end <- (volume_d1 > zero_threshold)
 
-  # Detect run starts
-  price_start_run_begins <- (price_start) & (!lag(price_start))
-  volume_end_run_begins <- (volume_end) & (!lag(volume_end))
+# MAMA / FAMA ==================================================================
+# MESA Adaptive Moving Average (Ehlers).
+# Hilbert Transform → instantaneous phase → adaptive alpha from delta_phase.
+# MAMA[i] = alpha[i]*x[i] + (1-alpha[i])*MAMA[i-1]
+# FAMA[i] = 0.5*alpha[i]*MAMA[i] + (1-0.5*alpha[i])*FAMA[i-1]
+# Data-dependent alpha — cannot use stats::filter; requires loop.
 
-  # Track days since last price_start
-  price_start_positions <- ifelse(price_start_run_begins, 1:n, 0)
-  last_price_start_position <- cummax(replace_na(price_start_positions, 0))
+mama_fama <- function(x, fast_limit = 0.5, slow_limit = 0.05) {
+  n <- length(x)
 
-  days_since_price_start <- ifelse(
-    last_price_start_position > 0,
-    (1:n) - last_price_start_position,
-    Inf
-  )
+  # 4-bar WMA smooth
+  smooth <- as.numeric(stats::filter(x, filter = c(4, 3, 2, 1) / 10,
+                                      method = "convolution", sides = 1))
+  smooth[is.na(smooth)] <- x[is.na(smooth)]
 
-  # Protect volume_end runs that start within protection period
-  protect_volume_end_run <- volume_end_run_begins &
-    (days_since_price_start < price_lookforward)
+  # Hilbert Transform FIR coefficients (Ehlers' 7-tap approximation)
+  ht <- c(0.0962, 0, 0.5769, 0, -0.5769, 0, -0.0962)
 
-  volume_end_run_id <- cumsum(replace_na(volume_end_run_begins, FALSE))
-  volume_end_run_id[!volume_end] <- 0
+  # Hilbert Transform helper: apply FIR with period-adaptive gain
+  ht_fir <- function(sig, i, adj) {
+    sig[i]   * ht[1] + sig[i-2] * ht[3] +
+    sig[i-4] * ht[5] + sig[i-6] * ht[7]
+  } # ht[2,4,6] are 0 so omitted
 
-  protected_run_ids <- unique(
-    volume_end_run_id[protect_volume_end_run & volume_end]
-  )
+  detrender <- Q1 <- I1 <- jI <- jQ <- numeric(n)
+  I2 <- Q2 <- Re_v <- Im_v <- numeric(n)
+  period <- rep(20, n)
+  phase  <- alpha_v <- numeric(n)
+  mama   <- fama <- x  # initialize to close
 
-  volume_end_protected <- volume_end
-  volume_end_protected[volume_end_run_id %in% protected_run_ids] <- FALSE
+  if (n < 7) return(list(mama = mama, fama = fama))
 
-  # Oscillator start conditions
-  strong_signal <- oscillator - signal_line >= min_signal
-  osc_d1 <- momentum(oscillator)
-  osc_diff <- oscillator - run_min(oscillator, osc_lookback)
-  osc_start <- (strong_signal) & (osc_d1 > min_osc_d1)
+  for (i in 7:n) {
+    adj <- 0.075 * period[i-1] + 0.54
 
-  buy <- (
-    ((price_start & !volume_end_protected) | (osc_start)) &
-      (osc_diff <= max_osc_diff)
-  ) %>%
-    replace_na(FALSE)
+    # Smooth → Detrender via Hilbert
+    detrender[i] <- ht_fir(smooth, i, adj) * adj
 
-  run_starts <- buy & !lag(buy)
-  run_ends <- !buy & lag(buy)
-  run_id <- cumsum(run_starts)
-  run_id[!buy] <- 0
+    # InPhase and Quadrature
+    Q1[i] <- ht_fir(detrender, i, adj) * adj
+    I1[i] <- detrender[i-3]
 
-  # Delay buy run ends until price_rms drops below price_rms_low
-  for (rid in unique(run_id[run_id > 0])) {
-    run_indices <- which(run_id == rid)
-    if (length(run_indices) == 0) next
+    # Advance phase by 90° via Hilbert
+    jI[i] <- ht_fir(I1, i, adj) * adj
+    jQ[i] <- ht_fir(Q1, i, adj) * adj
 
-    run_start_idx <- run_indices[1]
-    run_end_idx <- run_indices[length(run_indices)]
-    idx <- run_end_idx + 1
-    while (idx <= n && isTRUE(price_rms[idx] > price_rms_low)) {
-      buy[idx] <- TRUE
-      idx <- idx + 1
+    # Phasor addition + EMA smooth (alpha = 0.2)
+    I2[i] <- 0.2 * (I1[i] - jQ[i]) + 0.8 * I2[i-1]
+    Q2[i] <- 0.2 * (Q1[i] + jI[i]) + 0.8 * Q2[i-1]
+
+    # Homodyne Discriminator for period
+    Re_v[i] <- 0.2 * (I2[i] * I2[i-1] + Q2[i] * Q2[i-1]) + 0.8 * Re_v[i-1]
+    Im_v[i] <- 0.2 * (I2[i] * Q2[i-1] - Q2[i] * I2[i-1]) + 0.8 * Im_v[i-1]
+
+    if (Im_v[i] != 0 && Re_v[i] != 0) {
+      period[i] <- 2 * pi / atan(Im_v[i] / Re_v[i])
+    } else {
+      period[i] <- period[i-1]
     }
+    period[i] <- max(6, min(50, max(0.67 * period[i-1], min(1.5 * period[i-1], period[i]))))
+    period[i] <- 0.2 * period[i] + 0.8 * period[i-1]
+
+    # Phase and adaptive alpha
+    # Ehlers: EasyLanguage variables retain previous value when If block skips.
+    phase[i] <- phase[i-1]
+    if (I1[i] != 0) phase[i] <- atan(Q1[i] / I1[i]) * 180 / pi
+    dp <- max(1, phase[i-1] - phase[i])
+    alpha_v[i] <- max(slow_limit, min(fast_limit, fast_limit / dp))
+
+    # MAMA and FAMA
+    mama[i] <- alpha_v[i] * x[i] + (1 - alpha_v[i]) * mama[i-1]
+    fama[i] <- 0.5 * alpha_v[i] * mama[i] + (1 - 0.5 * alpha_v[i]) * fama[i-1]
   }
 
-  # Delay buy run starts until price_rms rises above price_rms_high
-  run_starts <- buy & !lag(buy)
-  run_id <- cumsum(run_starts)
-  run_id[!buy] <- 0
-
-  for (rid in unique(run_id[run_id > 0])) {
-    run_indices <- which(run_id == rid)
-    if (length(run_indices) == 0) next
-
-    run_start_idx <- run_indices[1]
-    run_end_idx <- run_indices[length(run_indices)]
-    idx <- run_start_idx
-    while (idx <= run_end_idx && isTRUE(price_rms[idx] < price_rms_high)) {
-      buy[idx] <- FALSE
-      idx <- idx + 1
-    }
-  }
-
-  # Invalidate buy signals with missing critical indicators
-  buy <- ifelse(
-    is.na(oscillator) | is.na(signal_line) |
-      is.na(price_rms) | is.na(volume_rms),
-    FALSE,
-    buy
-  )
-
-  result$buy <- buy
-  return(result)
+  list(mama = mama, fama = fama)
 }
 
-# FEATURE GENERATION ===========================================================
-
-generate_features <- function(
-  data,
-  zero_threshold = 0.05,
-  price_lookback = 10,
-  min_price_diff = 0.5,
-  price_lookforward = 5,
-  min_signal = 0.35,
-  min_osc_d1 = -0.01,
-  osc_lookback = 40,
-  max_osc_diff = 1.9,
-  price_rms_high = 1.5,
-  price_rms_low = -1
-) {
-  # Calculate indicators
-  result <- cbind(
-    select(calculate_oscillator(data), -date),
-    select(calculate_kama(data), -date),
-    select(calculate_rms(data), -date)
-  ) %>%
-    if_buy(
-      zero_threshold = zero_threshold,
-      price_lookback = price_lookback,
-      min_price_diff = min_price_diff,
-      price_lookforward = price_lookforward,
-      min_signal = min_signal,
-      min_osc_d1 = min_osc_d1,
-      osc_lookback = osc_lookback,
-      max_osc_diff = max_osc_diff,
-      price_rms_high = price_rms_high,
-      price_rms_low = price_rms_low
-    )
-
-  # Combine with original data, keeping only buy from result
-  for (col_name in names(result)) data[[col_name]] <- result[[col_name]]
-  return(data)
+# MAMA features: spread, crossover.
+# Output: spread/cross [-3,+3].
+# Warmup: RMS settling (Hilbert settles in ~50 bars, within RMS_PERIOD).
+feat_mama <- function(x, fast_limit = 0.5, slow_limit = 0.05) {
+  mf <- mama_fama(x, fast_limit, slow_limit)
+  .set_warmup(data.frame(
+    mama_spread = rms_normalize(x - mf$mama),
+    mama_cross  = rms_normalize(mf$mama - mf$fama)
+  ), RMS_PERIOD)
 }
 
-# PLOTTING =====================================================================
 
-plot_indicators <- function(data, plot_title = "Indicator Plot") {
-  plot_data <- tibble(
-    index = 1:nrow(data),
-    date = data$date,
-    open = data$open,
-    high = data$high,
-    low = data$low,
-    close = data$close,
-    avg_cost = data$avg_cost,
-    oscillator = data$oscillator,
-    signal_line = data$signal_line,
-    hue = data$hue,
-    kama = data$kama,
-    upper_bound = data$kama + 3 * data$atr,
-    lower_bound = data$kama - 3 * data$atr,
-    price_rms = data$price_rms,
-    volume_rms = data$volume_rms,
-    buy = data$buy,
-    candle_color = case_when(
-      close > open ~ "red",
-      close < open ~ "forestgreen",
-      (close == open) & (close > lag(close)) ~ "red",
-      (close == open) & (close < lag(close)) ~ "forestgreen",
-      (close == open) & (close == lag(close)) ~ "black",
-    )
+# ENSEMBLE =====================================================================
+
+ehlers_features <- function(close, open = NULL, high = NULL, low = NULL,
+    volume = NULL, amount = NULL, to = NULL,
+    mc = NULL, np = NULL, np_deduct = NULL, equity = NULL, revenue = NULL, ocf = NULL) {
+
+  feats <- list(
+    roofing  = feat_roofing(close),
+    ultimate = feat_ultimate(close),
+    ebsw     = feat_ebsw(close),
+    elegant  = feat_elegant(close),
+    cti      = feat_cti(close),
+    laguerre = feat_laguerre(close),
+    mama     = feat_mama(close)
   )
 
-  oscillator_colors <- sapply(
-    as.numeric(plot_data$hue),
-    function(h) {
-      if (is.na(h)) return(NA)
-      rgb_vals <- hsv_to_rgb(h, 1.0, 1.0)
-      return(rgb(rgb_vals$r, rgb_vals$g, rgb_vals$b, maxColorValue = 255))
-    }
-  )
+  if (!is.null(volume))
+    feats[["volume"]] <- feat_volume(close, volume)
 
-  plot_data$oscillator_color <- oscillator_colors
+  if (!is.null(amount) && !is.null(volume) && !is.null(to))
+    feats[["cost"]] <- feat_cost(close, calculate_avg_cost(amount, volume, to))
 
-  # Create natural date breaks using lubridate
-  # Find first occurrence of each unit change in the actual data
-  date_range <- range(plot_data$date)
-  time_span <- as.numeric(difftime(date_range[2], date_range[1], units = "days"))
+  if (!is.null(open) && !is.null(high) && !is.null(low))
+    feats[["ohlc"]] <- feat_ohlc(open, high, low, close)
 
-  # Determine appropriate interval based on time span
-  if (time_span > 1096) {
-    # More than 3 years: label first day of each year
-    plot_data$period <- year(plot_data$date)
-    date_format <- "%Y"
-  } else if (time_span > 366) {
-    # 1-3 years: label first day of each quarter
-    plot_data$period <- paste0(year(plot_data$date), "-Q", quarter(plot_data$date))
-    date_format <- "%Y-%m"
-  } else if (time_span > 92) {
-    # 3-12 months: label first day of each month
-    plot_data$period <- format(plot_data$date, "%Y-%m")
-    date_format <- "%Y-%m"
-  } else if (time_span > 31) {
-    # 1-3 months: label first day of each week
-    plot_data$period <- format(floor_date(plot_data$date, "week"), "%Y-%W")
-    date_format <- "%m-%d"
-  } else {
-    # 31 days or less: label every few days
-    interval_days <- max(1, ceiling(time_span / 10))
-    plot_data$period <- floor_date(plot_data$date, paste(interval_days, "days"))
-    date_format <- "%m-%d"
-  }
+  if (!is.null(mc) && !is.null(np) && !is.null(np_deduct) &&
+      !is.null(equity) && !is.null(revenue) && !is.null(ocf))
+    feats[["fund"]] <- feat_fundamental(mc, np, np_deduct, equity, revenue, ocf)
 
-  # Find the first index where each period appears
-  date_breaks <- plot_data %>%
-    group_by(period) %>%
-    summarise(first_index = min(index), .groups = "drop") %>%
-    arrange(first_index) %>%
-    pull(first_index)
-
-  date_labels <- format(plot_data$date[date_breaks], date_format)
-
-  # Calculate y-axis limits with padding
-  price_range <- range(
-    c(
-      plot_data$low, plot_data$high, plot_data$lower_bound,
-      plot_data$upper_bound, plot_data$avg_cost
-    ),
-    na.rm = TRUE
-  )
-  price_padding <- diff(price_range) * 0.02
-  price_ylim <- c(
-    price_range[1] - price_padding, price_range[2] + price_padding
-  )
-
-  osc_range <- range(
-    c(plot_data$oscillator, plot_data$signal_line),
-    na.rm = TRUE
-  )
-  osc_padding <- diff(osc_range) * 0.02
-  osc_ylim <- c(
-    osc_range[1] - osc_padding, osc_range[2] + osc_padding
-  )
-
-  rms_range <- range(
-    c(plot_data$price_rms, plot_data$volume_rms),
-    na.rm = TRUE
-  )
-  rms_padding <- diff(rms_range) * 0.02
-  rms_ylim <- c(
-    rms_range[1] - rms_padding, rms_range[2] + rms_padding
-  )
-
-  # Candlestick chart
-  buy_bg <- data.frame(
-    index = plot_data$index,
-    ymin = price_ylim[1],
-    ymax = price_ylim[2],
-    buy = plot_data$buy
-  )
-
-  p1 <- ggplot(plot_data, aes(x = index)) +
-    geom_rect(
-      data = buy_bg[buy_bg$buy, ],
-      aes(xmin = index - 0.5, xmax = index + 0.5, ymin = ymin, ymax = ymax),
-      fill = "black", alpha = 0.1, inherit.aes = FALSE
-    ) +
-    geom_ribbon(
-      aes(ymin = lower_bound, ymax = upper_bound),
-      fill = NA, color = "black", linetype = "dotted", linewidth = 0.5
-    ) +
-    geom_line(
-      aes(y = kama),
-      color = "black", linewidth = 0.5
-    ) +
-    geom_line(
-      aes(y = avg_cost),
-      color = "blue", linewidth = 0.5
-    ) +
-    geom_segment(
-      aes(x = index, y = low, yend = high),
-      color = plot_data$candle_color, linewidth = 0.3
-    ) +
-    geom_segment(
-      aes(x = index - 0.4, xend = index + 0.4, y = open),
-      color = plot_data$candle_color, linewidth = 0.3
-    ) +
-    geom_rect(
-      aes(
-        xmin = index - 0.4, xmax = index + 0.4,
-        ymin = pmin(open, close), ymax = pmax(open, close),
-        fill = candle_color
-      ),
-      linewidth = 0
-    ) +
-    scale_fill_identity() +
-    scale_x_continuous(
-      breaks = date_breaks,
-      labels = date_labels,
-      limits = c(0.6, nrow(plot_data) + 0.4),
-      expand = c(0, 0)
-    ) +
-    scale_y_continuous(limits = price_ylim, expand = c(0, 0)) +
-    labs(title = plot_title, y = "Price", x = NULL) +
-    theme_minimal() +
-    theme(
-      axis.text.x = element_blank(),
-      axis.ticks.x = element_blank(),
-      panel.grid.minor = element_blank(),
-      plot.title = element_text(
-        hjust = 0.5, face = "bold", margin = margin(0, 0, 0, 0)
-      ),
-      legend.position = "top",
-      legend.justification = "center",
-      legend.direction = "horizontal",
-      legend.margin = margin(0, 0, -10, 0)
-    )
-
-  # Oscillator subplot
-  oscillator_buy_bg <- data.frame(
-    index = plot_data$index,
-    ymin = osc_ylim[1],
-    ymax = osc_ylim[2],
-    buy = plot_data$buy
-  )
-
-  p2 <- ggplot(plot_data, aes(x = index)) +
-    geom_rect(
-      data = oscillator_buy_bg[oscillator_buy_bg$buy, ],
-      aes(xmin = index - 0.5, xmax = index + 0.5, ymin = ymin, ymax = ymax),
-      fill = "black", alpha = 0.1, inherit.aes = FALSE
-    ) +
-    geom_hline(
-      yintercept = 0,
-      linetype = "dashed", color = "gray50", linewidth = 0.5
-    ) +
-    # Actual oscillator line with dynamic colors (no legend)
-    geom_line(
-      aes(y = oscillator, color = oscillator_color, group = 1),
-      linewidth = 0.5
-    ) +
-    scale_color_identity() +
-    # Invisible dummy line for oscillator legend
-    geom_line(
-      aes(y = oscillator, linetype = "Oscillator"),
-      color = "darkorange", linewidth = 0.5, alpha = 0
-    ) +
-    # Signal line
-    geom_line(
-      aes(y = signal_line, linetype = "Signal Line"),
-      color = "black", linewidth = 0.5
-    ) +
-    scale_linetype_manual(
-      name = "",
-      values = c("Oscillator" = "solid", "Signal Line" = "solid"),
-      guide = guide_legend(override.aes = list(alpha = 1))
-    ) +
-    scale_x_continuous(
-      breaks = date_breaks,
-      labels = date_labels,
-      limits = c(0.6, nrow(plot_data) + 0.4),
-      expand = c(0, 0)
-    ) +
-    scale_y_continuous(limits = osc_ylim, expand = c(0, 0)) +
-    labs(y = "Oscillator", x = NULL) +
-    theme_minimal() +
-    theme(
-      axis.text.x = element_blank(),
-      axis.ticks.x = element_blank(),
-      panel.grid.minor = element_blank(),
-      legend.position = "top",
-      legend.justification = "center",
-      legend.direction = "horizontal",
-      legend.margin = margin(-10, 0, -10, 0)
-    )
-
-  # RMS subplot
-  rms_buy_bg <- data.frame(
-    index = plot_data$index,
-    ymin = rms_ylim[1],
-    ymax = rms_ylim[2],
-    buy = plot_data$buy
-  )
-
-  p3 <- ggplot(plot_data, aes(x = index)) +
-    geom_rect(
-      data = rms_buy_bg[rms_buy_bg$buy, ],
-      aes(xmin = index - 0.5, xmax = index + 0.5, ymin = ymin, ymax = ymax),
-      fill = "black", alpha = 0.1, inherit.aes = FALSE
-    ) +
-    geom_hline(
-      yintercept = 0,
-      linetype = "dashed", color = "gray50", linewidth = 0.5
-    ) +
-    geom_line(
-      aes(y = price_rms, color = "Price RMS"),
-      linewidth = 0.5
-    ) +
-    geom_line(
-      aes(y = volume_rms, color = "Volume RMS"),
-      linewidth = 0.5
-    ) +
-    scale_color_manual(
-      name = "",
-      values = c("Price RMS" = "lightblue", "Volume RMS" = "navyblue")
-    ) +
-    scale_x_continuous(
-      breaks = date_breaks,
-      labels = date_labels,
-      limits = c(0.6, nrow(plot_data) + 0.4),
-      expand = c(0, 0)
-    ) +
-    scale_y_continuous(limits = rms_ylim, expand = c(0, 0)) +
-    labs(y = "RMS", x = "Date") +
-    theme_minimal() +
-    theme(
-      panel.grid.minor = element_blank(),
-      legend.position = "top",
-      legend.justification = "center",
-      legend.direction = "horizontal",
-      legend.margin = margin(-10, 0, -10, 0),
-      axis.title.x = element_text(margin = margin(10, 0, 0, 0))
-    )
-
-  combined_plot <- p1 / p2 / p3 +
-    plot_layout(heights = c(2, 1, 1))
-
-  return(combined_plot)
+  result <- do.call(cbind, feats)
+  mat    <- as.matrix(result)
+  result[is.nan(mat) | is.infinite(mat)] <- NA_real_
+  result
 }
+
+
+# Market-level features: use ehlers_features() with market aggregates,
+# prefix feature names with "mkt_" for namespace separation:
+
+# feats <- mkt_feats <- ehlers_features(
+#   close         = mkt_data$close,
+#   volume        = mkt_data$to,
+#   mc            = mkt_data$mc,
+#   np            = mkt_data$np,
+#   np_deduct     = mkt_data$np_deduct,
+#   equity        = mkt_data$equity,
+#   revenue       = mkt_data$revenue,
+#   ocf           = mkt_data$ocf
+# ) %>%
+#   rename_with(~ paste0("mkt_", .x)) %>%
+#   as_tibble()
+
+
+# VERIFICATION =================================================================
+# Input: data.frame with columns from example.csv:
+#   symbol, date, open, high, low, close, volume, amount, to,
+#   mc, np, np_deduct, equity, revenue, ocf
+
+# t0 <- proc.time()
+
+# feats <- ehlers_features(
+#   close         = data$close,
+#   open          = data$open,
+#   high          = data$high,
+#   low           = data$low,
+#   volume        = data$volume,
+#   amount        = data$amount,
+#   to            = data$to,
+#   mc            = data$mc,
+#   np            = data$np,
+#   np_deduct     = data$np_deduct,
+#   equity        = data$equity,
+#   revenue       = data$revenue,
+#   ocf           = data$ocf
+# )
+
+# elapsed <- (proc.time() - t0)[3]
+# cat(nrow(feats), "x", ncol(feats), "in", round(elapsed, 3), "s\n")
+
+# mat <- as.matrix(feats)
+# valid <- mat[complete.cases(mat), ]
+# cat("Valid rows:", nrow(valid), " Warmup NAs:", sum(is.na(mat)), "\n")
+# cat("Bounds: [", round(min(valid), 4), ",", round(max(valid), 4), "]\n\n")
+
+# cat(sprintf("%-35s %8s %8s %8s\n", "Feature", "NAs", "Min", "Max"))
+# for (col in names(feats)) {
+#   v <- feats[[col]]; w <- sum(is.na(v))
+#   cat(sprintf("%-35s %8d %8.4f %8.4f\n", col, w,
+#               min(v, na.rm = TRUE), max(v, na.rm = TRUE)))
+# }
+
+# groups <- sub("\\.[^.]+$", "", names(feats))
+# cat("\nGroups:\n")
+# for (g in unique(groups)) cat(sprintf("  %-20s %3d\n", g, sum(groups == g)))
+# cat(sprintf("  %-20s %3d\n", "TOTAL", ncol(feats)))

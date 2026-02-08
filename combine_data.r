@@ -4,6 +4,7 @@ library(xts)
 library(DSTrading)
 library(patchwork)
 library(sn)
+library(bestNormalize)
 library(foreach)
 library(doFuture)
 library(data.table)
@@ -19,29 +20,27 @@ adjust_dir <- paste0(data_dir, "adjust/")
 mc_dir <- paste0(data_dir, "mc/")
 val_dir <- paste0(data_dir, "val/")
 
+spot_combined_path <- paste0(data_dir, "spot_combined.csv")
+
 data_combined_path <- paste0(data_dir, "data_combined.rds")
-scale_params_path <- paste0(data_dir, "scale_params.csv")
-data_train_path <- paste0(data_dir, "data_train.csv")
-data_train_tr_path <- paste0(data_dir, "data_train_tr.csv")
+feats_normalizers_path <- paste0(data_dir, "feats_normalizers.rds")
+train_path <- paste0(data_dir, "train.csv")
+test_path <- paste0(data_dir, "test.csv")
+train_tr_path <- paste0(data_dir, "train_tr.csv")
+test_tr_path <- paste0(data_dir, "test_tr.csv")
 example_path <- paste0(data_dir, "example.csv")
+
+mkt_data_path <- paste0(data_dir, "mkt_data.rds")
+mkt_feats_normalizers_path <- paste0(data_dir, "mkt_feats_normalizers.rds")
+mkt_feats_path <- paste0(data_dir, "mkt_feats.csv")
 
 analysis_dir <- "analysis/"
 logs_dir <- paste0(analysis_dir, "logs/")
 log_path <- paste0(logs_dir, format(now(), "%Y%m%d_%H%M%S"), ".log")
 
-zero_threshold <- 0.05
-price_lookback <- 10
-min_price_diff <- 0.5
-price_lookforward <- 5
-min_signal <- 0.35
-min_osc_d1 <- -0.01
-osc_lookback <- 40
-max_osc_diff <- 1.9
-price_rms_high <- 1.5
-price_rms_low <- -1
-
 last_td <- as_date("2026-01-23")
 train_start <- last_td %m-% years(10)
+test_start <- last_td %m-% years(2)
 
 set.seed(42)
 
@@ -49,6 +48,8 @@ set.seed(42)
 
 dir.create(analysis_dir)
 dir.create(logs_dir)
+
+spot_combined <- read_csv(spot_combined_path, show_col_types = FALSE)
 
 quarters_end <- quarter(all_td %m-% months(3), "date_last") %>%
   unique() %>%
@@ -65,7 +66,7 @@ data_combined <- foreach(
 ) %dofuture% {
   vars <- c(
     "adjust", "adjust_path", "data", "hist", "hist_path", "mc", "mc_path",
-    "my_list", "try_error", "val", "val_path"
+    "my_list", "val", "val_path"
   )
   rm(list = vars)
 
@@ -74,108 +75,61 @@ data_combined <- foreach(
   mc_path <- paste0(mc_dir, symbol, ".csv")
   val_path <- paste0(val_dir, symbol, ".csv")
 
-  hist <- read_csv(hist_path, show_col_types = FALSE)
-
   if (!file.exists(adjust_path)) {
     tsprint(str_glue("{symbol}: Missing adjust file."), log_path)
     return(NULL)
-  } else {
-    try_error <- try(
-      adjust <- read_csv(adjust_path, show_col_types = FALSE) %>%
-        mutate(adjust = adjust / last(adjust)),
-      silent = TRUE
-    )
-    if (inherits(try_error, "try-error")) {
-      tsprint(str_glue("{symbol}: Error reading adjust file."), log_path)
-    }
   }
-
   if (!file.exists(mc_path)) {
     tsprint(str_glue("{symbol}: Missing mc file."), log_path)
     return(NULL)
-  } else {
-    mc <- read_csv(mc_path, show_col_types = FALSE)
   }
-
   if (!file.exists(val_path)) {
     tsprint(str_glue("{symbol}: Missing val file."), log_path)
     return(NULL)
-  } else {
-    try_error <- try(
-      val <- read_csv(val_path, show_col_types = FALSE) %>%
-        full_join(tibble(date = !!quarters_end), by = "date") %>%
-        arrange(date) %>%
-        mutate(
-          revenue = run_sum(revenue, 4),
-          np = run_sum(np, 4),
-          np_deduct = run_sum(np_deduct, 4),
-          ocfps = run_sum(ocfps, 4)
-        ),
-      silent = TRUE
+  }
+
+  hist <- read_csv(hist_path, show_col_types = FALSE) %>%
+    mutate(
+      symbol = !!symbol,
+      volume = volume * 100,
+      to = to / 100
+    ) %>%
+    relocate(symbol)
+
+  adjust <- read_csv(adjust_path, show_col_types = FALSE) %>%
+    mutate(adjust = adjust / last(adjust))
+
+  mc <- read_csv(mc_path, show_col_types = FALSE) %>%
+    mutate(mc = mc * 1e8)
+
+  val <- read_csv(val_path, show_col_types = FALSE) %>%
+    full_join(tibble(date = !!quarters_end), by = "date") %>%
+    arrange(date) %>%
+    mutate(
+      revenue = run_sum(revenue, 4),
+      np = run_sum(np, 4),
+      np_deduct = run_sum(np_deduct, 4),
+      ocfps = run_sum(ocfps, 4)
     )
-    if (inherits(try_error, "try-error")) {
-      tsprint(str_glue("{symbol}: Error reading val file."), log_path)
-    }
-  }
 
-  try_error <- try(
-    data <- hist %>%
-      full_join(adjust, by = "date") %>%
-      full_join(mc, by = "date") %>%
-      full_join(val, by = "date") %>%
-      arrange(date) %>%
-      fill(names(hist), .direction = "down") %>%
-      mutate(
-        symbol = !!symbol,
-        volume = volume * 100,
-        to = to / 100,
-        avg_price = amount / volume,
-        shares = mc * 10^8 / close
-      ) %>%
-      fill(adjust, shares, .direction = "down") %>%
-      mutate(
-        mc = close * shares,
-        equity = bvps * shares,
-        ocf = ocfps * shares,
-        across(c(open, high, low, close, avg_price), ~ .x * adjust),
-        volume = volume / adjust
-      ) %>%
-      fill(np, np_deduct, equity, revenue, ocf, .direction = "down") %>%
-      filter(date %in% pull(hist, date)) %>%
-      mutate(
-        avg_cost = calculate_avg_cost(avg_price, to)
-      ) %>%
-      select(
-        symbol, names(hist), avg_price, avg_cost, mc, np, np_deduct, equity,
-        revenue, ocf
-      ),
-    silent = TRUE
-  )
-  if (inherits(try_error, "try-error")) {
-    tsprint(str_glue("{symbol}: Error combining data."), log_path)
-    return(NULL)
-  }
-
-  try_error <- try(
-    data <- generate_features(
-      data = data,
-      zero_threshold = zero_threshold,
-      price_lookback = price_lookback,
-      min_price_diff = min_price_diff,
-      price_lookforward = price_lookforward,
-      min_signal = min_signal,
-      min_osc_d1 = min_osc_d1,
-      osc_lookback = osc_lookback,
-      max_osc_diff = max_osc_diff,
-      price_rms_high = price_rms_high,
-      price_rms_low = price_rms_low
-    ),
-    silent = TRUE
-  )
-  if (inherits(try_error, "try-error")) {
-    tsprint(str_glue("{symbol}: Error generating features."), log_path)
-    return(NULL)
-  }
+  data <- hist %>%
+    full_join(adjust, by = "date") %>%
+    full_join(mc, by = "date") %>%
+    full_join(val, by = "date") %>%
+    arrange(date) %>%
+    fill(names(hist), adjust) %>%
+    mutate(shares = mc / close) %>%
+    fill(shares) %>%
+    mutate(
+      mc = close * shares,
+      equity = bvps * shares,
+      ocf = ocfps * shares,
+      across(c(open, high, low, close), ~ .x * adjust),
+      volume = volume / adjust
+    ) %>%
+    fill(np, np_deduct, equity, revenue, ocf) %>%
+    filter(date %in% pull(hist, date)) %>%
+    select(names(hist), mc, np, np_deduct, equity, revenue, ocf)
 
   my_list <- list()
   my_list[[symbol]] <- data
@@ -183,7 +137,6 @@ data_combined <- foreach(
 }
 
 plan(sequential)
-
 saveRDS(data_combined, data_combined_path)
 tsprint(str_glue("Combined {length(data_combined)} stocks."))
 
@@ -191,82 +144,181 @@ tsprint(str_glue("Combined {length(data_combined)} stocks."))
 
 plan(multisession, workers = availableCores() - 1)
 
-mkt_mc <- foreach(
+mkt_data <- foreach(
   data = data_combined,
   .combine = "c"
 ) %dofuture% {
+  if (nrow(data) == 0) return(NULL)
   data %>%
     right_join(tibble(date = all_td), by = "date") %>%
-    select(date, mc) %>%
-    filter(date <= last_td) %>%
-    fill(mc, .direction = "down") %>%
+    filter(
+      date >= min(data$date),
+      date <= if_else(
+        filter(spot_combined, symbol == data$symbol[1])$delist,
+        max(data$date),
+        last_td
+      )
+    ) %>%
+    arrange(date) %>%
+    fill(close, mc, np, np_deduct, equity, revenue, ocf) %>%
+    mutate(
+      close_r = close / lag(close),
+      across(c(volume, amount, to), ~ replace_na(.x, 0)),
+      mc_traded = volume * close,
+      mc_float = {mc_traded / to} %>%
+        replace(is.na(.) | is.infinite(.), NA_real_)
+    ) %>%
+    fill(mc_float) %>%
+    group_by(quarter(date, "date_last")) %>%
+    mutate(weight = c(rep(NA_real_, n() - 1), last(mc_float))) %>%
+    ungroup() %>%
+    mutate(weight = lag(weight)) %>%
+    fill(weight) %>%
+    select(
+      date, close_r, weight, mc_traded, mc_float,
+      mc, np, np_deduct, equity, revenue, ocf
+    ) %>%
+    na.omit() %>%
     list()
 } %>%
   rbindlist() %>%
   group_by(date) %>%
-  summarize(mkt_mc = sum(mc, na.rm = TRUE))
+  summarize(
+    n = sum(weight > 0),
+    close_r = weighted.mean(close_r, weight),
+    to = sum(mc_traded) / sum(mc_float),
+    across(c(mc, np, np_deduct, equity, revenue, ocf), sum)
+  ) %>%
+  ungroup() %>%
+  filter(n >= 100) %>%
+  arrange(date) %>%
+  mutate(close = cumprod(close_r) / first(close_r))
 
-data_train <- foreach(
+plan(sequential)
+saveRDS(mkt_data, mkt_data_path)
+tsprint(str_glue("Generated market data from {min(mkt_data$date)} to {max(mkt_data$date)}."))
+
+# mkt_data <- readRDS(mkt_data_path)
+
+# t0 <- proc.time()
+
+feats <- mkt_feats <- ehlers_features(
+  close         = mkt_data$close,
+  volume        = mkt_data$to,
+  mc            = mkt_data$mc,
+  np            = mkt_data$np,
+  np_deduct     = mkt_data$np_deduct,
+  equity        = mkt_data$equity,
+  revenue       = mkt_data$revenue,
+  ocf           = mkt_data$ocf
+) %>%
+  rename_with(~ paste0("mkt_", .x)) %>%
+  as_tibble()
+
+# elapsed <- (proc.time() - t0)[3]
+# cat(nrow(feats), "x", ncol(feats), "in", round(elapsed, 3), "s\n")
+
+# mat <- as.matrix(feats)
+# valid <- mat[complete.cases(mat), ]
+# cat("Valid rows:", nrow(valid), " Warmup NAs:", sum(is.na(mat)), "\n")
+# cat("Bounds: [", round(min(valid), 4), ",", round(max(valid), 4), "]\n\n")
+
+# cat(sprintf("%-35s %8s %8s %8s\n", "Feature", "NAs", "Min", "Max"))
+# for (col in names(feats)) {
+#   v <- feats[[col]]; w <- sum(is.na(v))
+#   cat(sprintf("%-35s %8d %8.4f %8.4f\n", col, w,
+#               min(v, na.rm = TRUE), max(v, na.rm = TRUE)))
+# }
+
+# groups <- sub("\\.[^.]+$", "", names(feats))
+# cat("\nGroups:\n")
+# for (g in unique(groups)) cat(sprintf("  %-20s %3d\n", g, sum(groups == g)))
+# cat(sprintf("  %-20s %3d\n", "TOTAL", ncol(feats)))
+
+mkt_feats <- bind_cols(date = mkt_data$date, mkt_feats) %>%
+  filter(date >= train_start)
+
+mkt_feats_normalizers <- mkt_feats %>%
+  filter(date < test_start) %>%
+  create_normalizers(matches("^mkt_\\."), method = "scale")
+saveRDS(mkt_feats_normalizers, mkt_feats_normalizers_path)
+
+mkt_feats <- predict(mkt_feats_normalizers, mkt_feats)
+write_csv(mkt_feats, mkt_feats_path)
+tsprint(str_glue("nrow(mkt_feats) = {nrow(mkt_feats)}"))
+
+# for (n in names(select(mkt_feats, -date))) {
+#   hist(mkt_feats[[n]], 30, xlab = n)
+# }
+
+# mkt_feats_plot <- filter(mkt_feats,date >= test_start) %>%
+#   bind_cols(close = filter(mkt_data, date >= test_start)$close)
+# for (n in names(select(mkt_feats_plot, -c(date, close)))) {
+#   plot_dual_y(
+#     mkt_feats_plot[["date"]], mkt_feats_plot[["close"]], mkt_feats_plot[[n]],
+#     xlab = "Date", y1lab = "Close", y2lab = n,
+#   )
+# }
+
+plan(multisession, workers = availableCores() - 1)
+
+feats <- foreach(
   data = data_combined,
   .combine = "c"
 ) %dofuture% {
-  data <- data %>%
-    left_join(mkt_mc, by = "date") %>%
-    mutate(
-      amplitude = TR(tibble(high, low, close))[, "tr"] / lag(close),
-      lr_mc_mkt = log(mc / mkt_mc),
-      pe = mc / np,
-      pe_deduct = mc / np_deduct,
-      pb = mc / equity,
-      ps = mc / revenue,
-      pc = mc / ocf,
-      npm = np / revenue,
-      roe = np / equity,
-      lr_ap_sma20 = log(avg_price / run_mean(close, 20)),
-      lr_ap_sma120 = log(avg_price / run_mean(close, 120)),
-      lr_ap_ema12 = log(avg_price / ema_na(close, 12)),
-      lr_ap_ema50 = log(avg_price / ema_na(close, 50)),
-      lr_ap_ac = log(avg_price / avg_cost),
-      lr_ap_kama = log(avg_price / kama),
-      lr_osc_sl = log(oscillator / signal_line)
+  data %>%
+    mutate(price = lead(open)) %>%
+    select(symbol, date, price) %>%
+    bind_cols(
+      feats <- ehlers_features(
+        close         = data$close,
+        open          = data$open,
+        high          = data$high,
+        low           = data$low,
+        volume        = data$volume,
+        amount        = data$amount,
+        to            = data$to,
+        mc            = data$mc,
+        np            = data$np,
+        np_deduct     = data$np_deduct,
+        equity        = data$equity,
+        revenue       = data$revenue,
+        ocf           = data$ocf
+      )
     ) %>%
-    select(
-      symbol, date, open, close,
-      avg_price, avg_cost, kama,
-      amplitude, to, oscillator, price_rms, volume_rms,
-      lr_mc_mkt, pe, pe_deduct, pb, ps, pc, npm, roe,
-      lr_ap_sma20, lr_ap_sma120,
-      lr_ap_ema12, lr_ap_ema50,
-      lr_ap_ac, lr_ap_kama, lr_osc_sl
-    ) %>%
-    rename_with(~ paste0("p_", .x), c(avg_price, avg_cost, kama)) %>%
-    rename_with(~ paste0("n_", .x), !matches("^(symbol|date|open|close|p_)"))
-
-  data <- data %>%
     filter(date >= train_start) %>%
-    na.omit()
-  if (nrow(data) == 0) return(NULL) else return(list(data))
+    na.omit() %>%
+    list()
 } %>%
   rbindlist()
 
 plan(sequential)
+tsprint(str_glue("Generated features for {length(unique(feats$symbol))} stocks."))
 
-scale_params <- data_train %>%
-  calculate_scale_params(
-    !matches("^(symbol|date|open|close)"), robust = TRUE
-  ) %>%
-  mutate(across(matches("^p"), ~ p_avg_price))
-write_csv(scale_params, scale_params_path)
+feats_normalizers <- feats %>%
+  filter(date < test_start) %>%
+  create_normalizers(-c(symbol, date, price), method = "scale")
+saveRDS(feats_normalizers, feats_normalizers_path)
 
-data_train <- scale_features(data_train, scale_params)
-write_csv(data_train, data_train_path)
-tsprint(str_glue("nrow(data_train) = {nrow(data_train)}"))
+feats <- predict(feats_normalizers, feats)
 
-symbols_tr <- sample(unique(data_train$symbol), 100)
-data_train_tr <- data_train %>%
-  filter(symbol %in% symbols_tr)
-write_csv(data_train_tr, data_train_tr_path)
-tsprint(str_glue("nrow(data_train_tr) = {nrow(data_train_tr)}"))
+train <- filter(feats, date < test_start)
+write_csv(train, train_path)
+tsprint(str_glue("nrow(train) = {nrow(train)}"))
 
-example <- data_train[1:10, ]
+test <- filter(feats, date >= test_start)
+write_csv(test, test_path)
+tsprint(str_glue("nrow(test) = {nrow(test)}"))
+
+symbols_tr <- sample(unique(feats$symbol), 100)
+
+train_tr <- filter(train, symbol %in% symbols_tr)
+write_csv(train_tr, train_tr_path)
+tsprint(str_glue("nrow(train_tr) = {nrow(train_tr)}"))
+
+test_tr <- filter(test, symbol %in% symbols_tr)
+write_csv(test_tr, test_tr_path)
+tsprint(str_glue("nrow(test_tr) = {nrow(test_tr)}"))
+
+example <- train[1:10, ]
 write_csv(example, example_path)

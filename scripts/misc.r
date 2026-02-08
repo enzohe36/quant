@@ -11,6 +11,8 @@ holidays_path <- paste0(resources_dir, "holidays.txt")
 last_td_expr <- expr(as_tradeday(now() - hours(17)))
 curr_td_expr <- expr(as_tradeday(now() - hours(9)))
 
+machine_eps <- .Machine$double.eps
+
 # MISCELLANEOUS ================================================================
 
 holidays <- as_date(readLines(holidays_path))
