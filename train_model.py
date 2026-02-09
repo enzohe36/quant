@@ -2,628 +2,1307 @@
 PPO + Transformer RL for stock trading.
 
 Stock CSV: symbol, date, price, <stock_feat_1>, ...
-Market CSV: date, <mkt_feat_1>, ...  (all columns except date start with "mkt_")
+Market CSV: date, <mkt_feat_1>, ...  (columns except date start with "mkt_")
 
-Market features are loaded once from a single file and joined to stock features
-by date when building episodes. The model receives [stock | market] features.
-Features with "mkt_" prefix route through the cross-attention pathway.
+Market features loaded separately, aligned to stock data at each lookback
+window's last date. Features with "mkt_" prefix route through cross-attention.
+
+Launch:
+  python train_model.py
+  Auto-detects GPUs. Uses DDP when multiple GPUs are available.
+  Also works with: torchrun --nproc_per_node=N train_model.py
+  Configure all parameters in the Config class.
 """
 
 import os
-import logging
-import argparse
+import math
+import time
+import socket
+import pickle
+import functools
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-N_WORKERS = max(1, (os.cpu_count() or 2) - 1)
-log = logging.getLogger("rl")
+_rank = 0
+_world = 1
+
+
+def _log(msg=""):
+    if _rank == 0:
+        print(msg, flush=True)
+
+
+def timed(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = fn(*args, **kwargs)
+        _log(f"    {fn.__name__} ({time.perf_counter() - start:.1f}s)")
+        return result
+    return wrapper
 
 
 class Config:
+    # Paths
     train_path: str = "train.csv"
     test_path: str = "test.csv"
-    mkt_path: str = "mkt_feats.csv"
+    market_path: str = "mkt_feats.csv"
     save_dir: str = "checkpoints"
-    log_file: str = "training.log"
-    lookback: int = 10
-    episode_length: int = 240
+
+    # Environment
+    lookback: int = 60
+    episode_length: int = 100
     transaction_cost: float = 0.001
     n_actions: int = 3
-    d_model: int = 128
-    d_ff: int = 256
-    n_heads: int = 4
-    n_layers: int = 2
-    dropout: float = 0.1
-    mkt_dropout: float = 0.3
+
+    # Model
+    d_model: int = 256
+    d_ff: int = 512
+    n_heads: int = 8
+    n_layers: int = 3
+    dropout: float = 0.15
+    market_dropout: float = 0.3
+
+    # PPO
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    clip_eps: float = 0.2
+    policy_clip: float = 0.2
     value_coeff: float = 0.5
     entropy_coeff: float = 0.01
-    max_grad_norm: float = 0.5
-    n_epochs: int = 50
+    grad_clip: float = 0.5
+
+    # Training
+    n_epochs: int = 100
+    warmup_epochs: int = 5
     ppo_epochs: int = 4
-    batch_size: int = 256
-    inference_batch: int = 4096
-    lr: float = 3e-4
+    batch_size: int = 4096
+    inference_batch: int = 16384
+    lr: float = 1e-4
     patience: int = 10
+    patience_smoothing: int = 3
     seed: int = 42
+
+    # Numerical
+    reward_clip: float = 10.0
+    sortino_clip: float = 10.0
+    pytorch_eps: float = 1e-8
+
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     def to_dict(self):
         return {k: getattr(self, k) for k in self.__class__.__annotations__}
 
 
-# feature grouping
+# Feature grouping
 
-def split_groups(cols):
+def split_feature_groups(column_names):
     groups = defaultdict(list)
-    for i, c in enumerate(cols):
-        groups[c.split(".")[0] if "." in c else c.split("_")[0]].append(i)
-    stk, mkt = {}, {}
-    for name, idx in groups.items():
-        (mkt if name.startswith("mkt") else stk)[name] = idx
-    stk_idx = sorted(i for v in stk.values() for i in v)
-    mkt_idx = sorted(i for v in mkt.values() for i in v)
-    return stk, mkt, stk_idx, mkt_idx
+    for col_idx, col_name in enumerate(column_names):
+        prefix = col_name.split(".")[0] if "." in col_name else col_name.split("_")[0]
+        groups[prefix].append(col_idx)
+    stock_groups, market_groups = {}, {}
+    for group_name, group_indices in groups.items():
+        target = market_groups if group_name.startswith("mkt") else stock_groups
+        target[group_name] = group_indices
+    stock_feature_indices = sorted(idx for vals in stock_groups.values() for idx in vals)
+    market_feature_indices = sorted(idx for vals in market_groups.values() for idx in vals)
+    return stock_groups, market_groups, stock_feature_indices, market_feature_indices
 
 
-# vectorized environment
+# Vectorized environment
 
 class VecEnv:
-    def __init__(self, episodes, lookback, tx_cost):
-        self.N = len(episodes)
+    """Batched single-stock trading environment.
+
+    Observations concatenate [stock_window, market_window] along the feature
+    axis. For each lookback window the stock slice is ``lookback`` consecutive
+    rows from the episode's stock_features. The market slice is ``lookback``
+    consecutive rows from the global market array, ending at the market row
+    whose date matches the stock window's last date.
+    """
+
+    def __init__(self, episodes, lookback, transaction_cost, global_market_features):
         self.lookback = lookback
-        self.tx_cost = tx_cost
-        self.features = np.stack([e["features"] for e in episodes])
-        self.log_returns = np.stack([e["log_returns"] for e in episodes])
-        self.T = self.features.shape[1]
-        self.n_steps = self.T - lookback
+        self.transaction_cost = transaction_cost
+        self.n_envs = len(episodes)
+        self.stock_features = np.stack([ep["stock_features"] for ep in episodes])
+        self.log_returns = np.stack([ep["log_returns"] for ep in episodes])
+        self.market_date_indices = np.stack([ep["market_indices"] for ep in episodes])
+        self.global_market_features = global_market_features
+        self.total_steps = self.stock_features.shape[1]
+        self._lookback_offsets = np.arange(-lookback + 1, 1)
+
+    def _build_observation(self):
+        stock_window = self.stock_features[
+            :, self.current_step - self.lookback : self.current_step
+        ]
+        market_end_idx = self.market_date_indices[:, self.current_step - 1]
+        market_lookup = market_end_idx[:, None] + self._lookback_offsets[None, :]
+        market_window = self.global_market_features[market_lookup]
+        return np.concatenate([stock_window, market_window], axis=-1).astype(np.float32)
 
     def reset(self):
-        self.t = self.lookback
-        self.pos = np.zeros(self.N, dtype=np.float64)
-        return self.features[:, self.t - self.lookback: self.t]
+        self.current_step = self.lookback
+        self.position = np.zeros(self.n_envs, dtype=np.float64)
+        position_idx = (self.position + 1).astype(np.int64)
+        return self._build_observation(), position_idx
 
     def step(self, actions):
-        new_pos = actions.astype(np.float64) - 1.0
-        rewards = (self.pos * self.log_returns[:, self.t]
-                   - self.tx_cost * np.abs(new_pos - self.pos)).astype(np.float32)
-        self.pos = new_pos
-        self.t += 1
-        done = self.t >= self.T
-        return (None if done else
-                self.features[:, self.t - self.lookback: self.t]), rewards, done
+        new_position = actions.astype(np.float64) - 1.0
+        reward = (
+            self.position * self.log_returns[:, self.current_step]
+            - self.transaction_cost * np.abs(new_position - self.position)
+        ).astype(np.float32)
+        self.position = new_position
+        self.current_step += 1
+        done = self.current_step >= self.total_steps
+        position_idx = (self.position + 1).astype(np.int64)
+        obs = None if done else self._build_observation()
+        return obs, reward, done, position_idx
 
 
-# model
+# Reward normalizer
+
+class RewardNormalizer:
+    """Welford running standard deviation for reward scaling.
+
+    Divides rewards by running std without mean-shifting, so the optimal
+    policy is unchanged.
+    """
+
+    def __init__(self, reward_clip, pytorch_eps):
+        self.reward_clip = reward_clip
+        self.pytorch_eps = pytorch_eps
+        self.count = 0
+        self.mean = 0.0
+        self.m2 = 0.0
+
+    @staticmethod
+    def _batch_stats(rewards):
+        flat = rewards.ravel().astype(np.float64)
+        n = len(flat)
+        if n == 0:
+            return 0, 0.0, 0.0
+        return n, float(flat.mean()), float(flat.var() * n)
+
+    @staticmethod
+    def _merge(count_a, mean_a, m2_a, count_b, mean_b, m2_b):
+        """Combine two sets of Welford statistics."""
+        if count_b == 0:
+            return count_a, mean_a, m2_a
+        if count_a == 0:
+            return count_b, mean_b, m2_b
+        total = count_a + count_b
+        delta = mean_b - mean_a
+        new_mean = mean_a + delta * count_b / total
+        new_m2 = m2_a + m2_b + delta ** 2 * count_a * count_b / total
+        return total, new_mean, new_m2
+
+    def update(self, rewards):
+        """Merge a batch of rewards into the running statistics."""
+        n, batch_mean, batch_m2 = self._batch_stats(rewards)
+        self.count, self.mean, self.m2 = self._merge(
+            self.count, self.mean, self.m2, n, batch_mean, batch_m2,
+        )
+
+    def update_distributed(self, rewards, device):
+        """Compute local batch stats, sum across DDP ranks, then merge.
+
+        Only the current batch's stats are communicated. The running
+        state is updated identically on every rank from the same global
+        totals, so historical counts are never double-counted.
+        """
+        n, batch_mean, batch_m2 = self._batch_stats(rewards)
+        local = torch.tensor(
+            [float(n), batch_mean, batch_m2],
+            device=device, dtype=torch.float64,
+        )
+        gathered = [
+            torch.zeros(3, device=device, dtype=torch.float64)
+            for _ in range(_world)
+        ]
+        dist.all_gather(gathered, local)
+
+        epoch_count, epoch_mean, epoch_m2 = 0, 0.0, 0.0
+        for t in gathered:
+            c, m, s = int(t[0].item()), t[1].item(), t[2].item()
+            epoch_count, epoch_mean, epoch_m2 = self._merge(
+                epoch_count, epoch_mean, epoch_m2, c, m, s,
+            )
+
+        self.count, self.mean, self.m2 = self._merge(
+            self.count, self.mean, self.m2,
+            epoch_count, epoch_mean, epoch_m2,
+        )
+
+    def normalize(self, rewards):
+        if self.count < 2:
+            return rewards
+        std = np.sqrt(self.m2 / self.count + self.pytorch_eps)
+        return np.clip(
+            rewards / std, -self.reward_clip, self.reward_clip,
+        ).astype(np.float32)
+
+    def state_dict(self):
+        return {"count": self.count, "mean": self.mean, "m2": self.m2}
+
+    def load_state_dict(self, state):
+        self.count = state["count"]
+        self.mean = state["mean"]
+        self.m2 = state["m2"]
+
+
+# Model
 
 class GroupProjection(nn.Module):
     def __init__(self, group_indices, d_model):
         super().__init__()
-        self.names = sorted(group_indices)
-        n = len(self.names)
-        base, rem = d_model // n, d_model % n
+        self.group_names = sorted(group_indices)
+        n_groups = len(self.group_names)
+        base_dim = d_model // n_groups
+        remainder = d_model % n_groups
         self.proj = nn.ModuleDict()
-        for i, name in enumerate(self.names):
-            self.proj[name] = nn.Linear(len(group_indices[name]),
-                                        base + (1 if i < rem else 0))
-            self.register_buffer(f"i_{name}",
-                                 torch.tensor(group_indices[name], dtype=torch.long))
+        for group_rank, name in enumerate(self.group_names):
+            out_dim = base_dim + (1 if group_rank < remainder else 0)
+            self.proj[name] = nn.Linear(len(group_indices[name]), out_dim)
+            self.register_buffer(
+                f"idx_{name}", torch.tensor(group_indices[name], dtype=torch.long),
+            )
 
     def forward(self, x):
-        return torch.cat([self.proj[n](x[..., getattr(self, f"i_{n}")])
-                          for n in self.names], dim=-1)
+        return torch.cat(
+            [
+                self.proj[name](x[..., getattr(self, f"idx_{name}")])
+                for name in self.group_names
+            ],
+            dim=-1,
+        )
 
 
-class Policy(nn.Module):
-    def __init__(self, stk_groups, n_mkt, stk_idx, mkt_idx, cfg):
+class PolicyNetwork(nn.Module):
+    def __init__(self, stock_groups, n_market_features, stock_feature_indices,
+                 market_feature_indices, cfg):
         super().__init__()
         self.cfg = cfg
-        self.register_buffer("stk_idx", torch.tensor(stk_idx, dtype=torch.long))
-        self.register_buffer("mkt_idx", torch.tensor(mkt_idx, dtype=torch.long))
-        self.has_mkt = n_mkt > 0
+        self.register_buffer(
+            "stock_idx", torch.tensor(stock_feature_indices, dtype=torch.long),
+        )
+        self.register_buffer(
+            "market_idx", torch.tensor(market_feature_indices, dtype=torch.long),
+        )
+        self.has_market = n_market_features > 0
 
-        self.stk_proj = GroupProjection(stk_groups, cfg.d_model)
-        self.stk_norm = nn.LayerNorm(cfg.d_model)
-        self.pos_emb = nn.Parameter(torch.randn(1, cfg.lookback, cfg.d_model) * 0.02)
+        self.stock_proj = GroupProjection(stock_groups, cfg.d_model)
+        self.stock_norm = nn.LayerNorm(cfg.d_model)
+        self.pos_emb = nn.Parameter(
+            torch.randn(1, cfg.lookback, cfg.d_model) * 0.02,
+        )
 
-        if self.has_mkt:
-            self.mkt_proj = nn.Sequential(
-                nn.Linear(n_mkt, cfg.d_model), nn.LayerNorm(cfg.d_model))
+        if self.has_market:
+            self.market_proj = nn.Sequential(
+                nn.Linear(n_market_features, cfg.d_model),
+                nn.LayerNorm(cfg.d_model),
+            )
             self.cross_attn = nn.MultiheadAttention(
-                cfg.d_model, cfg.n_heads, dropout=cfg.dropout, batch_first=True)
+                cfg.d_model, cfg.n_heads, dropout=cfg.dropout, batch_first=True,
+            )
             self.cross_norm = nn.LayerNorm(cfg.d_model)
 
-        enc = nn.TransformerEncoderLayer(
-            cfg.d_model, cfg.n_heads, cfg.d_ff,
-            cfg.dropout, batch_first=True, activation="gelu")
-        self.transformer = nn.TransformerEncoder(enc, cfg.n_layers)
+        encoder_layer = nn.TransformerEncoderLayer(
+            cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.dropout,
+            batch_first=True, activation="gelu",
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, cfg.n_layers)
 
-        self.pi = nn.Sequential(
-            nn.Linear(cfg.d_model, 64), nn.ReLU(), nn.Linear(64, cfg.n_actions))
-        self.vf = nn.Sequential(
-            nn.Linear(cfg.d_model, 64), nn.ReLU(), nn.Linear(64, 1))
+        position_dim = 16
+        self.position_emb = nn.Embedding(cfg.n_actions, position_dim)
+        head_input_dim = cfg.d_model + position_dim
 
-    def forward(self, x):
-        h = self.stk_norm(self.stk_proj(x[..., self.stk_idx])) + self.pos_emb
-        if self.has_mkt:
-            m = self.mkt_proj(x[..., self.mkt_idx])
-            if self.training and self.cfg.mkt_dropout > 0:
-                mask = torch.bernoulli(torch.full(
-                    (m.shape[0], 1, 1), 1 - self.cfg.mkt_dropout,
-                    device=m.device, dtype=m.dtype))
-                m = m * mask / (1 - self.cfg.mkt_dropout)
-            out, _ = self.cross_attn(query=h, key=m, value=m)
-            h = self.cross_norm(h + out)
-        h = self.transformer(h).mean(dim=1)
-        return self.pi(h), self.vf(h).squeeze(-1)
+        self.policy_head = nn.Sequential(
+            nn.Linear(head_input_dim, 128), nn.ReLU(), nn.Linear(128, cfg.n_actions),
+        )
+        self.value_head = nn.Sequential(
+            nn.Linear(head_input_dim, 128), nn.ReLU(), nn.Linear(128, 1),
+        )
+
+    def forward(self, x, position_idx):
+        hidden = self.stock_norm(self.stock_proj(x[..., self.stock_idx])) + self.pos_emb
+        if self.has_market:
+            market_emb = self.market_proj(x[..., self.market_idx])
+            if self.training and self.cfg.market_dropout > 0:
+                keep_mask = torch.bernoulli(torch.full(
+                    (market_emb.shape[0], 1, 1),
+                    1 - self.cfg.market_dropout,
+                    device=market_emb.device, dtype=market_emb.dtype,
+                ))
+                market_emb = market_emb * keep_mask / (1 - self.cfg.market_dropout)
+            cross_out, _ = self.cross_attn(
+                query=hidden, key=market_emb, value=market_emb,
+            )
+            hidden = self.cross_norm(hidden + cross_out)
+        pooled = self.transformer(hidden).mean(dim=1)
+        pos_emb = self.position_emb(position_idx)
+        pooled = torch.cat([pooled, pos_emb], dim=-1)
+        return self.policy_head(pooled), self.value_head(pooled).squeeze(-1)
 
 
-def get_action(model, states, deterministic=False):
-    logits, values = model(states)
-    dist = torch.distributions.Categorical(logits=logits)
-    actions = logits.argmax(-1) if deterministic else dist.sample()
-    return actions, dist.log_prob(actions), values
+def sample_stochastic(model, states, position_idx):
+    logits, values = model(states, position_idx)
+    policy = torch.distributions.Categorical(logits=logits)
+    actions = policy.sample()
+    return actions, policy.log_prob(actions), values
 
 
-def eval_actions(model, states, actions):
-    logits, values = model(states)
-    dist = torch.distributions.Categorical(logits=logits)
-    return dist.log_prob(actions), dist.entropy(), values
+def select_greedy(model, states, position_idx):
+    logits, values = model(states, position_idx)
+    return logits.argmax(-1), values
 
 
-# rollout buffer
+def evaluate_actions(model, states, actions, position_idx):
+    logits, values = model(states, position_idx)
+    policy = torch.distributions.Categorical(logits=logits)
+    return policy.log_prob(actions), policy.entropy(), values
 
-class Buffer:
-    def __init__(self):
-        self.s, self.a, self.r, self.lp, self.v, self.d = [], [], [], [], [], []
 
-    def add_episode(self, states, actions, rewards, log_probs, values):
-        n = len(rewards)
-        self.s.extend(states); self.a.extend(actions); self.r.extend(rewards)
-        self.lp.extend(log_probs); self.v.extend(values)
-        self.d.extend([False] * (n - 1) + [True])
+# Rollout buffer
 
-    def tensors(self, device, gamma, lam):
-        v = np.array(self.v, dtype=np.float32)
-        r = np.array(self.r, dtype=np.float32)
-        d = np.array(self.d, dtype=np.float32)
-        T = len(r)
-        adv = np.zeros(T, dtype=np.float32)
-        g = 0.0
-        for t in reversed(range(T)):
-            nv = 0.0 if t == T - 1 else v[t + 1] * (1 - d[t])
-            delta = r[t] + gamma * nv - v[t]
-            g = delta + gamma * lam * (1 - d[t]) * g
-            adv[t] = g
-        ret = adv + v
-        std = adv.std()
-        if std > 1e-8:
-            adv = (adv - adv.mean()) / std
+class RolloutBuffer:
+    """Pre-allocated buffer for PPO rollout data.
+
+    All arrays are shaped (n_episodes, episode_length), enabling vectorized
+    GAE computation and batch construction via advanced numpy indexing.
+    """
+
+    def __init__(self, n_episodes, episode_length, lookback, global_market_features):
+        self.n_episodes = n_episodes
+        self.episode_length = episode_length
+        self.lookback = lookback
+        self.global_market_features = global_market_features
+
+        self.actions = np.empty((n_episodes, episode_length), dtype=np.int64)
+        self.rewards = np.empty((n_episodes, episode_length), dtype=np.float32)
+        self.log_probs = np.empty((n_episodes, episode_length), dtype=np.float32)
+        self.values = np.empty((n_episodes, episode_length), dtype=np.float32)
+        self.positions = np.empty((n_episodes, episode_length), dtype=np.int64)
+
+        self.all_stock_features = None
+        self.all_market_indices = None
+
+    def register_episodes(self, episodes):
+        self.all_stock_features = np.stack(
+            [ep["stock_features"] for ep in episodes],
+        )
+        self.all_market_indices = np.stack(
+            [ep["market_indices"] for ep in episodes],
+        )
+
+    def compute_gae(self, gamma, gae_lambda, pytorch_eps):
+        advantages = np.zeros_like(self.rewards)
+        running_gae = np.zeros(self.n_episodes, dtype=np.float32)
+
+        for step in reversed(range(self.episode_length)):
+            if step == self.episode_length - 1:
+                next_value = np.zeros(self.n_episodes, dtype=np.float32)
+            else:
+                next_value = self.values[:, step + 1]
+            td_error = (
+                self.rewards[:, step] + gamma * next_value - self.values[:, step]
+            )
+            running_gae = td_error + gamma * gae_lambda * running_gae
+            advantages[:, step] = running_gae
+
+        returns = advantages + self.values
+
+        flat_advantages = advantages.ravel()
+        flat_advantages = (
+            (flat_advantages - flat_advantages.mean())
+            / (flat_advantages.std() + pytorch_eps)
+        )
+
+        self._flat_advantages = flat_advantages
+        self._flat_returns = returns.ravel()
+        self._flat_actions = self.actions.ravel()
+        self._flat_log_probs = self.log_probs.ravel()
+        self._flat_positions = self.positions.ravel()
+
+        return self.n_episodes * self.episode_length
+
+    def get_batch(self, flat_indices, device):
+        cpu_indices = (
+            flat_indices if isinstance(flat_indices, np.ndarray)
+            else flat_indices.cpu().numpy()
+        )
+        episode_ids = cpu_indices // self.episode_length
+        step_offsets = cpu_indices % self.episode_length
+
+        lookback = self.lookback
+        window_range = np.arange(lookback)
+
+        stock_row_indices = step_offsets[:, None] + window_range[None, :]
+        stock_batch = self.all_stock_features[
+            episode_ids[:, None], stock_row_indices, :
+        ]
+
+        market_end = self.all_market_indices[
+            episode_ids, step_offsets + lookback - 1
+        ]
+        market_row_indices = (
+            market_end[:, None] - lookback + 1 + window_range[None, :]
+        )
+        market_batch = self.global_market_features[market_row_indices]
+
+        observation_batch = np.concatenate([stock_batch, market_batch], axis=-1)
+
         return {
-            "s": torch.tensor(np.array(self.s), dtype=torch.float32, device=device),
-            "a": torch.tensor(np.array(self.a), dtype=torch.long, device=device),
-            "lp": torch.tensor(np.array(self.lp), dtype=torch.float32, device=device),
-            "adv": torch.tensor(adv, dtype=torch.float32, device=device),
-            "ret": torch.tensor(ret, dtype=torch.float32, device=device),
+            "states": torch.from_numpy(observation_batch).to(
+                device, non_blocking=True,
+            ),
+            "actions": torch.tensor(
+                self._flat_actions[cpu_indices], dtype=torch.long, device=device,
+            ),
+            "log_probs": torch.tensor(
+                self._flat_log_probs[cpu_indices], dtype=torch.float32, device=device,
+            ),
+            "advantages": torch.tensor(
+                self._flat_advantages[cpu_indices], dtype=torch.float32, device=device,
+            ),
+            "returns": torch.tensor(
+                self._flat_returns[cpu_indices], dtype=torch.float32, device=device,
+            ),
+            "positions": torch.tensor(
+                self._flat_positions[cpu_indices], dtype=torch.long, device=device,
+            ),
         }
 
-    def clear(self):
-        self.__init__()
+
+# Data loading
+
+def _read_csv(path):
+    try:
+        return pd.read_csv(path, engine="pyarrow")
+    except ImportError:
+        return pd.read_csv(path)
 
 
-# data loading
+@timed
+def load_stock_data(path, market_date_to_idx):
+    df = _read_csv(path)
+    df.sort_values(["symbol", "date"], inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    feature_cols = [c for c in df.columns if c not in ("symbol", "date", "price")]
+    symbols = df["symbol"].values
+    prices = df["price"].values.astype(np.float64)
+    features = df[feature_cols].values.astype(np.float32)
+    dates = df["date"].values
 
-def load_data(path):
-    df = pd.read_csv(path).sort_values(["symbol", "date"]).reset_index(drop=True)
-    feat_cols = [c for c in df.columns if c not in ("symbol", "date", "price")]
+    log_returns = np.empty(len(prices), dtype=np.float32)
+    log_returns[0] = 0.0
+    log_returns[1:] = np.log(prices[1:] / prices[:-1]).astype(np.float32)
+    symbol_breaks = np.flatnonzero(symbols[1:] != symbols[:-1]) + 1
+    log_returns[symbol_breaks] = 0.0
+
+    starts = np.empty(len(symbol_breaks) + 1, dtype=np.intp)
+    starts[0] = 0
+    starts[1:] = symbol_breaks
+    ends = np.empty_like(starts)
+    ends[:-1] = symbol_breaks
+    ends[-1] = len(df)
+
     data = {}
-    for sym, g in df.groupby("symbol"):
-        p = g["price"].values.astype(np.float64)
-        lr = np.zeros(len(p), dtype=np.float32)
-        lr[1:] = np.log(p[1:] / p[:-1]).astype(np.float32)
-        data[str(sym)] = {
-            "features": g[feat_cols].values.astype(np.float32),
-            "log_returns": lr,
-            "dates": g["date"].tolist(),
-            "prices": p,
+    for symbol_idx in range(len(starts)):
+        start_row, end_row = int(starts[symbol_idx]), int(ends[symbol_idx])
+        symbol_dates = dates[start_row:end_row]
+        market_indices = np.array(
+            [market_date_to_idx.get(d, -1) for d in symbol_dates], dtype=np.int32,
+        )
+        data[str(symbols[start_row])] = {
+            "features": features[start_row:end_row],
+            "log_returns": log_returns[start_row:end_row],
+            "dates": symbol_dates.tolist(),
+            "prices": prices[start_row:end_row],
+            "market_indices": market_indices,
         }
-    return data, feat_cols
+    return data, feature_cols
 
 
-def load_mkt_data(path):
-    df = pd.read_csv(path).sort_values("date").reset_index(drop=True)
-    cols = [c for c in df.columns if c != "date"]
+@timed
+def load_market_data(path):
+    df = _read_csv(path)
+    df.sort_values("date", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    columns = [c for c in df.columns if c != "date"]
     return {
-        "features": df[cols].values.astype(np.float32),
-        "date_to_idx": {d: i for i, d in enumerate(df["date"])},
-        "cols": cols,
+        "features": df[columns].values.astype(np.float32),
+        "date_to_idx": dict(zip(df["date"], range(len(df)))),
+        "columns": columns,
     }
 
 
-# chunk generation
+# Episode generation
 
-def _chunk_starts(args):
-    sym, T, lookback, ep_len, seed = args
-    cs = lookback + ep_len
-    if T < cs:
-        return sym, []
-    rng = np.random.default_rng(seed)
-    anchor = rng.integers(0, T)
-    starts = set()
-    s = anchor
-    while s + cs <= T:
-        starts.add(s); s += ep_len
-    s = anchor - ep_len
-    while s >= 0:
-        if s + cs <= T:
-            starts.add(s)
-        s -= ep_len
-    return sym, sorted(starts)
+def generate_episodes(stock_data, cfg, epoch_rng):
+    """Generate non-overlapping episodes with a random per-symbol anchor.
 
+    Stride equals episode_length so trading portions never overlap. A fresh
+    random anchor per symbol per call gives different coverage each epoch.
+    """
+    chunk_size = cfg.lookback + cfg.episode_length
+    episodes = []
 
-def gen_chunks(data, mkt, cfg, rng):
-    syms = list(data)
-    seeds = rng.integers(0, 2**63, size=len(syms))
-    args = [(s, len(data[s]["features"]), cfg.lookback,
-             cfg.episode_length, int(seeds[i])) for i, s in enumerate(syms)]
-    with ProcessPoolExecutor(max_workers=N_WORKERS) as pool:
-        results = list(pool.map(_chunk_starts, args))
+    for symbol, symbol_data in stock_data.items():
+        n_rows = len(symbol_data["features"])
+        if n_rows < chunk_size:
+            continue
 
-    cs = cfg.lookback + cfg.episode_length
-    date_to_idx = mkt["date_to_idx"]
-    mkt_feats = mkt["features"]
-    eps = []
-    for sym, starts in results:
-        d = data[sym]
-        for s in starts:
-            chunk_dates = d["dates"][s:s+cs]
-            mkt_rows = [date_to_idx.get(dt) for dt in chunk_dates]
-            if any(r is None for r in mkt_rows):
-                continue
-            combined = np.concatenate(
-                [d["features"][s:s+cs], mkt_feats[mkt_rows]], axis=1)
-            eps.append({
-                "symbol": sym, "features": combined,
-                "log_returns": d["log_returns"][s:s+cs],
-                "dates": chunk_dates, "prices": d["prices"][s:s+cs],
-            })
-    return eps
+        max_start = n_rows - chunk_size
+        anchor = int(epoch_rng.integers(0, min(cfg.episode_length, max_start + 1)))
+        precomputed_market = symbol_data["market_indices"]
+
+        start = anchor
+        while start <= max_start:
+            market_slice = precomputed_market[start : start + chunk_size]
+            required_region = market_slice[cfg.lookback - 1 : chunk_size - 1]
+            if np.all(required_region >= cfg.lookback - 1):
+                episodes.append({
+                    "symbol": symbol,
+                    "stock_features": symbol_data["features"][start : start + chunk_size],
+                    "market_indices": market_slice,
+                    "log_returns": symbol_data["log_returns"][start : start + chunk_size],
+                    "dates": symbol_data["dates"][start : start + chunk_size],
+                    "prices": symbol_data["prices"][start : start + chunk_size],
+                })
+            start += cfg.episode_length
+
+    epoch_rng.shuffle(episodes)
+    return episodes
 
 
-# rollout collection
+# Metrics
 
-def collect(model, episodes, cfg):
-    buf = Buffer()
+def compute_sortino(rewards, sortino_clip, pytorch_eps):
+    mean_reward = rewards.mean()
+    downside_deviation = np.sqrt((np.minimum(rewards, 0.0) ** 2).mean())
+    if downside_deviation < pytorch_eps:
+        return float(np.clip(np.sign(mean_reward) * sortino_clip, -sortino_clip, sortino_clip))
+    return float(np.clip(mean_reward / downside_deviation, -sortino_clip, sortino_clip))
+
+
+def compute_episode_sortinos(reward_matrix, sortino_clip, pytorch_eps):
+    return np.array(
+        [compute_sortino(reward_matrix[i], sortino_clip, pytorch_eps)
+         for i in range(len(reward_matrix))],
+    )
+
+
+# Baseline
+
+def compute_baseline_rewards(episodes, cfg):
+    """Buy-and-hold baseline: enter long at step 0, hold for remaining steps."""
+    log_returns = np.stack([ep["log_returns"] for ep in episodes])
+    trading_returns = log_returns[:, cfg.lookback :]
+    rewards = np.empty_like(trading_returns)
+    rewards[:, 0] = -cfg.transaction_cost
+    rewards[:, 1:] = trading_returns[:, 1:]
+    return rewards
+
+
+# Rollout collection
+
+@timed
+def collect_training_rollout(model, episodes, cfg, global_market_features,
+                             reward_normalizer, distributed):
+    n_episodes = len(episodes)
+    episode_length = cfg.episode_length
+
+    rollout = RolloutBuffer(
+        n_episodes, episode_length, cfg.lookback, global_market_features,
+    )
+    rollout.register_episodes(episodes)
+
     model.eval()
     with torch.no_grad():
-        for bs in range(0, len(episodes), cfg.inference_batch):
-            batch = episodes[bs:bs+cfg.inference_batch]
-            N = len(batch)
-            env = VecEnv(batch, cfg.lookback, cfg.transaction_cost)
-            states = env.reset()
-            ns, nF = env.n_steps, states.shape[-1]
-            aS = np.empty((ns, N, cfg.lookback, nF), dtype=np.float32)
-            aA = np.empty((ns, N), dtype=np.int64)
-            aR = np.empty((ns, N), dtype=np.float32)
-            aL = np.empty((ns, N), dtype=np.float32)
-            aV = np.empty((ns, N), dtype=np.float32)
-            for t in range(ns):
-                aS[t] = states
-                act, lp, val = get_action(model, torch.from_numpy(states).to(cfg.device))
-                an = act.cpu().numpy()
-                aA[t], aL[t], aV[t] = an, lp.cpu().numpy(), val.cpu().numpy()
-                states, aR[t], _ = env.step(an)
-            for i in range(N):
-                buf.add_episode(aS[:,i], aA[:,i], aR[:,i], aL[:,i], aV[:,i])
-    return buf
+        for batch_start in range(0, n_episodes, cfg.inference_batch):
+            batch_end = min(batch_start + cfg.inference_batch, n_episodes)
+            batch_episodes = episodes[batch_start:batch_end]
+            env = VecEnv(
+                batch_episodes, cfg.lookback, cfg.transaction_cost,
+                global_market_features,
+            )
+            obs, pos_idx = env.reset()
+
+            for step in range(episode_length):
+                states = torch.from_numpy(obs).to(cfg.device)
+                pos_tensor = torch.from_numpy(pos_idx).to(cfg.device)
+                actions, log_probs, values = sample_stochastic(
+                    model, states, pos_tensor,
+                )
+                actions_np = actions.cpu().numpy()
+
+                rollout.positions[batch_start:batch_end, step] = pos_idx
+                rollout.actions[batch_start:batch_end, step] = actions_np
+
+                obs, step_rewards, _, pos_idx = env.step(actions_np)
+                rollout.log_probs[batch_start:batch_end, step] = (
+                    log_probs.cpu().numpy()
+                )
+                rollout.values[batch_start:batch_end, step] = (
+                    values.cpu().numpy()
+                )
+                rollout.rewards[batch_start:batch_end, step] = step_rewards
+
+    baseline_rewards = compute_baseline_rewards(episodes, cfg)
+    model_sortino = float(compute_episode_sortinos(
+        rollout.rewards, cfg.sortino_clip, cfg.pytorch_eps,
+    ).mean())
+    baseline_sortino = float(compute_episode_sortinos(
+        baseline_rewards, cfg.sortino_clip, cfg.pytorch_eps,
+    ).mean())
+
+    if distributed:
+        reward_normalizer.update_distributed(rollout.rewards, cfg.device)
+    else:
+        reward_normalizer.update(rollout.rewards)
+    rollout.rewards = reward_normalizer.normalize(rollout.rewards)
+
+    return rollout, model_sortino, baseline_sortino
+
+
+# Deterministic evaluation
+
+def evaluate_deterministic(model, episodes, cfg, global_market_features):
+    n_episodes = len(episodes)
+    episode_length = cfg.episode_length
+    all_rewards = np.empty((n_episodes, episode_length), dtype=np.float32)
+    all_positions = np.empty((n_episodes, episode_length), dtype=np.int64)
+
+    model.eval()
+    with torch.no_grad():
+        for batch_start in range(0, n_episodes, cfg.inference_batch):
+            batch_end = min(batch_start + cfg.inference_batch, n_episodes)
+            batch_episodes = episodes[batch_start:batch_end]
+            env = VecEnv(
+                batch_episodes, cfg.lookback, cfg.transaction_cost,
+                global_market_features,
+            )
+            obs, pos_idx = env.reset()
+
+            for step in range(episode_length):
+                states = torch.from_numpy(obs).to(cfg.device)
+                pos_tensor = torch.from_numpy(pos_idx).to(cfg.device)
+                actions, _ = select_greedy(model, states, pos_tensor)
+                actions_np = actions.cpu().numpy()
+                obs, step_rewards, _, pos_idx = env.step(actions_np)
+                all_rewards[batch_start:batch_end, step] = step_rewards
+                all_positions[batch_start:batch_end, step] = actions_np - 1
+
+    return all_rewards, all_positions
+
+
+@timed
+def evaluate_episodes(model, episodes, cfg, global_market_features):
+    if len(episodes) == 0:
+        return {
+            "model_sortino": 0.0, "baseline_sortino": 0.0, "beat_rate": 0.0,
+            "model_rewards": np.empty((0, cfg.episode_length)),
+            "baseline_rewards": np.empty((0, cfg.episode_length)),
+            "model_positions": np.empty((0, cfg.episode_length), dtype=np.int64),
+        }
+
+    model_rewards, model_positions = evaluate_deterministic(
+        model, episodes, cfg, global_market_features,
+    )
+    baseline_rewards = compute_baseline_rewards(episodes, cfg)
+    model_sortinos = compute_episode_sortinos(
+        model_rewards, cfg.sortino_clip, cfg.pytorch_eps,
+    )
+    baseline_sortinos = compute_episode_sortinos(
+        baseline_rewards, cfg.sortino_clip, cfg.pytorch_eps,
+    )
+
+    return {
+        "model_sortino": float(model_sortinos.mean()),
+        "baseline_sortino": float(baseline_sortinos.mean()),
+        "beat_rate": float(np.mean(model_sortinos > baseline_sortinos)),
+        "model_rewards": model_rewards,
+        "baseline_rewards": baseline_rewards,
+        "model_positions": model_positions,
+    }
 
 
 # PPO update
 
-def ppo_update(model, optimizer, buf, cfg):
-    model.train()
-    d = buf.tensors(cfg.device, cfg.gamma, cfg.gae_lambda)
-    n = len(d["s"])
-    tpl = tvl = te = 0.0
-    nu = 0
-    base = model.module if hasattr(model, "module") else model
-    for _ in range(cfg.ppo_epochs):
-        idx = torch.randperm(n, device=cfg.device)
-        for start in range(0, n, cfg.batch_size):
-            i = idx[start:min(start+cfg.batch_size, n)]
-            lp, ent, val = eval_actions(model, d["s"][i], d["a"][i])
-            ratio = torch.exp(lp - d["lp"][i])
-            adv = d["adv"][i]
-            pl = -torch.min(ratio * adv,
-                            torch.clamp(ratio, 1-cfg.clip_eps, 1+cfg.clip_eps) * adv).mean()
-            vl = F.mse_loss(val, d["ret"][i])
-            loss = pl + cfg.value_coeff * vl - cfg.entropy_coeff * ent.mean()
-            optimizer.zero_grad(); loss.backward()
-            nn.utils.clip_grad_norm_(base.parameters(), cfg.max_grad_norm)
-            optimizer.step()
-            tpl += pl.item(); tvl += vl.item(); te += ent.mean().item(); nu += 1
-    return {"pl": tpl/max(nu,1), "vl": tvl/max(nu,1), "ent": te/max(nu,1)}
+def run_ppo_update(model, optimizer, rollout, cfg, n_local_transitions,
+                   n_padded_transitions):
+    """One PPO pass over the rollout buffer.
 
-
-# buy and hold worker
-
-def _bh_batch(args):
-    lr_list, lookback, tx_cost = args
-    lr = np.stack(lr_list)
-    N, T = lr.shape
-    ns = T - lookback
-    pos = np.zeros(N, dtype=np.float64)
-    rw = np.empty((ns, N), dtype=np.float32)
-    for t in range(ns):
-        new = np.ones(N, dtype=np.float64)
-        rw[t] = (pos * lr[:, lookback+t] - tx_cost * np.abs(new - pos)).astype(np.float32)
-        pos = new
-    return rw
-
-
-# evaluation
-
-def evaluate(model, episodes, cfg, verbose=False):
-    ne = len(episodes)
-    if ne == 0:
-        return {"model_return": 0, "bh_return": 0, "excess": 0,
-                "beat_rate": 0, "metrics": [], "rows": []}
-    ns = cfg.episode_length
-    mr = np.empty((ns, ne), dtype=np.float32)
-    mp = np.empty((ns, ne), dtype=np.int64)
-
+    All ranks iterate over the same number of mini-batches (determined by
+    n_padded_transitions) so DDP gradient synchronisation stays aligned.
+    Ranks with fewer local transitions wrap indices via modulo.
+    """
     model.eval()
-    with torch.no_grad():
-        for bs in range(0, ne, cfg.inference_batch):
-            batch = episodes[bs:bs+cfg.inference_batch]
-            N = len(batch)
-            env = VecEnv(batch, cfg.lookback, cfg.transaction_cost)
-            st = env.reset()
-            for t in range(ns):
-                act, _, _ = get_action(model, torch.from_numpy(st).to(cfg.device), True)
-                an = act.cpu().numpy()
-                mp[t, bs:bs+N] = an - 1
-                st, rw, _ = env.step(an)
-                mr[t, bs:bs+N] = rw
+    base_model = model.module if hasattr(model, "module") else model
+    policy_loss_sum = value_loss_sum = entropy_sum = 0.0
+    n_batches = 0
 
-    bsz = max(1, ne // N_WORKERS)
-    bh_args = [([e["log_returns"] for e in episodes[i:i+bsz]],
-                cfg.lookback, cfg.transaction_cost) for i in range(0, ne, bsz)]
-    br = np.empty((ns, ne), dtype=np.float32)
-    with ProcessPoolExecutor(max_workers=N_WORKERS) as pool:
-        for i, rw in enumerate(pool.map(_bh_batch, bh_args)):
-            s = i * bsz
-            br[:, s:s+rw.shape[1]] = rw
+    permutation = torch.randperm(n_padded_transitions, device=cfg.device)
+    if n_local_transitions < n_padded_transitions:
+        permutation = permutation % n_local_transitions
 
-    rows, metrics = [], []
-    for i in range(ne):
-        m, b = mr[:, i], br[:, i]
-        ms, bs_ = m.std(), b.std()
-        mret = float(m.mean() / ms) if ms > 1e-8 else 0.0
-        bret = float(b.mean() / bs_) if bs_ > 1e-8 else 0.0
-        pos = mp[:, i]
-        nt = int(np.sum(np.diff(pos) != 0))
-        td = (m != 0).sum()
-        wr = float((m[m != 0] > 0).mean()) if td > 0 else 0.0
-        cum = np.cumsum(m)
-        dd = float((np.maximum.accumulate(cum) - cum).max()) if len(cum) else 0.0
-        metrics.append({"symbol": episodes[i]["symbol"], "model": mret, "bh": bret,
-                        "excess": mret - bret, "dd": dd, "trades": nt, "wr": wr})
-        dates = episodes[i]["dates"][cfg.lookback:]
-        prices = episodes[i]["prices"][cfg.lookback:]
-        for t in range(ns):
-            rows.append({"symbol": episodes[i]["symbol"], "date": dates[t],
-                         "price": prices[t], "position": int(pos[t]),
-                         "model_pnl": float(m[t]), "bh_pnl": float(b[t])})
+    for batch_start in range(0, n_padded_transitions, cfg.batch_size):
+        batch_end = min(batch_start + cfg.batch_size, n_padded_transitions)
+        batch_indices = permutation[batch_start:batch_end]
+        batch = rollout.get_batch(batch_indices, cfg.device)
 
-    mrets = [x["model"] for x in metrics]
-    brets = [x["bh"] for x in metrics]
-    excs = [x["excess"] for x in metrics]
-    beat = float(np.mean([e > 0 for e in excs]))
+        new_log_probs, entropy, new_values = evaluate_actions(
+            model, batch["states"], batch["actions"], batch["positions"],
+        )
+        ratio = torch.exp(new_log_probs - batch["log_probs"])
+        advantages = batch["advantages"]
 
-    if verbose:
-        log.info("")
-        log.info(f"{'Sym':>8} {'Model':>8} {'B&H':>8} {'Excess':>8} "
-                 f"{'DD':>7} {'Trd':>5} {'WR':>6}")
-        for x in metrics:
-            log.info(f"{x['symbol']:>8} {x['model']:8.4f} {x['bh']:8.4f} "
-                     f"{x['excess']:+8.4f} {x['dd']:7.4f} {x['trades']:5d} {x['wr']:6.3f}")
-        log.info("")
-        log.info(f"{'':>10} {'Mean':>8} {'Median':>8}")
-        log.info(f"{'Model':>10} {np.mean(mrets):8.4f} {np.median(mrets):8.4f}")
-        log.info(f"{'B&H':>10} {np.mean(brets):8.4f} {np.median(brets):8.4f}")
-        log.info(f"{'Excess':>10} {np.mean(excs):+8.4f} {np.median(excs):+8.4f}")
-        log.info(f"  Beat rate: {beat:.1%}  |  Episodes: {ne}")
+        policy_loss = -torch.min(
+            ratio * advantages,
+            torch.clamp(ratio, 1 - cfg.policy_clip, 1 + cfg.policy_clip) * advantages,
+        ).mean()
+        value_loss = F.mse_loss(new_values, batch["returns"])
+        total_loss = (
+            policy_loss
+            + cfg.value_coeff * value_loss
+            - cfg.entropy_coeff * entropy.mean()
+        )
 
-    return {"model_return": float(np.mean(mrets)), "bh_return": float(np.mean(brets)),
-            "excess": float(np.mean(excs)), "beat_rate": beat,
-            "metrics": metrics, "rows": rows}
+        optimizer.zero_grad()
+        total_loss.backward()
+        nn.utils.clip_grad_norm_(base_model.parameters(), cfg.grad_clip)
+        optimizer.step()
+
+        policy_loss_sum += policy_loss.item()
+        value_loss_sum += value_loss.item()
+        entropy_sum += entropy.mean().item()
+        n_batches += 1
+
+    if _world > 1:
+        sync_tensor = torch.tensor(
+            [policy_loss_sum, value_loss_sum, entropy_sum, float(n_batches)],
+            device=cfg.device,
+        )
+        dist.all_reduce(sync_tensor)
+        policy_loss_sum = sync_tensor[0].item()
+        value_loss_sum = sync_tensor[1].item()
+        entropy_sum = sync_tensor[2].item()
+        n_batches = int(sync_tensor[3].item())
+
+    n_batches = max(n_batches, 1)
+    return {
+        "policy_loss": policy_loss_sum / n_batches,
+        "value_loss": value_loss_sum / n_batches,
+        "entropy": entropy_sum / n_batches,
+    }
 
 
-# plotting
+# Test results
 
-def plot(h, path):
-    ep = range(1, len(h["tr_mod"]) + 1)
-    fig, ax = plt.subplots(2, 2, figsize=(14, 10))
+def build_test_results(episodes, eval_result, cfg):
+    rows = []
+    for episode_idx, episode in enumerate(episodes):
+        dates = episode["dates"][cfg.lookback :]
+        prices = episode["prices"][cfg.lookback :]
+        for step in range(cfg.episode_length):
+            rows.append({
+                "symbol": episode["symbol"],
+                "date": dates[step],
+                "price": prices[step],
+                "position": int(eval_result["model_positions"][episode_idx, step]),
+                "model_rewards": float(
+                    eval_result["model_rewards"][episode_idx, step],
+                ),
+                "baseline_rewards": float(
+                    eval_result["baseline_rewards"][episode_idx, step],
+                ),
+            })
+    return rows
 
-    ax[0,0].plot(ep, h["tr_mod"], "b-", label="Train", alpha=.8)
-    ax[0,0].plot(ep, h["vl_mod"], "r-", label="Val", alpha=.8)
-    ax[0,0].plot(ep, h["tr_bh"], "b--", label="Train B&H", alpha=.5)
-    ax[0,0].plot(ep, h["vl_bh"], "r--", label="Val B&H", alpha=.5)
-    ax[0,0].set_ylabel("Return (mean/std)"); ax[0,0].set_title("Return")
-    ax[0,0].legend(fontsize=8); ax[0,0].grid(True, alpha=.3)
 
-    ax[0,1].plot(ep, h["tr_exc"], "b-", label="Train", alpha=.8)
-    ax[0,1].plot(ep, h["vl_exc"], "r-", label="Val", alpha=.8)
-    ax[0,1].axhline(0, color="k", ls="--", alpha=.3)
-    ax[0,1].set_ylabel("Excess over B&H"); ax[0,1].set_title("Excess")
-    ax[0,1].legend(fontsize=8); ax[0,1].grid(True, alpha=.3)
+# DDP helpers
 
-    ax[1,0].plot(ep, h["pl"], "b-", label="Policy", alpha=.8)
-    ax[1,0].plot(ep, h["vl_loss"], "r-", label="Value", alpha=.8)
-    ax[1,0].set_xlabel("Epoch"); ax[1,0].set_ylabel("Loss")
-    ax[1,0].set_title("Losses"); ax[1,0].legend(fontsize=8); ax[1,0].grid(True, alpha=.3)
+def _allreduce_means(mean_a, mean_b, local_count, device):
+    tensor = torch.tensor(
+        [mean_a * local_count, mean_b * local_count, float(local_count)],
+        device=device, dtype=torch.float64,
+    )
+    dist.all_reduce(tensor)
+    total = tensor[2].item()
+    if total < 1:
+        return mean_a, mean_b
+    return float(tensor[0].item() / total), float(tensor[1].item() / total)
 
-    ax[1,1].plot(ep, h["ent"], "g-", label="Entropy", alpha=.8)
-    a2 = ax[1,1].twinx()
-    a2.plot(ep, h["beat"], "r-", label="Beat rate", alpha=.8)
-    a2.set_ylabel("Beat rate", color="r"); a2.set_ylim(0, 1)
-    ax[1,1].set_xlabel("Epoch"); ax[1,1].set_ylabel("Entropy", color="g")
-    ax[1,1].set_title("Entropy & Beat Rate"); ax[1,1].grid(True, alpha=.3)
-    l1, lb1 = ax[1,1].get_legend_handles_labels()
-    l2, lb2 = a2.get_legend_handles_labels()
-    ax[1,1].legend(l1+l2, lb1+lb2, fontsize=8)
+
+def _allreduce_eval(result, local_count, device):
+    tensor = torch.tensor([
+        result["model_sortino"] * local_count,
+        result["baseline_sortino"] * local_count,
+        result["beat_rate"] * local_count,
+        float(local_count),
+    ], device=device, dtype=torch.float64)
+    dist.all_reduce(tensor)
+    total = tensor[3].item()
+    if total < 1:
+        return result
+    return {
+        "model_sortino": float(tensor[0].item() / total),
+        "baseline_sortino": float(tensor[1].item() / total),
+        "beat_rate": float(tensor[2].item() / total),
+    }
+
+
+def _allreduce_max_int(value, device):
+    tensor = torch.tensor([value], device=device, dtype=torch.long)
+    dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
+    return int(tensor.item())
+
+
+def _gather_test_rows(local_rows, device):
+    local_bytes = pickle.dumps(local_rows)
+    local_size = torch.tensor([len(local_bytes)], dtype=torch.long, device=device)
+    all_sizes = [
+        torch.zeros(1, dtype=torch.long, device=device) for _ in range(_world)
+    ]
+    dist.all_gather(all_sizes, local_size)
+
+    max_size = max(s.item() for s in all_sizes)
+    local_padded = torch.zeros(max_size, dtype=torch.uint8, device=device)
+    local_padded[:len(local_bytes)] = torch.tensor(
+        list(local_bytes), dtype=torch.uint8, device=device,
+    )
+    all_padded = [
+        torch.zeros(max_size, dtype=torch.uint8, device=device)
+        for _ in range(_world)
+    ]
+    dist.all_gather(all_padded, local_padded)
+
+    if _rank == 0:
+        all_rows = []
+        for rank_idx in range(_world):
+            size = all_sizes[rank_idx].item()
+            rank_bytes = bytes(all_padded[rank_idx][:size].cpu().numpy().tolist())
+            all_rows.extend(pickle.loads(rank_bytes))
+        return all_rows
+    return None
+
+
+# Plotting and checkpointing
+
+@timed
+def plot_training(history, path):
+    from matplotlib.ticker import MaxNLocator
+    epochs = range(1, len(history["train_model"]) + 1)
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    axes[0, 0].plot(epochs, history["train_model"], "b-", label="Train model", alpha=0.8)
+    axes[0, 0].plot(epochs, history["val_model"], "r-", label="Val model", alpha=0.8)
+    axes[0, 0].plot(
+        epochs, history["train_baseline"], "b--", label="Train baseline", alpha=0.5,
+    )
+    axes[0, 0].plot(
+        epochs, history["val_baseline"], "r--", label="Val baseline", alpha=0.5,
+    )
+    axes[0, 0].set_ylabel("Sortino")
+    axes[0, 0].set_title("Returns")
+    axes[0, 0].legend(fontsize=8)
+    axes[0, 0].grid(True, alpha=0.3)
+
+    axes[0, 1].plot(epochs, history["beat_rate"], "g-", alpha=0.8)
+    axes[0, 1].set_ylabel("Beat Rate")
+    axes[0, 1].set_title("Beat Rate")
+    axes[0, 1].set_ylim(0, 1)
+    axes[0, 1].grid(True, alpha=0.3)
+
+    axes[1, 0].plot(epochs, history["policy_loss"], "b-", label="Policy", alpha=0.8)
+    axes[1, 0].plot(epochs, history["value_loss"], "r-", label="Value", alpha=0.8)
+    axes[1, 0].set_xlabel("Epoch")
+    axes[1, 0].set_ylabel("Loss")
+    axes[1, 0].set_title("Losses")
+    axes[1, 0].legend(fontsize=8)
+    axes[1, 0].grid(True, alpha=0.3)
+
+    axes[1, 1].plot(epochs, history["entropy"], "g-", alpha=0.8)
+    axes[1, 1].set_xlabel("Epoch")
+    axes[1, 1].set_ylabel("Entropy")
+    axes[1, 1].set_title("Entropy")
+    axes[1, 1].grid(True, alpha=0.3)
+
+    for ax in axes.flat:
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
 
     plt.tight_layout()
-    plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
 
-# training loop
+@timed
+def save_checkpoint(state, path):
+    torch.save(state, path)
+
+
+def warmup_cosine_lr(base_lr, epoch, n_epochs, warmup_epochs):
+    if epoch <= warmup_epochs:
+        return base_lr * epoch / warmup_epochs
+    progress = (epoch - warmup_epochs) / (n_epochs - warmup_epochs)
+    return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+# Training loop
 
 def train(cfg):
+    global _rank, _world
+
+    distributed = "RANK" in os.environ
+    if distributed:
+        dist.init_process_group("nccl")
+        _rank = dist.get_rank()
+        _world = dist.get_world_size()
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        cfg.device = f"cuda:{local_rank}"
+    is_main = _rank == 0
+
     os.makedirs(cfg.save_dir, exist_ok=True)
-    logging.basicConfig(
-        filename=os.path.join(cfg.save_dir, cfg.log_file),
-        filemode="w", level=logging.INFO,
-        format="%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
-    torch.manual_seed(cfg.seed); np.random.seed(cfg.seed)
-    rng = np.random.default_rng(cfg.seed)
+    _log()
+    _log("[Configuration]")
+    for key, value in cfg.to_dict().items():
+        _log(f"    {key:<20s}: {value}")
 
-    train_data, stk_cols = load_data(cfg.train_path)
-    test_data, _ = load_data(cfg.test_path)
-    mkt = load_mkt_data(cfg.mkt_path)
-    all_cols = stk_cols + mkt["cols"]
-    log.info(f"Train: {len(train_data)} symbols, {len(stk_cols)} stock feats, "
-             f"{len(mkt['cols'])} market feats")
-    log.info(f"Test:  {len(test_data)} symbols")
+    torch.manual_seed(cfg.seed)
+    np.random.seed(cfg.seed)
 
-    val_eps = gen_chunks(test_data, mkt, cfg,
-                         np.random.default_rng(cfg.seed + 1000))
-    log.info(f"Val episodes: {len(val_eps)} (fixed)")
+    _log()
+    _log("[Data]")
+    market = load_market_data(cfg.market_path)
+    global_market_features = market["features"]
+    train_data, stock_feature_cols = load_stock_data(
+        cfg.train_path, market["date_to_idx"],
+    )
+    test_data, _ = load_stock_data(cfg.test_path, market["date_to_idx"])
+    all_feature_cols = stock_feature_cols + market["columns"]
+    _log(f"    {'Train symbols':<20s}: {len(train_data)}")
+    _log(f"    {'Test symbols':<20s}: {len(test_data)}")
+    _log(f"    {'Stock features':<20s}: {len(stock_feature_cols)}")
+    _log(f"    {'Market features':<20s}: {len(market['columns'])}")
 
-    stk_g, mkt_g, stk_i, mkt_i = split_groups(all_cols)
-    log.info(f"Stock groups: {len(stk_g)} ({len(stk_i)} feats)  "
-             f"Market groups: {len(mkt_g)} ({len(mkt_i)} feats)  "
-             f"Mkt dropout: {cfg.mkt_dropout}")
+    _log()
+    _log("[Episodes]")
+    test_episode_rng = np.random.default_rng(cfg.seed + 1000)
+    all_test_episodes = generate_episodes(test_data, cfg, test_episode_rng)
 
-    model = Policy(stk_g, len(mkt_i), stk_i, mkt_i, cfg).to(cfg.device)
-    n_gpus = torch.cuda.device_count()
-    dp = nn.DataParallel(model) if n_gpus > 1 else model
-    log.info(f"Params: {sum(p.numel() for p in model.parameters()):,}  "
-             f"Device: {f'{n_gpus} GPUs' if n_gpus > 1 else cfg.device}  "
-             f"Workers: {N_WORKERS}")
+    test_split_rng = np.random.default_rng(cfg.seed + 2000)
+    test_symbols = sorted(set(ep["symbol"] for ep in all_test_episodes))
+    test_split_rng.shuffle(test_symbols)
+    n_val_symbols = len(test_symbols) // 2
+    val_symbol_set = set(test_symbols[:n_val_symbols])
+    val_episodes = [ep for ep in all_test_episodes if ep["symbol"] in val_symbol_set]
+    test_episodes = [ep for ep in all_test_episodes if ep["symbol"] not in val_symbol_set]
+    del all_test_episodes
+    _log(f"    {'Val symbols':<20s}: {n_val_symbols}")
+    _log(f"    {'Test symbols':<20s}: {len(test_symbols) - n_val_symbols}")
+    _log(f"    {'Val episodes':<20s}: {len(val_episodes)}")
+    _log(f"    {'Test episodes':<20s}: {len(test_episodes)}")
 
-    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr, eps=1e-5)
-    hist = defaultdict(list)
-    best_val, patience_ctr = -float("inf"), 0
+    stock_groups, market_groups, stock_feature_indices, market_feature_indices = (
+        split_feature_groups(all_feature_cols)
+    )
 
-    hdr = (f"{'Ep':>4} {'PL':>7} {'VL':>7} {'Ent':>6} "
-           f"{'TrMod':>7} {'TrExc':>7} {'VlMod':>7} {'VlExc':>7} {'Beat':>6} {'#Ep':>5}")
-    log.info(f"Training up to {cfg.n_epochs} epochs, patience {cfg.patience}")
-    log.info(hdr)
+    _log()
+    _log("[Model]")
+    base_model = PolicyNetwork(
+        stock_groups, len(market_feature_indices),
+        stock_feature_indices, market_feature_indices, cfg,
+    ).to(cfg.device)
+    model = base_model
+    if distributed:
+        model = DDP(base_model, device_ids=[int(os.environ["LOCAL_RANK"])])
+        torch.manual_seed(cfg.seed + _rank)
+    n_params = sum(p.numel() for p in base_model.parameters())
+    _log(f"    {'Stock groups':<20s}: {len(stock_groups)} ({len(stock_feature_indices)} features)")
+    _log(f"    {'Market groups':<20s}: {len(market_groups)} ({len(market_feature_indices)} features)")
+    _log(f"    {'Parameters':<20s}: {n_params:,}")
+    device_label = f"{_world} GPUs (DDP)" if distributed else cfg.device
+    _log(f"    {'Device':<20s}: {device_label}")
 
-    for epoch in range(1, cfg.n_epochs + 1):
-        for pg in opt.param_groups:
-            pg["lr"] = cfg.lr * (1 - (epoch - 1) / cfg.n_epochs)
+    effective_lr = cfg.lr * _world
+    optimizer = torch.optim.Adam(base_model.parameters(), lr=effective_lr, eps=1e-5)
+    reward_normalizer = RewardNormalizer(cfg.reward_clip, cfg.pytorch_eps)
+    if _world > 1:
+        _log(f"    {'LR (linear scaled)':<20s}: {cfg.lr} x {_world} = {effective_lr:.6f}")
 
-        tr_eps = gen_chunks(train_data, mkt, cfg, rng)
-        buf = collect(dp, tr_eps, cfg)
-        loss = ppo_update(dp, opt, buf, cfg)
-        buf.clear()
+    history = defaultdict(list)
+    best_smoothed_sortino = -float("inf")
+    patience_counter = 0
+    start_epoch = 1
 
-        tr = evaluate(dp, tr_eps, cfg)
-        vl = evaluate(dp, val_eps, cfg)
+    latest_path = os.path.join(cfg.save_dir, "model_latest.pt")
+    if os.path.exists(latest_path):
+        ckpt = torch.load(latest_path, map_location=cfg.device, weights_only=False)
+        base_model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        start_epoch = ckpt["epoch"] + 1
+        patience_counter = ckpt.get("patience_counter", 0)
+        if "reward_normalizer" in ckpt:
+            reward_normalizer.load_state_dict(ckpt["reward_normalizer"])
+        if "history" in ckpt:
+            for key, vals in ckpt["history"].items():
+                history[key] = list(vals)
 
-        for k, v in [("tr_mod", tr["model_return"]), ("tr_bh", tr["bh_return"]),
-                      ("tr_exc", tr["excess"]), ("vl_mod", vl["model_return"]),
-                      ("vl_bh", vl["bh_return"]), ("vl_exc", vl["excess"]),
-                      ("beat", vl["beat_rate"]), ("pl", loss["pl"]),
-                      ("vl_loss", loss["vl"]), ("ent", loss["ent"])]:
-            hist[k].append(v)
-
-        log.info(f"{epoch:4d} {loss['pl']:7.4f} {loss['vl']:7.4f} {loss['ent']:6.4f} "
-                 f"{tr['model_return']:7.4f} {tr['excess']:+7.4f} "
-                 f"{vl['model_return']:7.4f} {vl['excess']:+7.4f} "
-                 f"{vl['beat_rate']:6.1%} {len(tr_eps):5d}")
-
-        _save(model, cfg, all_cols, stk_g, mkt_g, stk_i, mkt_i,
-              os.path.join(cfg.save_dir, "model_latest.pt"), epoch)
-        plot(dict(hist), os.path.join(cfg.save_dir, "training_curves.png"))
-
-        if vl["model_return"] > best_val:
-            best_val = vl["model_return"]
-            patience_ctr = 0
-            _save(model, cfg, all_cols, stk_g, mkt_g, stk_i, mkt_i,
-                  os.path.join(cfg.save_dir, "model_best.pt"), epoch)
-            log.info(f"  new best val {best_val:.4f}")
+        if "val_model" in history and len(history["val_model"]) > 0:
+            val_series = history["val_model"]
+            window = cfg.patience_smoothing
+            best_smoothed_sortino = max(
+                float(np.mean(val_series[max(0, i + 1 - window) : i + 1]))
+                for i in range(len(val_series))
+            )
         else:
-            patience_ctr += 1
+            best_smoothed_sortino = ckpt.get(
+                "best_smoothed_sortino", -float("inf"),
+            )
 
-        if patience_ctr >= cfg.patience:
-            log.info(f"Early stop at epoch {epoch} (patience {cfg.patience})")
+        _log()
+        _log(
+            f"Resumed from epoch {ckpt['epoch']}"
+            f" (best smoothed {best_smoothed_sortino:.3f},"
+            f" patience {patience_counter})"
+        )
+
+    rank_val_episodes = val_episodes[_rank::_world]
+
+    _log()
+    _log(
+        f"[Training] {cfg.n_epochs} epochs, patience {cfg.patience}"
+        f", smoothing window {cfg.patience_smoothing}"
+    )
+
+    def _build_checkpoint():
+        return {
+            "model_state_dict": base_model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "config": cfg.to_dict(),
+            "feature_cols": all_feature_cols,
+            "stock_groups": stock_groups,
+            "market_groups": market_groups,
+            "stock_indices": stock_feature_indices,
+            "market_indices": market_feature_indices,
+            "epoch": epoch,
+            "best_smoothed_sortino": best_smoothed_sortino,
+            "patience_counter": patience_counter,
+            "reward_normalizer": reward_normalizer.state_dict(),
+            "history": dict(history),
+        }
+
+    for epoch in range(start_epoch, cfg.n_epochs + 1):
+        current_lr = warmup_cosine_lr(
+            effective_lr, epoch, cfg.n_epochs, cfg.warmup_epochs,
+        )
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = current_lr
+
+        epoch_rng = np.random.default_rng(cfg.seed + epoch * 7919)
+        train_episodes = generate_episodes(train_data, cfg, epoch_rng)
+        rank_train_episodes = train_episodes[_rank::_world]
+
+        if epoch == start_epoch:
+            _log(f"    {'Training episodes':<20s}: {len(train_episodes)} (epoch {epoch})")
+
+        rollout, model_sortino, baseline_sortino = collect_training_rollout(
+            model, rank_train_episodes, cfg, global_market_features,
+            reward_normalizer, distributed,
+        )
+
+        if distributed:
+            model_sortino, baseline_sortino = _allreduce_means(
+                model_sortino, baseline_sortino,
+                len(rank_train_episodes), cfg.device,
+            )
+
+        n_local_transitions = rollout.compute_gae(
+            cfg.gamma, cfg.gae_lambda, cfg.pytorch_eps,
+        )
+        if _world > 1:
+            n_padded_transitions = _allreduce_max_int(
+                n_local_transitions, cfg.device,
+            )
+        else:
+            n_padded_transitions = n_local_transitions
+
+        epoch_losses = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
+        epoch_start = time.perf_counter()
+        for ppo_pass in range(cfg.ppo_epochs):
+            losses = run_ppo_update(
+                model, optimizer, rollout, cfg,
+                n_local_transitions, n_padded_transitions,
+            )
+            for k in epoch_losses:
+                epoch_losses[k] += losses[k]
+        for k in epoch_losses:
+            epoch_losses[k] /= cfg.ppo_epochs
+
+        del rollout
+        if cfg.device.startswith("cuda"):
+            torch.cuda.empty_cache()
+
+        val_result = evaluate_episodes(
+            model, rank_val_episodes, cfg, global_market_features,
+        )
+        if distributed:
+            val_aggregated = _allreduce_eval(
+                val_result, len(rank_val_episodes), cfg.device,
+            )
+        else:
+            val_aggregated = val_result
+
+        for key, value in [
+            ("train_model", model_sortino),
+            ("train_baseline", baseline_sortino),
+            ("val_model", val_aggregated["model_sortino"]),
+            ("val_baseline", val_aggregated["baseline_sortino"]),
+            ("beat_rate", val_aggregated["beat_rate"]),
+            ("policy_loss", epoch_losses["policy_loss"]),
+            ("value_loss", epoch_losses["value_loss"]),
+            ("entropy", epoch_losses["entropy"]),
+        ]:
+            history[key].append(value)
+
+        window = cfg.patience_smoothing
+        recent_vals = history["val_model"][-window:]
+        smoothed_val_sortino = float(np.mean(recent_vals))
+
+        improved = smoothed_val_sortino > best_smoothed_sortino
+        if improved:
+            best_smoothed_sortino = smoothed_val_sortino
+            patience_counter = 0
+            if is_main:
+                save_checkpoint(
+                    _build_checkpoint(),
+                    os.path.join(cfg.save_dir, "model_best.pt"),
+                )
+        else:
+            patience_counter += 1
+
+        elapsed = time.perf_counter() - epoch_start
+        _log()
+        _log(f"[Epoch {epoch}/{cfg.n_epochs}] ({elapsed:.1f}s)")
+        _log(f"    {'Train sortino':<20s}: {model_sortino:.4f}")
+        _log(f"    {'Train baseline':<20s}: {baseline_sortino:.4f}")
+        _log(f"    {'Val sortino':<20s}: {val_aggregated['model_sortino']:.4f}")
+        _log(f"    {'Val baseline':<20s}: {val_aggregated['baseline_sortino']:.4f}")
+        _log(f"    {'Val smoothed':<20s}: {smoothed_val_sortino:.4f}")
+        _log(f"    {'Beat rate':<20s}: {val_aggregated['beat_rate']:.1%}")
+        _log(f"    {'Policy loss':<20s}: {epoch_losses['policy_loss']:.4f}")
+        _log(f"    {'Value loss':<20s}: {epoch_losses['value_loss']:.4f}")
+        _log(f"    {'Entropy':<20s}: {epoch_losses['entropy']:.4f}")
+        _log(f"    {'LR':<20s}: {current_lr:.2e}")
+        _log(f"    {'Patience':<20s}: {patience_counter}/{cfg.patience}")
+        if improved:
+            _log(f"    {'New best smoothed':<20s}: {best_smoothed_sortino:.4f}")
+
+        if is_main:
+            save_checkpoint(
+                _build_checkpoint(),
+                os.path.join(cfg.save_dir, "model_latest.pt"),
+            )
+            plot_training(
+                dict(history),
+                os.path.join(cfg.save_dir, "training_curves.png"),
+            )
+
+        if patience_counter >= cfg.patience:
+            _log(f"  Early stopping at epoch {epoch} (patience {cfg.patience})")
             break
 
-    log.info(f"Done. Best val: {best_val:.4f}")
+    _log()
+    _log(f"Training complete, best smoothed validation: {best_smoothed_sortino:.4f}")
 
-    ckpt = torch.load(os.path.join(cfg.save_dir, "model_best.pt"),
-                      map_location=cfg.device, weights_only=False)
-    model.load_state_dict(ckpt["model_state_dict"])
+    best_path = os.path.join(cfg.save_dir, "model_best.pt")
+    if os.path.exists(best_path):
+        ckpt = torch.load(best_path, map_location=cfg.device, weights_only=False)
+        base_model.load_state_dict(ckpt["model_state_dict"])
 
-    log.info("FINAL EVAL (best model, fresh chunks)")
-    final_eps = gen_chunks(test_data, mkt, cfg,
-                           np.random.default_rng(cfg.seed + 9999))
-    log.info(f"Episodes: {len(final_eps)}")
-    res = evaluate(dp, final_eps, cfg, verbose=True)
-    pd.DataFrame(res["rows"]).to_csv(
-        os.path.join(cfg.save_dir, "test_results.csv"), index=False)
-    log.info(f"Results saved to {os.path.join(cfg.save_dir, 'test_results.csv')}")
+    rank_test_episodes = test_episodes[_rank::_world]
+    test_result = evaluate_episodes(
+        model, rank_test_episodes, cfg, global_market_features,
+    )
+    if distributed:
+        test_aggregated = _allreduce_eval(
+            test_result, len(rank_test_episodes), cfg.device,
+        )
+    else:
+        test_aggregated = test_result
+
+    _log()
+    _log(f"[Final Evaluation] {len(test_episodes)} episodes")
+    _log(f"    {'Model sortino':<20s}: {test_aggregated['model_sortino']:.4f}")
+    _log(f"    {'Baseline sortino':<20s}: {test_aggregated['baseline_sortino']:.4f}")
+    _log(f"    {'Beat rate':<20s}: {test_aggregated['beat_rate']:.1%}")
+
+    if distributed:
+        local_rows = build_test_results(rank_test_episodes, test_result, cfg)
+        all_rows = _gather_test_rows(local_rows, cfg.device)
+        if is_main and all_rows is not None:
+            results_path = os.path.join(cfg.save_dir, "test_results.csv")
+            pd.DataFrame(all_rows).to_csv(results_path, index=False)
+            _log(f"    {'Saved':<20s}: {results_path}")
+    elif is_main:
+        rows = build_test_results(rank_test_episodes, test_result, cfg)
+        results_path = os.path.join(cfg.save_dir, "test_results.csv")
+        pd.DataFrame(rows).to_csv(results_path, index=False)
+        _log(f"    {'Saved':<20s}: {results_path}")
+
+    if distributed:
+        dist.destroy_process_group()
 
 
-def _save(model, cfg, all_cols, stk_g, mkt_g, stk_i, mkt_i, path, epoch):
-    torch.save({"model_state_dict": model.state_dict(), "config": cfg.to_dict(),
-                "feature_cols": all_cols, "stock_groups": stk_g,
-                "market_groups": mkt_g, "stock_indices": stk_i,
-                "market_indices": mkt_i, "epoch": epoch}, path)
+# Launch
+
+def _spawn_ddp_worker(local_rank, cfg_dict, n_gpus, port):
+    os.environ["RANK"] = str(local_rank)
+    os.environ["LOCAL_RANK"] = str(local_rank)
+    os.environ["WORLD_SIZE"] = str(n_gpus)
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(port)
+    cfg = Config()
+    for key, value in cfg_dict.items():
+        setattr(cfg, key, value)
+    train(cfg)
 
 
-# CLI
+def _find_free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("", 0))
+        return sock.getsockname()[1]
+
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--train"); p.add_argument("--test"); p.add_argument("--mkt")
-    p.add_argument("--save_dir"); p.add_argument("--log_file")
-    p.add_argument("--epochs", type=int); p.add_argument("--lr", type=float)
-    p.add_argument("--lookback", type=int); p.add_argument("--episode_length", type=int)
-    p.add_argument("--tx_cost", type=float); p.add_argument("--mkt_dropout", type=float)
-    p.add_argument("--patience", type=int); p.add_argument("--seed", type=int)
-    a = p.parse_args()
     cfg = Config()
-    if a.train: cfg.train_path = a.train
-    if a.test: cfg.test_path = a.test
-    if a.mkt: cfg.mkt_path = a.mkt
-    if a.save_dir: cfg.save_dir = a.save_dir
-    if a.log_file: cfg.log_file = a.log_file
-    if a.epochs: cfg.n_epochs = a.epochs
-    if a.lr: cfg.lr = a.lr
-    if a.lookback: cfg.lookback = a.lookback
-    if a.episode_length: cfg.episode_length = a.episode_length
-    if a.tx_cost: cfg.transaction_cost = a.tx_cost
-    if a.mkt_dropout is not None: cfg.mkt_dropout = a.mkt_dropout
-    if a.patience: cfg.patience = a.patience
-    if a.seed: cfg.seed = a.seed
-    train(cfg)
+    n_gpus = torch.cuda.device_count()
+    if n_gpus > 1 and "RANK" not in os.environ:
+        port = _find_free_port()
+        _log(f"Auto launching DDP on {n_gpus} GPUs (port {port})")
+        mp.spawn(
+            _spawn_ddp_worker,
+            args=(cfg.to_dict(), n_gpus, port),
+            nprocs=n_gpus,
+            join=True,
+        )
+    else:
+        train(cfg)
 
 
 if __name__ == "__main__":
