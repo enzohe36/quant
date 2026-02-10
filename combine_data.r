@@ -44,7 +44,7 @@ test_start <- last_td %m-% years(2)
 
 set.seed(42)
 
-# MAIN SCRIPT ==================================================================
+# STOCK PREPROCESSING ==========================================================
 
 dir.create(analysis_dir)
 dir.create(logs_dir)
@@ -140,6 +140,9 @@ plan(sequential)
 saveRDS(data_combined, data_combined_path)
 tsprint(str_glue("Combined {length(data_combined)} stocks."))
 
+# MARKET PREPROCESSING =========================================================
+
+# spot_combined <- read_csv(spot_combined_path, show_col_types = FALSE)
 # data_combined <- readRDS(data_combined_path)
 
 plan(multisession, workers = availableCores() - 1)
@@ -198,68 +201,47 @@ plan(sequential)
 saveRDS(mkt_data, mkt_data_path)
 tsprint(str_glue("Generated market data from {min(mkt_data$date)} to {max(mkt_data$date)}."))
 
+# MARKET FEATURES ==============================================================
+
 # mkt_data <- readRDS(mkt_data_path)
 
-# t0 <- proc.time()
+t0 <- proc.time()
 
-feats <- mkt_feats <- ehlers_features(
-  close         = mkt_data$close,
-  volume        = mkt_data$to,
-  mc            = mkt_data$mc,
-  np            = mkt_data$np,
-  np_deduct     = mkt_data$np_deduct,
-  equity        = mkt_data$equity,
-  revenue       = mkt_data$revenue,
-  ocf           = mkt_data$ocf
+feats <- ehlers_features(
+  close     = mkt_data$close,
+  volume    = mkt_data$to,
+  mc        = mkt_data$mc,
+  np        = mkt_data$np,
+  np_deduct = mkt_data$np_deduct,
+  equity    = mkt_data$equity,
+  revenue   = mkt_data$revenue,
+  ocf       = mkt_data$ocf
 ) %>%
   rename_with(~ paste0("mkt_", .x)) %>%
+  mutate(date = mkt_data$date, .before = 1) %>%
+  filter(date >= train_start) %>%
+  na.omit() %>%
   as_tibble()
 
-# elapsed <- (proc.time() - t0)[3]
-# cat(nrow(feats), "x", ncol(feats), "in", round(elapsed, 3), "s\n")
+elapsed <- (proc.time() - t0)[3]
+cat(nrow(feats), "x", ncol(feats), "in", round(elapsed, 3), "s\n")
 
-# mat <- as.matrix(feats)
-# valid <- mat[complete.cases(mat), ]
-# cat("Valid rows:", nrow(valid), " Warmup NAs:", sum(is.na(mat)), "\n")
-# cat("Bounds: [", round(min(valid), 4), ",", round(max(valid), 4), "]\n\n")
-
-# cat(sprintf("%-35s %8s %8s %8s\n", "Feature", "NAs", "Min", "Max"))
-# for (col in names(feats)) {
-#   v <- feats[[col]]; w <- sum(is.na(v))
-#   cat(sprintf("%-35s %8d %8.4f %8.4f\n", col, w,
-#               min(v, na.rm = TRUE), max(v, na.rm = TRUE)))
-# }
-
-# groups <- sub("\\.[^.]+$", "", names(feats))
-# cat("\nGroups:\n")
-# for (g in unique(groups)) cat(sprintf("  %-20s %3d\n", g, sum(groups == g)))
-# cat(sprintf("  %-20s %3d\n", "TOTAL", ncol(feats)))
-
-mkt_feats <- bind_cols(date = mkt_data$date, mkt_feats) %>%
-  filter(date >= train_start)
-
-mkt_feats_normalizers <- mkt_feats %>%
+feats_normalizers <- feats %>%
   filter(date < test_start) %>%
-  create_normalizers(matches("^mkt_\\."), method = "scale")
-saveRDS(mkt_feats_normalizers, mkt_feats_normalizers_path)
+  create_normalizers(matches("\\.fund_"), method = "scale")
+saveRDS(feats_normalizers, mkt_feats_normalizers_path)
 
-mkt_feats <- predict(mkt_feats_normalizers, mkt_feats)
-write_csv(mkt_feats, mkt_feats_path)
-tsprint(str_glue("nrow(mkt_feats) = {nrow(mkt_feats)}"))
+feats <- predict(feats_normalizers, feats)
+validate_features(feats)
+write_csv(feats, mkt_feats_path)
+tsprint(str_glue("nrow(mkt_feats) = {nrow(feats)}"))
 
-# for (n in names(select(mkt_feats, -date))) {
-#   hist(mkt_feats[[n]], 30, xlab = n)
-# }
+# STOCK FEATURES ===============================================================
 
-# mkt_feats_plot <- filter(mkt_feats,date >= test_start) %>%
-#   bind_cols(close = filter(mkt_data, date >= test_start)$close)
-# for (n in names(select(mkt_feats_plot, -c(date, close)))) {
-#   plot_dual_y(
-#     mkt_feats_plot[["date"]], mkt_feats_plot[["close"]], mkt_feats_plot[[n]],
-#     xlab = "Date", y1lab = "Close", y2lab = n,
-#   )
-# }
+# data_combined <- readRDS(data_combined_path)
+# mkt_data <- readRDS(mkt_data_path)
 
+t0 <- proc.time()
 plan(multisession, workers = availableCores() - 1)
 
 feats <- foreach(
@@ -270,20 +252,21 @@ feats <- foreach(
     mutate(price = lead(open)) %>%
     select(symbol, date, price) %>%
     bind_cols(
-      feats <- ehlers_features(
-        close         = data$close,
-        open          = data$open,
-        high          = data$high,
-        low           = data$low,
-        volume        = data$volume,
-        amount        = data$amount,
-        to            = data$to,
-        mc            = data$mc,
-        np            = data$np,
-        np_deduct     = data$np_deduct,
-        equity        = data$equity,
-        revenue       = data$revenue,
-        ocf           = data$ocf
+      ehlers_features(
+        close     = data$close,
+        open      = data$open,
+        high      = data$high,
+        low       = data$low,
+        volume    = data$volume,
+        amount    = data$amount,
+        to        = data$to,
+        mc        = data$mc,
+        mkt_mc    = left_join(data, mkt_data, by = "date")$mc.y,
+        np        = data$np,
+        np_deduct = data$np_deduct,
+        equity    = data$equity,
+        revenue   = data$revenue,
+        ocf       = data$ocf
       )
     ) %>%
     filter(date >= train_start) %>%
@@ -294,13 +277,17 @@ feats <- foreach(
 
 plan(sequential)
 tsprint(str_glue("Generated features for {length(unique(feats$symbol))} stocks."))
+elapsed <- (proc.time() - t0)[3]
+cat(nrow(feats), "x", ncol(feats), "in", round(elapsed, 3), "s\n")
 
 feats_normalizers <- feats %>%
   filter(date < test_start) %>%
-  create_normalizers(-c(symbol, date, price), method = "scale")
+  create_normalizers(matches("\\.fund_"), method = "orderNorm")
 saveRDS(feats_normalizers, feats_normalizers_path)
 
-feats <- predict(feats_normalizers, feats)
+feats <- predict(feats_normalizers, feats) %>%
+  mutate(across(matches("\\.fund_"), ~ clamp(.x, 3)))
+validate_features(feats)
 
 train <- filter(feats, date < test_start)
 write_csv(train, train_path)
@@ -320,5 +307,6 @@ test_tr <- filter(test, symbol %in% symbols_tr)
 write_csv(test_tr, test_tr_path)
 tsprint(str_glue("nrow(test_tr) = {nrow(test_tr)}"))
 
-example <- train[1:10, ]
+example <- filter(train, symbol == symbols_tr[1])
 write_csv(example, example_path)
+tsprint(str_glue("nrow(example) = {nrow(example)}"))
