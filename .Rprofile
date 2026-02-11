@@ -19,3 +19,4 @@ options(repos = c(CRAN = "https://cloud.r-project.org"))
 options(encoding = "UTF-8")
 
 Sys.setenv(TZ = "Asia/Shanghai")
+Sys.setenv("R_MAX_VSIZE" = "64Gb")

@@ -1,9 +1,6 @@
 # PRESET =======================================================================
 
-# library(sn)
 # library(patchwork)
-# library(bestNormalize)
-
 
 # HELPER FUNCTIONS =============================================================
 
@@ -80,7 +77,6 @@ atr_na <- function(HLC, n = 14, ...) {
   return(result)
 }
 
-
 # PLOTTING =====================================================================
 
 plot_dual_y <- function(x, y1, y2,
@@ -132,147 +128,146 @@ plot_dual_y <- function(x, y1, y2,
   invisible(p)
 }
 
-
 # NORMALIZERS ==================================================================
 
-# Main creation function
-create_normalizers <- function(
-  data, ..., method = c("scale", "robust_scale", "orderNorm")
-) {
-  method <- match.arg(method)
+# # Main creation function
+# create_normalizers <- function(
+#   data, ..., method = c("scale", "robust_scale", "orderNorm")
+# ) {
+#   method <- match.arg(method)
 
-  selected_cols <- data %>%
-    select(...) %>%
-    names()
+#   selected_cols <- data %>%
+#     select(...) %>%
+#     names()
 
-  normalizers <- map(selected_cols, function(col) {
-    if (method %in% c("scale", "robust_scale")) {
-      create_scale_normalizer(
-        data[[col]], col, robust = method == "robust_scale"
-      )
-    } else {
-      # Use bestNormalize::orderNorm directly
-      create_ordernorm_wrapper(data[[col]], col)
-    }
-  })
+#   normalizers <- map(selected_cols, function(col) {
+#     if (method %in% c("scale", "robust_scale")) {
+#       create_scale_normalizer(
+#         data[[col]], col, robust = method == "robust_scale"
+#       )
+#     } else {
+#       # Use bestNormalize::orderNorm directly
+#       create_ordernorm_wrapper(data[[col]], col)
+#     }
+#   })
 
-  names(normalizers) <- selected_cols
-  structure(normalizers, class = "normalizer_list")
-}
+#   names(normalizers) <- selected_cols
+#   structure(normalizers, class = "normalizer_list")
+# }
 
-combine_normalizers <- function(...) {
-  all_norms <- list(...)
-  combined <- unlist(all_norms, recursive = FALSE)
-  structure(combined, class = "normalizer_list")
-}
+# combine_normalizers <- function(...) {
+#   all_norms <- list(...)
+#   combined <- unlist(all_norms, recursive = FALSE)
+#   structure(combined, class = "normalizer_list")
+# }
 
-# Create scale normalizer (z-score or robust)
-create_scale_normalizer <- function(x, col_name, robust = FALSE) {
-  center <- if (robust) median(x, na.rm = TRUE) else mean(x, na.rm = TRUE)
-  disp <- if (robust) mad(x, na.rm = TRUE) else sd(x, na.rm = TRUE)
+# # Create scale normalizer (z-score or robust)
+# create_scale_normalizer <- function(x, col_name, robust = FALSE) {
+#   center <- if (robust) median(x, na.rm = TRUE) else mean(x, na.rm = TRUE)
+#   disp <- if (robust) mad(x, na.rm = TRUE) else sd(x, na.rm = TRUE)
 
-  structure(
-    list(
-      column = col_name,
-      method = if (robust) "robust_scale" else "scale",
-      center = center,
-      dispersion = disp
-    ),
-    class = "scale_normalizer"
-  )
-}
+#   structure(
+#     list(
+#       column = col_name,
+#       method = if (robust) "robust_scale" else "scale",
+#       center = center,
+#       dispersion = disp
+#     ),
+#     class = "scale_normalizer"
+#   )
+# }
 
-# Wrapper for bestNormalize::orderNorm object
-create_ordernorm_wrapper <- function(x, col_name) {
-  # Create the actual orderNorm object
-  orq_obj <- orderNorm(x, warn = FALSE)
+# # Wrapper for bestNormalize::orderNorm object
+# create_ordernorm_wrapper <- function(x, col_name) {
+#   # Create the actual orderNorm object
+#   orq_obj <- orderNorm(x, warn = FALSE)
 
-  # Wrap it with column info
-  structure(
-    list(
-      column = col_name,
-      method = "orderNorm",
-      orq_object = orq_obj  # Store the actual bestNormalize object
-    ),
-    class = "ordernorm_wrapper"
-  )
-}
+#   # Wrap it with column info
+#   structure(
+#     list(
+#       column = col_name,
+#       method = "orderNorm",
+#       orq_object = orq_obj  # Store the actual bestNormalize object
+#     ),
+#     class = "ordernorm_wrapper"
+#   )
+# }
 
-# Apply scale normalization to new data
-predict.scale_normalizer <- function(object, newdata, ...) {
-  (newdata - object$center) / object$dispersion
-}
+# # Apply scale normalization to new data
+# predict.scale_normalizer <- function(object, newdata, ...) {
+#   (newdata - object$center) / object$dispersion
+# }
 
-# Apply orderNorm using bestNormalize's predict method
-predict.ordernorm_wrapper <- function(object, newdata, ...) {
-  predict(object$orq_object, newdata = newdata, warn = FALSE)
-}
+# # Apply orderNorm using bestNormalize's predict method
+# predict.ordernorm_wrapper <- function(object, newdata, ...) {
+#   predict(object$orq_object, newdata = newdata, warn = FALSE)
+# }
 
-# Apply all normalizers in a list to new data
-predict.normalizer_list <- function(object, newdata, ...) {
-  result <- newdata
+# # Apply all normalizers in a list to new data
+# predict.normalizer_list <- function(object, newdata, ...) {
+#   result <- newdata
 
-  for (col_name in names(object)) {
-    if (col_name %in% names(newdata)) {
-      result[[col_name]] <- predict(object[[col_name]], newdata[[col_name]])
-    }
-  }
+#   for (col_name in names(object)) {
+#     if (col_name %in% names(newdata)) {
+#       result[[col_name]] <- predict(object[[col_name]], newdata[[col_name]])
+#     }
+#   }
 
-  result
-}
+#   result
+# }
 
-# Print method for scale normalizer
-print.scale_normalizer <- function(x, ...) {
-  cat(sprintf("<%s Normalizer>\n", x$method))
-  cat(sprintf("Column: %s\n", x$column))
-  cat(sprintf("Center: %s\n", format(x$center, digits = 6)))
-  cat(sprintf("Dispersion: %s\n", format(x$dispersion, digits = 6)))
-  invisible(x)
-}
+# # Print method for scale normalizer
+# print.scale_normalizer <- function(x, ...) {
+#   cat(sprintf("<%s Normalizer>\n", x$method))
+#   cat(sprintf("Column: %s\n", x$column))
+#   cat(sprintf("Center: %s\n", format(x$center, digits = 6)))
+#   cat(sprintf("Dispersion: %s\n", format(x$dispersion, digits = 6)))
+#   invisible(x)
+# }
 
-# Print method for orderNorm wrapper
-print.ordernorm_wrapper <- function(x, ...) {
-  cat(sprintf("<%s Normalizer>\n", x$method))
-  cat(sprintf("Column: %s\n", x$column))
-  cat("bestNormalize::orderNorm object:\n")
-  print(x$orq_object)
-  invisible(x)
-}
+# # Print method for orderNorm wrapper
+# print.ordernorm_wrapper <- function(x, ...) {
+#   cat(sprintf("<%s Normalizer>\n", x$method))
+#   cat(sprintf("Column: %s\n", x$column))
+#   cat("bestNormalize::orderNorm object:\n")
+#   print(x$orq_object)
+#   invisible(x)
+# }
 
-# Print method for normalizer list (brief overview)
-print.normalizer_list <- function(x, ...) {
-  cat(sprintf("Normalizer List (%d columns)\n", length(x)))
-  cat(strrep("=", 50), "\n")
+# # Print method for normalizer list (brief overview)
+# print.normalizer_list <- function(x, ...) {
+#   cat(sprintf("Normalizer List (%d columns)\n", length(x)))
+#   cat(strrep("=", 50), "\n")
 
-  methods <- sapply(x, function(obj) obj$method)
-  for (method_type in unique(methods)) {
-    cols <- names(x)[methods == method_type]
-    cat(sprintf("\n%s (%d):\n", method_type, length(cols)))
-    cat("  ", paste(cols, collapse = ", "), "\n")
-  }
+#   methods <- sapply(x, function(obj) obj$method)
+#   for (method_type in unique(methods)) {
+#     cols <- names(x)[methods == method_type]
+#     cat(sprintf("\n%s (%d):\n", method_type, length(cols)))
+#     cat("  ", paste(cols, collapse = ", "), "\n")
+#   }
 
-  cat("\nUse summary() for detailed information\n")
-  invisible(x)
-}
+#   cat("\nUse summary() for detailed information\n")
+#   invisible(x)
+# }
 
-# Summary method for normalizer list (detailed view)
-summary.normalizer_list <- function(object, ...) {
-  cat(sprintf("Normalizer List Summary (%d columns)\n", length(object)))
-  cat(strrep("=", 70), "\n\n")
+# # Summary method for normalizer list (detailed view)
+# summary.normalizer_list <- function(object, ...) {
+#   cat(sprintf("Normalizer List Summary (%d columns)\n", length(object)))
+#   cat(strrep("=", 70), "\n\n")
 
-  for (col_name in names(object)) {
-    norm <- object[[col_name]]
-    cat(sprintf("[%s] %s\n", norm$method, col_name))
+#   for (col_name in names(object)) {
+#     norm <- object[[col_name]]
+#     cat(sprintf("[%s] %s\n", norm$method, col_name))
 
-    if (inherits(norm, "scale_normalizer")) {
-      cat(sprintf("  Center: %s, Dispersion: %s\n",
-                  format(norm$center, digits = 6),
-                  format(norm$dispersion, digits = 6)))
-    } else if (inherits(norm, "ordernorm_wrapper")) {
-      cat(sprintf("  N observations: %d\n", norm$orq_object$n))
-      cat(sprintf("  Ties present: %s\n", norm$orq_object$ties_status))
-    }
-  }
+#     if (inherits(norm, "scale_normalizer")) {
+#       cat(sprintf("  Center: %s, Dispersion: %s\n",
+#                   format(norm$center, digits = 6),
+#                   format(norm$dispersion, digits = 6)))
+#     } else if (inherits(norm, "ordernorm_wrapper")) {
+#       cat(sprintf("  N observations: %d\n", norm$orq_object$n))
+#       cat(sprintf("  Ties present: %s\n", norm$orq_object$ties_status))
+#     }
+#   }
 
-  invisible(object)
-}
+#   invisible(object)
+# }

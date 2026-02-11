@@ -72,7 +72,7 @@ class Config:
     n_heads: int = 8
     n_layers: int = 3
     dropout: float = 0.15
-    market_dropout: float = 0.1
+    market_dropout: float = 0.3
 
     # PPO
     gamma: float = 0.99
@@ -88,14 +88,15 @@ class Config:
     xattn_weight_decay: float = 0.05
 
     # Training
-    n_epochs: int = 100
+    n_epochs: int = 200
     warmup_epochs: int = 5
     ppo_epochs: int = 4
     batch_size: int = 4096
     inference_batch: int = 65536
     lr: float = 1e-4
-    patience: int = 10
+    patience: int = 40
     patience_smoothing: int = 10
+    ablation_interval: int = 10
     seed: int = 42
 
     # Numerical
@@ -756,6 +757,35 @@ def evaluate_episodes(model, episodes, cfg, global_market_features):
     }
 
 
+@timed
+def evaluate_ablated(model, episodes, cfg, global_market_features):
+    """Evaluate with market or stock features zeroed to measure feature dependency."""
+    if len(episodes) == 0:
+        return {"no_market": 0.0, "no_stock": 0.0}
+
+    zero_market = np.zeros_like(global_market_features)
+    no_market_rewards, _, _ = evaluate_deterministic(
+        model, episodes, cfg, zero_market,
+    )
+
+    zero_episodes = [
+        {**ep, "stock_features": np.zeros_like(ep["stock_features"])}
+        for ep in episodes
+    ]
+    no_stock_rewards, _, _ = evaluate_deterministic(
+        model, zero_episodes, cfg, global_market_features,
+    )
+
+    return {
+        "no_market": float(compute_episode_sortinos(
+            no_market_rewards, cfg.sortino_clip, cfg.pytorch_eps,
+        ).mean()),
+        "no_stock": float(compute_episode_sortinos(
+            no_stock_rewards, cfg.sortino_clip, cfg.pytorch_eps,
+        ).mean()),
+    }
+
+
 # PPO update
 
 def run_ppo_update(model, optimizer, scaler, rollout, cfg, n_local_transitions,
@@ -904,6 +934,22 @@ def _allreduce_eval(result, local_count, device):
     }
 
 
+def _allreduce_ablation(result, local_count, device):
+    tensor = torch.tensor([
+        result["no_market"] * local_count,
+        result["no_stock"] * local_count,
+        float(local_count),
+    ], device=device, dtype=torch.float64)
+    dist.all_reduce(tensor)
+    total = tensor[2].item()
+    if total < 1:
+        return result
+    return {
+        "no_market": float(tensor[0].item() / total),
+        "no_stock": float(tensor[1].item() / total),
+    }
+
+
 def _allreduce_max_int(value, device):
     tensor = torch.tensor([value], device=device, dtype=torch.long)
     dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
@@ -939,47 +985,25 @@ def _gather_test_rows(local_rows, device):
     return None
 
 
-def _gather_sortinos(local_array, device):
-    """Gather 1-D numpy arrays of varying length across DDP ranks."""
-    local_n = torch.tensor([len(local_array)], dtype=torch.long, device=device)
-    all_n = [torch.zeros(1, dtype=torch.long, device=device) for _ in range(_world)]
-    dist.all_gather(all_n, local_n)
-
-    max_n = max(t.item() for t in all_n)
-    padded = torch.zeros(max_n, dtype=torch.float64, device=device)
-    padded[:len(local_array)] = torch.from_numpy(local_array.astype(np.float64)).to(device)
-    all_padded = [torch.zeros(max_n, dtype=torch.float64, device=device) for _ in range(_world)]
-    dist.all_gather(all_padded, padded)
-
-    parts = [all_padded[r][:all_n[r].item()].cpu().numpy() for r in range(_world)]
-    return np.concatenate(parts)
-
 
 # Plotting and checkpointing
 
 @timed
-def plot_training(history, path, val_sortinos=None, test_sortinos=None):
+def plot_training(history, path):
     """Plot training curves on a 2x3 grid.
 
-    Top row: policy loss, value loss, entropy (all vs epoch).
-    Bottom row: train/val sortino vs epoch, val beat rate vs epoch,
-    best val and test sortino grouped bar chart (mean +/- SD).
-
-    val_sortinos and test_sortinos are optional dicts, each with keys
-    "model" and "baseline" holding 1-D numpy arrays of per-episode
-    sortino values. The bottom right subplot shows whichever are
-    available as grouped bars.
+    Top row: policy loss, value loss, entropy.
+    Bottom row: train/val sortino, ablation sortino, val beat rate.
     """
     from matplotlib.ticker import MaxNLocator
 
     C_TRAIN = "b"
     C_VAL = "r"
-    C_TEST = "g"
+    C_NO_MARKET = "darkorange"
+    C_NO_STOCK = "purple"
 
     epochs = range(1, len(history["train_model"]) + 1)
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-
-    # Top row: losses and entropy (all training phase metrics)
 
     axes[0, 0].plot(epochs, history["policy_loss"], "b-", alpha=0.8)
     axes[0, 0].set_ylabel("Loss")
@@ -996,96 +1020,39 @@ def plot_training(history, path, val_sortinos=None, test_sortinos=None):
     axes[0, 2].set_title("Entropy")
     axes[0, 2].grid(True, alpha=0.3)
 
-    # Bottom left: train and val sortino vs baseline
-
-    axes[1, 0].plot(epochs, history["train_model"], "b-", label="Train model", alpha=0.8)
-    axes[1, 0].plot(epochs, history["val_model"], "r-", label="Val model", alpha=0.8)
-    axes[1, 0].plot(
-        epochs, history["train_baseline"], "b--", label="Train baseline", alpha=0.5,
-    )
-    axes[1, 0].plot(
-        epochs, history["val_baseline"], "r--", label="Val baseline", alpha=0.5,
-    )
+    axes[1, 0].plot(epochs, history["train_model"], color=C_TRAIN, label="Train model", alpha=0.8)
+    axes[1, 0].plot(epochs, history["val_model"], color=C_VAL, label="Val model", alpha=0.8)
+    axes[1, 0].plot(epochs, history["train_baseline"], color=C_TRAIN, linestyle="--", label="Train baseline", alpha=0.5)
+    axes[1, 0].plot(epochs, history["val_baseline"], color=C_VAL, linestyle="--", label="Val baseline", alpha=0.5)
     axes[1, 0].set_xlabel("Epoch")
     axes[1, 0].set_ylabel("Sortino")
-    axes[1, 0].set_title("Returns")
+    axes[1, 0].set_title("Train vs Val")
     axes[1, 0].legend(fontsize=8)
     axes[1, 0].grid(True, alpha=0.3)
 
-    # Bottom center: validation beat rate
-
-    axes[1, 1].plot(epochs, history["beat_rate"], "r-", alpha=0.8)
+    ablation_epochs = history.get("ablation_epochs", [])
+    axes[1, 1].plot(epochs, history["val_model"], color=C_VAL, label="Val model", alpha=0.8)
+    if ablation_epochs:
+        axes[1, 1].plot(
+            ablation_epochs, history["val_no_market"], color=C_NO_MARKET,
+            label="Val no-market", alpha=0.8,
+        )
+        axes[1, 1].plot(
+            ablation_epochs, history["val_no_stock"], color=C_NO_STOCK,
+            label="Val no-stock", alpha=0.8,
+        )
     axes[1, 1].set_xlabel("Epoch")
-    axes[1, 1].set_ylabel("Beat Rate")
-    axes[1, 1].set_title("Val Beat Rate")
-    axes[1, 1].set_ylim(0, 1)
+    axes[1, 1].set_ylabel("Sortino")
+    axes[1, 1].set_title("Feature Ablation")
+    axes[1, 1].legend(fontsize=8)
     axes[1, 1].grid(True, alpha=0.3)
 
-    # Bottom right: best val and test sortino grouped bars (mean +/- SD)
-
-    ax_bar = axes[1, 2]
-    groups = []
-    group_colors = []
-    if val_sortinos is not None:
-        groups.append(("Best Val", val_sortinos))
-        group_colors.append(C_VAL)
-    if test_sortinos is not None:
-        groups.append(("Test", test_sortinos))
-        group_colors.append(C_TEST)
-
-    if groups:
-        group_labels = [g[0] for g in groups]
-        n_groups = len(groups)
-        bar_width = 0.3
-        x_positions = np.arange(n_groups)
-
-        model_means = [float(g[1]["model"].mean()) for g in groups]
-        model_stds = [float(g[1]["model"].std()) for g in groups]
-        baseline_means = [float(g[1]["baseline"].mean()) for g in groups]
-        baseline_stds = [float(g[1]["baseline"].std()) for g in groups]
-
-        bars_model = ax_bar.bar(
-            x_positions - bar_width / 2, model_means, bar_width,
-            yerr=model_stds, label="Model", color=group_colors,
-            capsize=5, error_kw={"linewidth": 1.5},
-        )
-        baseline_light = [c if c != "r" else "lightsalmon" for c in group_colors]
-        baseline_light = [c if c != "g" else "lightgreen" for c in baseline_light]
-        baseline_light = [c if c != "b" else "lightblue" for c in baseline_light]
-        bars_baseline = ax_bar.bar(
-            x_positions + bar_width / 2, baseline_means, bar_width,
-            yerr=baseline_stds, label="Baseline", color=baseline_light,
-            capsize=5, error_kw={"linewidth": 1.5},
-        )
-        for bars, means, stds in [
-            (bars_model, model_means, model_stds),
-            (bars_baseline, baseline_means, baseline_stds),
-        ]:
-            for bar, m, s in zip(bars, means, stds):
-                ax_bar.text(
-                    bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + s + 0.02,
-                    f"{m:.3f}", ha="center", va="bottom", fontsize=8,
-                )
-
-        n_label_parts = []
-        if val_sortinos is not None:
-            n_label_parts.append(f"val n={len(val_sortinos['model'])}")
-        if test_sortinos is not None:
-            n_label_parts.append(f"test n={len(test_sortinos['model'])}")
-
-        ax_bar.set_xticks(x_positions)
-        ax_bar.set_xticklabels(group_labels)
-        ax_bar.set_ylabel("Sortino")
-        ax_bar.set_title(f"Model vs Baseline ({', '.join(n_label_parts)})")
-        ax_bar.legend(fontsize=8)
-        ax_bar.grid(True, alpha=0.3, axis="y")
-    else:
-        ax_bar.text(
-            0.5, 0.5, "Pending", transform=ax_bar.transAxes,
-            ha="center", va="center", fontsize=12, color="grey",
-        )
-        ax_bar.set_title("Model vs Baseline")
+    axes[1, 2].plot(epochs, history["beat_rate"], color=C_VAL, alpha=0.8)
+    axes[1, 2].set_xlabel("Epoch")
+    axes[1, 2].set_ylabel("Beat Rate")
+    axes[1, 2].set_title("Val Beat Rate")
+    axes[1, 2].set_ylim(0, 1)
+    axes[1, 2].grid(True, alpha=0.3)
 
     for ax in axes.flat:
         ax.xaxis.set_major_locator(MaxNLocator(integer=True))
@@ -1226,7 +1193,6 @@ def train(cfg):
 
     history = defaultdict(list)
     best_smoothed_sortino = -float("inf")
-    best_val_sortinos = None
     patience_counter = 0
     start_epoch = 1
 
@@ -1261,38 +1227,11 @@ def train(cfg):
         _log()
         _log(
             f"Resumed from epoch {ckpt['epoch']}"
-            f" (best smoothed {best_smoothed_sortino:.3f},"
+            f" (best smoothed {best_smoothed_sortino:.4f},"
             f" patience {patience_counter})"
         )
 
     rank_val_episodes = val_episodes[_rank::_world]
-
-    best_path = os.path.join(cfg.save_dir, "model_best.pt")
-    if start_epoch > 1 and os.path.exists(best_path):
-        best_ckpt = torch.load(best_path, map_location=cfg.device, weights_only=False)
-        base_model.load_state_dict(best_ckpt["model_state_dict"])
-        best_val_result = evaluate_episodes(
-            model, rank_val_episodes, cfg, global_market_features,
-        )
-        local_val_model = compute_episode_sortinos(
-            best_val_result["model_rewards"], cfg.sortino_clip, cfg.pytorch_eps,
-        )
-        local_val_baseline = compute_episode_sortinos(
-            best_val_result["baseline_rewards"], cfg.sortino_clip, cfg.pytorch_eps,
-        )
-        if distributed:
-            best_val_sortinos = {
-                "model": _gather_sortinos(local_val_model, cfg.device),
-                "baseline": _gather_sortinos(local_val_baseline, cfg.device),
-            }
-        else:
-            best_val_sortinos = {
-                "model": local_val_model,
-                "baseline": local_val_baseline,
-            }
-        base_model.load_state_dict(ckpt["model_state_dict"])
-        del best_ckpt
-        _log(f"    {'Best val restored':<20s}: {len(rank_val_episodes)} episodes evaluated")
 
     _log()
     _log(
@@ -1384,6 +1323,23 @@ def train(cfg):
         else:
             val_aggregated = val_result
 
+        run_ablation = (
+            cfg.ablation_interval > 0 and epoch % cfg.ablation_interval == 0
+        )
+        if run_ablation:
+            ablation_result = evaluate_ablated(
+                model, rank_val_episodes, cfg, global_market_features,
+            )
+            if distributed:
+                ablation_aggregated = _allreduce_ablation(
+                    ablation_result, len(rank_val_episodes), cfg.device,
+                )
+            else:
+                ablation_aggregated = ablation_result
+            history["ablation_epochs"].append(epoch)
+            history["val_no_market"].append(ablation_aggregated["no_market"])
+            history["val_no_stock"].append(ablation_aggregated["no_stock"])
+
         for key, value in [
             ("train_model", model_sortino),
             ("train_baseline", baseline_sortino),
@@ -1404,23 +1360,6 @@ def train(cfg):
         if improved:
             best_smoothed_sortino = smoothed_val_sortino
             patience_counter = 0
-
-            local_val_model_sortinos = compute_episode_sortinos(
-                val_result["model_rewards"], cfg.sortino_clip, cfg.pytorch_eps,
-            )
-            local_val_baseline_sortinos = compute_episode_sortinos(
-                val_result["baseline_rewards"], cfg.sortino_clip, cfg.pytorch_eps,
-            )
-            if distributed:
-                best_val_sortinos = {
-                    "model": _gather_sortinos(local_val_model_sortinos, cfg.device),
-                    "baseline": _gather_sortinos(local_val_baseline_sortinos, cfg.device),
-                }
-            else:
-                best_val_sortinos = {
-                    "model": local_val_model_sortinos,
-                    "baseline": local_val_baseline_sortinos,
-                }
 
             if is_main:
                 save_checkpoint(
@@ -1445,6 +1384,9 @@ def train(cfg):
         _log(f"    {'LR':<20s}: {current_lr:.2e}")
         _log(f"    {'Entropy coeff':<20s}: {current_entropy_coeff:.4f}")
         _log(f"    {'Patience':<20s}: {patience_counter}/{cfg.patience}")
+        if run_ablation:
+            _log(f"    {'Val no-market':<20s}: {ablation_aggregated['no_market']:.4f}")
+            _log(f"    {'Val no-stock':<20s}: {ablation_aggregated['no_stock']:.4f}")
         if improved:
             _log(f"    {'New best smoothed':<20s}: {best_smoothed_sortino:.4f}")
 
@@ -1456,11 +1398,10 @@ def train(cfg):
             plot_training(
                 dict(history),
                 os.path.join(cfg.save_dir, "training_curves.png"),
-                val_sortinos=best_val_sortinos,
             )
 
         if patience_counter >= cfg.patience:
-            _log(f"  Early stopping at epoch {epoch} (patience {cfg.patience})")
+            _log(f"    Early stopping at epoch {epoch} (patience {cfg.patience})")
             break
 
     _log()
@@ -1488,19 +1429,6 @@ def train(cfg):
     _log(f"    {'Baseline sortino':<20s}: {test_aggregated['baseline_sortino']:.4f}")
     _log(f"    {'Beat rate':<20s}: {test_aggregated['beat_rate']:.1%}")
 
-    local_model_sortinos = compute_episode_sortinos(
-        test_result["model_rewards"], cfg.sortino_clip, cfg.pytorch_eps,
-    )
-    local_baseline_sortinos = compute_episode_sortinos(
-        test_result["baseline_rewards"], cfg.sortino_clip, cfg.pytorch_eps,
-    )
-    if distributed:
-        all_model_sortinos = _gather_sortinos(local_model_sortinos, cfg.device)
-        all_baseline_sortinos = _gather_sortinos(local_baseline_sortinos, cfg.device)
-    else:
-        all_model_sortinos = local_model_sortinos
-        all_baseline_sortinos = local_baseline_sortinos
-
     local_rows = build_test_results(rank_test_episodes, test_result, cfg)
     if distributed:
         all_rows = _gather_test_rows(local_rows, cfg.device)
@@ -1515,11 +1443,6 @@ def train(cfg):
         plot_training(
             dict(history),
             os.path.join(cfg.save_dir, "training_curves.png"),
-            val_sortinos=best_val_sortinos,
-            test_sortinos={
-                "model": all_model_sortinos,
-                "baseline": all_baseline_sortinos,
-            },
         )
 
     if distributed:

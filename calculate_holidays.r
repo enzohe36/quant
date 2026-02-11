@@ -11,11 +11,11 @@ data_dir <- "data/"
 hist_dir <- paste0(data_dir, "hist/")
 
 resources_dir <- "resources/"
+dir.create(resources_dir)
+
 holidays_path <- paste0(resources_dir, "holidays.txt")
 
 # MAIN SCRIPT ==================================================================
-
-dir.create(resources_dir)
 
 new_holidays <- c(
   seq(mdy("January 1, 2026"), mdy("January 3, 2026"), "1 day"),

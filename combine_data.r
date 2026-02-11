@@ -1,10 +1,6 @@
 # PRESET =======================================================================
 
-library(xts)
-library(DSTrading)
 library(patchwork)
-library(sn)
-library(bestNormalize)
 library(foreach)
 library(doFuture)
 library(data.table)
@@ -23,19 +19,24 @@ val_dir <- paste0(data_dir, "val/")
 spot_combined_path <- paste0(data_dir, "spot_combined.csv")
 
 data_combined_path <- paste0(data_dir, "data_combined.rds")
-feats_normalizers_path <- paste0(data_dir, "feats_normalizers.rds")
 train_path <- paste0(data_dir, "train.csv")
 test_path <- paste0(data_dir, "test.csv")
-train_tr_path <- paste0(data_dir, "train_tr.csv")
-test_tr_path <- paste0(data_dir, "test_tr.csv")
 example_path <- paste0(data_dir, "example.csv")
 
 mkt_data_path <- paste0(data_dir, "mkt_data.rds")
-mkt_feats_normalizers_path <- paste0(data_dir, "mkt_feats_normalizers.rds")
 mkt_feats_path <- paste0(data_dir, "mkt_feats.csv")
 
+batch_dir <- paste0(data_dir, "feat_batches/")
+dir.create(batch_dir)
+
+batch_size <- 500
+
 analysis_dir <- "analysis/"
+dir.create(analysis_dir)
+
 logs_dir <- paste0(analysis_dir, "logs/")
+dir.create(logs_dir)
+
 log_path <- paste0(logs_dir, format(now(), "%Y%m%d_%H%M%S"), ".log")
 
 last_td <- as_date("2026-01-23")
@@ -45,9 +46,6 @@ test_start <- last_td %m-% years(2)
 set.seed(42)
 
 # STOCK PREPROCESSING ==========================================================
-
-dir.create(analysis_dir)
-dir.create(logs_dir)
 
 spot_combined <- read_csv(spot_combined_path, show_col_types = FALSE)
 
@@ -64,12 +62,6 @@ data_combined <- foreach(
   symbol = symbols,
   .combine = "c"
 ) %dofuture% {
-  vars <- c(
-    "adjust", "adjust_path", "data", "hist", "hist_path", "mc", "mc_path",
-    "my_list", "val", "val_path"
-  )
-  rm(list = vars)
-
   hist_path <- paste0(hist_dir, symbol, ".csv")
   adjust_path <- paste0(adjust_dir, symbol, ".csv")
   mc_path <- paste0(mc_dir, symbol, ".csv")
@@ -168,7 +160,7 @@ mkt_data <- foreach(
       close_r = close / lag(close),
       across(c(volume, amount, to), ~ replace_na(.x, 0)),
       mc_traded = volume * close,
-      mc_float = {mc_traded / to} %>%
+      mc_float = (mc_traded / to) %>%
         replace(is.na(.) | is.infinite(.), NA_real_)
     ) %>%
     fill(mc_float) %>%
@@ -193,7 +185,6 @@ mkt_data <- foreach(
     across(c(mc, np, np_deduct, equity, revenue, ocf), sum)
   ) %>%
   ungroup() %>%
-  filter(n >= 100) %>%
   arrange(date) %>%
   mutate(close = cumprod(close_r) / first(close_r))
 
@@ -218,7 +209,10 @@ feats <- ehlers_features(
   ocf       = mkt_data$ocf
 ) %>%
   rename_with(~ paste0("mkt_", .x)) %>%
-  mutate(date = mkt_data$date, .before = 1) %>%
+  mutate(
+    date = mkt_data$date, .before = 1,
+    across(matches("_dn$"), ~ NULL)
+  ) %>%
   filter(date >= train_start) %>%
   na.omit() %>%
   as_tibble()
@@ -226,13 +220,8 @@ feats <- ehlers_features(
 elapsed <- (proc.time() - t0)[3]
 cat(nrow(feats), "x", ncol(feats), "in", round(elapsed, 3), "s\n")
 
-feats_normalizers <- feats %>%
-  filter(date < test_start) %>%
-  create_normalizers(matches("\\.fund_"), method = "scale")
-saveRDS(feats_normalizers, mkt_feats_normalizers_path)
-
-feats <- predict(feats_normalizers, feats)
 validate_features(feats)
+
 write_csv(feats, mkt_feats_path)
 tsprint(str_glue("nrow(mkt_feats) = {nrow(feats)}"))
 
@@ -244,49 +233,59 @@ tsprint(str_glue("nrow(mkt_feats) = {nrow(feats)}"))
 t0 <- proc.time()
 plan(multisession, workers = availableCores() - 1)
 
-feats <- foreach(
-  data = data_combined,
-  .combine = "c"
-) %dofuture% {
-  data %>%
-    mutate(price = lead(open)) %>%
-    select(symbol, date, price) %>%
-    bind_cols(
-      ehlers_features(
-        close     = data$close,
-        open      = data$open,
-        high      = data$high,
-        low       = data$low,
-        volume    = data$volume,
-        amount    = data$amount,
-        to        = data$to,
-        mc        = data$mc,
-        mkt_mc    = left_join(data, mkt_data, by = "date")$mc.y,
-        np        = data$np,
-        np_deduct = data$np_deduct,
-        equity    = data$equity,
-        revenue   = data$revenue,
-        ocf       = data$ocf
-      )
-    ) %>%
-    filter(date >= train_start) %>%
-    na.omit() %>%
-    list()
-} %>%
-  rbindlist()
+batches <- split(seq_along(data_combined), ceiling(seq_along(data_combined) / batch_size))
+
+for (b in seq_along(batches)) {
+  batch_feats <- foreach(
+    data = data_combined[batches[[b]]],
+    .combine = "c"
+  ) %dofuture% {
+    data %>%
+      mutate(price = lead(open)) %>%
+      select(symbol, date, price) %>%
+      bind_cols(
+        ehlers_features(
+          close     = data$close,
+          open      = data$open,
+          high      = data$high,
+          low       = data$low,
+          volume    = data$volume,
+          amount    = data$amount,
+          to        = data$to,
+          mc        = data$mc,
+          mkt_mc    = left_join(data, mkt_data, by = "date")$mc.y,
+          np        = data$np,
+          np_deduct = data$np_deduct,
+          equity    = data$equity,
+          revenue   = data$revenue,
+          ocf       = data$ocf
+        )
+      ) %>%
+      filter(date >= train_start) %>%
+      na.omit() %>%
+      list()
+  } %>%
+    rbindlist()
+
+  fwrite(batch_feats, paste0(batch_dir, "batch_", b, ".csv"))
+  rm(batch_feats)
+  gc()
+  tsprint(str_glue("Batch {b}/{length(batches)} done."))
+}
 
 plan(sequential)
+
+feats <- rbindlist(lapply(list.files(batch_dir, full.names = TRUE), fread, colClasses = c(symbol = "character")))
+unlink(batch_dir, recursive = TRUE)
+
+setDT(feats)
+dn_cols <- grep("_dn$", names(feats), value = TRUE)
+feats[, (dn_cols) := lapply(.SD, cross_pctrank), by = date, .SDcols = dn_cols]
 tsprint(str_glue("Generated features for {length(unique(feats$symbol))} stocks."))
+
 elapsed <- (proc.time() - t0)[3]
 cat(nrow(feats), "x", ncol(feats), "in", round(elapsed, 3), "s\n")
 
-feats_normalizers <- feats %>%
-  filter(date < test_start) %>%
-  create_normalizers(matches("\\.fund_"), method = "orderNorm")
-saveRDS(feats_normalizers, feats_normalizers_path)
-
-feats <- predict(feats_normalizers, feats) %>%
-  mutate(across(matches("\\.fund_"), ~ clamp(.x, 3)))
 validate_features(feats)
 
 train <- filter(feats, date < test_start)
@@ -297,16 +296,6 @@ test <- filter(feats, date >= test_start)
 write_csv(test, test_path)
 tsprint(str_glue("nrow(test) = {nrow(test)}"))
 
-symbols_tr <- sample(unique(feats$symbol), 100)
-
-train_tr <- filter(train, symbol %in% symbols_tr)
-write_csv(train_tr, train_tr_path)
-tsprint(str_glue("nrow(train_tr) = {nrow(train_tr)}"))
-
-test_tr <- filter(test, symbol %in% symbols_tr)
-write_csv(test_tr, test_tr_path)
-tsprint(str_glue("nrow(test_tr) = {nrow(test_tr)}"))
-
-example <- filter(train, symbol == symbols_tr[1])
+example <- filter(train, symbol == "002384")
 write_csv(example, example_path)
 tsprint(str_glue("nrow(example) = {nrow(example)}"))

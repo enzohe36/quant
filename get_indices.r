@@ -13,12 +13,12 @@ source("scripts/data_retrievers.r")
 source("scripts/misc.r")
 
 resources_dir <- "resources/"
+dir.create(resources_dir)
+
 indices_path <- paste0(resources_dir, "indices.csv")
 index_comp_path <- paste0(resources_dir, "index_comp.csv")
 
 # MAIN SCRIPT ==================================================================
-
-dir.create(resources_dir)
 
 indices <- combine_indices()
 write_csv(indices, indices_path)

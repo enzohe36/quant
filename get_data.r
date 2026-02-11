@@ -13,24 +13,28 @@ source("scripts/data_retrievers.r")
 source("scripts/misc.r")
 
 data_dir <- "data/"
+dir.create(data_dir)
+
 spot_combined_path <- paste0(data_dir, "spot_combined.csv")
 
 hist_dir <- paste0(data_dir, "hist/")
+dir.create(hist_dir)
+
 adjust_dir <- paste0(data_dir, "adjust/")
+dir.create(adjust_dir)
+
 mc_dir <- paste0(data_dir, "mc/")
+dir.create(mc_dir)
+
 val_dir <- paste0(data_dir, "val/")
+dir.create(val_dir)
 
 logs_dir <- paste0(data_dir, "logs/")
+dir.create(logs_dir)
+
 log_path <- paste0(logs_dir, format(now(), "%Y%m%d_%H%M%S"), ".log")
 
 # SPOT DATA ====================================================================
-
-dir.create(data_dir)
-dir.create(hist_dir)
-dir.create(adjust_dir)
-dir.create(mc_dir)
-dir.create(val_dir)
-dir.create(logs_dir)
 
 if (!file.exists(spot_combined_path)) {
   spot_combined <- combine_spot()
@@ -51,13 +55,6 @@ success_count <- foreach(
   symbol = spot_combined$symbol,
   .combine = sum
 ) %do% {
-  vars <- c(
-    "adjust", "adjust_change_date", "adjust_path", "hist", "hist_path", "mc",
-    "mc_path", "shares_change_date", "spot", "try_error", "val",
-    "val_change_date", "val_path"
-  )
-  rm(list = vars)
-
   hist_path <- paste0(hist_dir, symbol, ".csv")
   adjust_path <- paste0(adjust_dir, symbol, ".csv")
   mc_path <- paste0(mc_dir, symbol, ".csv")
