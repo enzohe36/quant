@@ -79,32 +79,24 @@ class Config:
     gae_lambda: float = 0.95
     policy_clip: float = 0.2
     value_coeff: float = 0.5
-    entropy_coeff_start: float = 0.05
-    entropy_coeff_end: float = 0.005
+    entropy_coeff: float = 0.01
     grad_clip: float = 0.5
-
-    # Regularization
-    weight_decay: float = 0.02
-    xattn_weight_decay: float = 0.05
 
     # Training
     n_epochs: int = 200
     warmup_epochs: int = 5
     ppo_epochs: int = 4
     batch_size: int = 4096
-    inference_batch: int = 65536
+    inference_batch: int = 16384
     lr: float = 1e-4
     patience: int = 40
     patience_smoothing: int = 10
-    ablation_interval: int = 1
     seed: int = 42
 
     # Numerical
     reward_clip: float = 10.0
-    reward_ema_decay: float = 0.99
     sortino_clip: float = 10.0
     pytorch_eps: float = 1e-8
-    use_amp: bool = True
 
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -113,12 +105,6 @@ class Config:
 
 
 # Feature grouping
-
-def _remap_groups(groups, feature_indices):
-    """Remap group indices from global (all_feature_cols) to local (0-based within slice)."""
-    global_to_local = {g: l for l, g in enumerate(feature_indices)}
-    return {name: [global_to_local[i] for i in idxs] for name, idxs in groups.items()}
-
 
 def split_feature_groups(column_names):
     groups = defaultdict(list)
@@ -185,70 +171,94 @@ class VecEnv:
         obs = None if done else self._build_observation()
         return obs, reward, done, position_idx
 
-    def terminal_observation(self):
-        """Build observation at the truncation boundary (current_step == total_steps)."""
-        return self._build_observation()
-
 
 # Reward normalizer
 
 class RewardNormalizer:
-    """EMA reward normalizer for non-stationary reward scaling.
+    """Welford running standard deviation for reward scaling.
 
-    Tracks an exponential moving average of mean squared reward. Divides
-    rewards by the EMA standard deviation without mean-shifting, so the
-    optimal policy is unchanged. Adapts to distribution shift as the
-    policy improves, unlike a monotonically accumulating estimator.
+    Divides rewards by running std without mean-shifting, so the optimal
+    policy is unchanged. Clamps normalized rewards to [-10, 10] for stability.
     """
 
-    def __init__(self, clip, eps, decay):
+    def __init__(self, clip, eps):
         self.clip = clip
         self.eps = eps
-        self.decay = decay
-        self.mean_sq = 1.0
-        self.initialized = False
+        self.count = 0
+        self.mean = 0.0
+        self.mean_sq = 0.0
 
-    def _apply_ema(self, batch_mean_sq):
-        if not self.initialized:
-            self.mean_sq = batch_mean_sq
-            self.initialized = True
-        else:
-            self.mean_sq = (
-                self.decay * self.mean_sq
-                + (1 - self.decay) * batch_mean_sq
-            )
+    @staticmethod
+    def _batch_stats(rewards):
+        flat = rewards.ravel().astype(np.float64)
+        n = len(flat)
+        if n == 0:
+            return 0, 0.0, 0.0
+        return n, float(flat.mean()), float(flat.var() * n)
+
+    @staticmethod
+    def _merge(count_a, mean_a, mean_sq_a, count_b, mean_b, mean_sq_b):
+        """Combine two sets of Welford statistics."""
+        if count_b == 0:
+            return count_a, mean_a, mean_sq_a
+        if count_a == 0:
+            return count_b, mean_b, mean_sq_b
+        total = count_a + count_b
+        delta = mean_b - mean_a
+        new_mean = mean_a + delta * count_b / total
+        new_mean_sq = mean_sq_a + mean_sq_b + delta ** 2 * count_a * count_b / total
+        return total, new_mean, new_mean_sq
 
     def update(self, rewards):
-        flat = rewards.ravel().astype(np.float64)
-        if len(flat) > 0:
-            self._apply_ema(float((flat ** 2).mean()))
+        """Merge a batch of rewards into the running statistics."""
+        n, batch_mean, batch_mean_sq = self._batch_stats(rewards)
+        self.count, self.mean, self.mean_sq = self._merge(
+            self.count, self.mean, self.mean_sq, n, batch_mean, batch_mean_sq,
+        )
 
     def update_distributed(self, rewards, device):
-        """All-reduce local squared sums so every rank applies identical EMA."""
-        flat = rewards.ravel().astype(np.float64)
+        """Compute local batch stats, sum across DDP ranks, then merge.
+
+        Only the current batch's stats are communicated. The running
+        state is updated identically on every rank from the same global
+        totals, so historical counts are never double-counted.
+        """
+        n, batch_mean, batch_mean_sq = self._batch_stats(rewards)
         local = torch.tensor(
-            [float((flat ** 2).sum()), float(len(flat))],
+            [float(n), batch_mean, batch_mean_sq],
             device=device, dtype=torch.float64,
         )
-        dist.all_reduce(local)
-        total_sq, total_n = local[0].item(), local[1].item()
-        if total_n > 0:
-            self._apply_ema(total_sq / total_n)
+        gathered = [
+            torch.zeros(3, device=device, dtype=torch.float64)
+            for _ in range(_world)
+        ]
+        dist.all_gather(gathered, local)
+
+        epoch_count, epoch_mean, epoch_mean_sq = 0, 0.0, 0.0
+        for t in gathered:
+            c, m, s = int(t[0].item()), t[1].item(), t[2].item()
+            epoch_count, epoch_mean, epoch_mean_sq = self._merge(
+                epoch_count, epoch_mean, epoch_mean_sq, c, m, s,
+            )
+
+        self.count, self.mean, self.mean_sq = self._merge(
+            self.count, self.mean, self.mean_sq,
+            epoch_count, epoch_mean, epoch_mean_sq,
+        )
 
     def normalize(self, rewards):
-        if not self.initialized:
+        if self.count < 2:
             return rewards
-        std = np.sqrt(self.mean_sq + self.eps)
-        return np.clip(
-            rewards / std, -self.clip, self.clip,
-        ).astype(np.float32)
+        std = np.sqrt(self.mean_sq / self.count + self.eps)
+        return np.clip(rewards / std, -self.clip, self.clip).astype(np.float32)
 
     def state_dict(self):
-        return {"mean_sq": self.mean_sq, "initialized": self.initialized}
+        return {"count": self.count, "mean": self.mean, "mean_sq": self.mean_sq}
 
     def load_state_dict(self, state):
-        self.mean_sq = state.get("mean_sq", 1.0)
-        self.initialized = state.get("initialized", False)
+        self.count = state["count"]
+        self.mean = state["mean"]
+        self.mean_sq = state["mean_sq"]
 
 
 # Model
@@ -279,7 +289,7 @@ class GroupProjection(nn.Module):
 
 
 class PolicyNetwork(nn.Module):
-    def __init__(self, stock_groups, market_groups, stock_feature_indices,
+    def __init__(self, stock_groups, stock_feature_indices,
                  market_feature_indices, cfg):
         super().__init__()
         self.cfg = cfg
@@ -289,19 +299,20 @@ class PolicyNetwork(nn.Module):
         self.register_buffer(
             "market_idx", torch.tensor(market_feature_indices, dtype=torch.long),
         )
-        self.has_market = len(market_feature_indices) > 0
+        n_market_features = len(market_feature_indices)
+        self.has_market = n_market_features > 0
 
-        local_stock_groups = _remap_groups(stock_groups, stock_feature_indices)
-        self.stock_proj = GroupProjection(local_stock_groups, cfg.d_model)
+        self.stock_proj = GroupProjection(stock_groups, cfg.d_model)
         self.stock_norm = nn.LayerNorm(cfg.d_model)
         self.pos_emb = nn.Parameter(
             torch.randn(1, cfg.lookback, cfg.d_model) * 0.02,
         )
 
         if self.has_market:
-            local_market_groups = _remap_groups(market_groups, market_feature_indices)
-            self.market_proj = GroupProjection(local_market_groups, cfg.d_model)
-            self.market_norm = nn.LayerNorm(cfg.d_model)
+            self.market_proj = nn.Sequential(
+                nn.Linear(n_market_features, cfg.d_model),
+                nn.LayerNorm(cfg.d_model),
+            )
             self.xattn = nn.MultiheadAttention(
                 cfg.d_model, cfg.n_heads, dropout=cfg.dropout, batch_first=True,
             )
@@ -327,7 +338,7 @@ class PolicyNetwork(nn.Module):
     def forward(self, x, position_idx):
         hidden = self.stock_norm(self.stock_proj(x[..., self.stock_idx])) + self.pos_emb
         if self.has_market:
-            market_emb = self.market_norm(self.market_proj(x[..., self.market_idx]))
+            market_emb = self.market_proj(x[..., self.market_idx])
             if self.training and self.cfg.market_dropout > 0:
                 keep_mask = torch.bernoulli(torch.full(
                     (market_emb.shape[0], 1, 1),
@@ -383,7 +394,6 @@ class RolloutBuffer:
         self.log_probs = np.empty((n_episodes, episode_length), dtype=np.float32)
         self.values = np.empty((n_episodes, episode_length), dtype=np.float32)
         self.positions = np.empty((n_episodes, episode_length), dtype=np.int64)
-        self.final_values = np.empty(n_episodes, dtype=np.float32)
 
         self.all_stock_features = None
         self.all_market_indices = None
@@ -396,13 +406,13 @@ class RolloutBuffer:
             [ep["market_indices"] for ep in episodes],
         )
 
-    def compute_gae(self, gamma, gae_lambda, eps, distributed=False, device=None):
+    def compute_gae(self, gamma, gae_lambda, eps):
         advantages = np.zeros_like(self.rewards)
         running_gae = np.zeros(self.n_episodes, dtype=np.float32)
 
         for step in reversed(range(self.episode_length)):
             if step == self.episode_length - 1:
-                next_value = self.final_values
+                next_value = np.zeros(self.n_episodes, dtype=np.float32)
             else:
                 next_value = self.values[:, step + 1]
             td_error = (
@@ -414,23 +424,10 @@ class RolloutBuffer:
         returns = advantages + self.values
 
         flat_advantages = advantages.ravel()
-        if distributed and device is not None:
-            stats = torch.tensor(
-                [float(flat_advantages.size),
-                 float(flat_advantages.sum()),
-                 float((flat_advantages ** 2).sum())],
-                device=device, dtype=torch.float64,
-            )
-            dist.all_reduce(stats)
-            n, s, sq = stats[0].item(), stats[1].item(), stats[2].item()
-            global_mean = s / n
-            global_std = math.sqrt(sq / n - global_mean * global_mean + eps)
-            flat_advantages = (flat_advantages - global_mean) / global_std
-        else:
-            flat_advantages = (
-                (flat_advantages - flat_advantages.mean())
-                / (flat_advantages.std() + eps)
-            )
+        flat_advantages = (
+            (flat_advantages - flat_advantages.mean())
+            / (flat_advantages.std() + eps)
+        )
 
         self._flat_advantages = flat_advantages
         self._flat_returns = returns.ravel()
@@ -633,8 +630,7 @@ def collect_training_rollout(model, episodes, cfg, global_market_features,
     rollout.register_episodes(episodes)
 
     model.eval()
-    amp_enabled = cfg.use_amp and cfg.device.startswith("cuda")
-    with torch.no_grad(), torch.amp.autocast("cuda", enabled=amp_enabled):
+    with torch.no_grad():
         for batch_start in range(0, n_episodes, cfg.inference_batch):
             batch_end = min(batch_start + cfg.inference_batch, n_episodes)
             batch_episodes = episodes[batch_start:batch_end]
@@ -664,15 +660,6 @@ def collect_training_rollout(model, episodes, cfg, global_market_features,
                 )
                 rollout.rewards[batch_start:batch_end, step] = step_rewards
 
-            # Bootstrap V(s_T) at the truncation boundary
-            terminal_obs = env.terminal_observation()
-            terminal_states = torch.from_numpy(terminal_obs).to(cfg.device)
-            terminal_pos = torch.from_numpy(pos_idx).to(cfg.device)
-            _, terminal_values = select_greedy(model, terminal_states, terminal_pos)
-            rollout.final_values[batch_start:batch_end] = (
-                terminal_values.cpu().numpy()
-            )
-
     baseline_rewards = compute_baseline_rewards(episodes, cfg)
     model_sortino = float(compute_episode_sortinos(
         rollout.rewards, cfg.sortino_clip, cfg.pytorch_eps,
@@ -696,12 +683,10 @@ def evaluate_deterministic(model, episodes, cfg, global_market_features):
     n_episodes = len(episodes)
     episode_length = cfg.episode_length
     all_rewards = np.empty((n_episodes, episode_length), dtype=np.float32)
-    all_old_positions = np.empty((n_episodes, episode_length), dtype=np.int64)
-    all_new_positions = np.empty((n_episodes, episode_length), dtype=np.int64)
+    all_positions = np.empty((n_episodes, episode_length), dtype=np.int64)
 
     model.eval()
-    amp_enabled = cfg.use_amp and cfg.device.startswith("cuda")
-    with torch.no_grad(), torch.amp.autocast("cuda", enabled=amp_enabled):
+    with torch.no_grad():
         for batch_start in range(0, n_episodes, cfg.inference_batch):
             batch_end = min(batch_start + cfg.inference_batch, n_episodes)
             batch_episodes = episodes[batch_start:batch_end]
@@ -716,12 +701,11 @@ def evaluate_deterministic(model, episodes, cfg, global_market_features):
                 pos_tensor = torch.from_numpy(pos_idx).to(cfg.device)
                 actions, _ = select_greedy(model, states, pos_tensor)
                 actions_np = actions.cpu().numpy()
-                all_old_positions[batch_start:batch_end, step] = pos_idx - 1
-                all_new_positions[batch_start:batch_end, step] = actions_np - 1
                 obs, step_rewards, _, pos_idx = env.step(actions_np)
                 all_rewards[batch_start:batch_end, step] = step_rewards
+                all_positions[batch_start:batch_end, step] = actions_np - 1
 
-    return all_rewards, all_old_positions, all_new_positions
+    return all_rewards, all_positions
 
 
 @timed
@@ -731,11 +715,10 @@ def evaluate_episodes(model, episodes, cfg, global_market_features):
             "model_sortino": 0.0, "baseline_sortino": 0.0, "beat_rate": 0.0,
             "model_rewards": np.empty((0, cfg.episode_length)),
             "baseline_rewards": np.empty((0, cfg.episode_length)),
-            "old_positions": np.empty((0, cfg.episode_length), dtype=np.int64),
-            "new_positions": np.empty((0, cfg.episode_length), dtype=np.int64),
+            "model_positions": np.empty((0, cfg.episode_length), dtype=np.int64),
         }
 
-    model_rewards, old_positions, new_positions = evaluate_deterministic(
+    model_rewards, model_positions = evaluate_deterministic(
         model, episodes, cfg, global_market_features,
     )
     baseline_rewards = compute_baseline_rewards(episodes, cfg)
@@ -752,111 +735,59 @@ def evaluate_episodes(model, episodes, cfg, global_market_features):
         "beat_rate": float(np.mean(model_sortinos > baseline_sortinos)),
         "model_rewards": model_rewards,
         "baseline_rewards": baseline_rewards,
-        "old_positions": old_positions,
-        "new_positions": new_positions,
-    }
-
-
-@timed
-def evaluate_ablated(model, episodes, cfg, global_market_features):
-    """Evaluate with market or stock features zeroed to measure feature dependency."""
-    if len(episodes) == 0:
-        return {"no_market": 0.0, "no_stock": 0.0}
-
-    zero_market = np.zeros_like(global_market_features)
-    no_market_rewards, _, _ = evaluate_deterministic(
-        model, episodes, cfg, zero_market,
-    )
-
-    zero_episodes = [
-        {**ep, "stock_features": np.zeros_like(ep["stock_features"])}
-        for ep in episodes
-    ]
-    no_stock_rewards, _, _ = evaluate_deterministic(
-        model, zero_episodes, cfg, global_market_features,
-    )
-
-    return {
-        "no_market": float(compute_episode_sortinos(
-            no_market_rewards, cfg.sortino_clip, cfg.pytorch_eps,
-        ).mean()),
-        "no_stock": float(compute_episode_sortinos(
-            no_stock_rewards, cfg.sortino_clip, cfg.pytorch_eps,
-        ).mean()),
+        "model_positions": model_positions,
     }
 
 
 # PPO update
 
-def run_ppo_update(model, optimizer, scaler, rollout, cfg, n_local_transitions,
-                   n_padded_transitions, entropy_coeff):
+def run_ppo_update(model, optimizer, rollout, cfg, n_local_transitions,
+                   n_padded_transitions):
     """One PPO pass over the rollout buffer.
 
     All ranks iterate over the same number of mini-batches (determined by
     n_padded_transitions) so DDP gradient synchronisation stays aligned.
-    Ranks with fewer local transitions pad with masked transitions that
-    contribute zero loss, avoiding gradient bias from duplicated samples.
+    Ranks with fewer local transitions wrap indices via modulo.
     """
-    model.train()
+    model.eval()
     base_model = model.module if hasattr(model, "module") else model
     policy_loss_sum = value_loss_sum = entropy_sum = 0.0
     n_batches = 0
-    amp_enabled = cfg.use_amp and cfg.device.startswith("cuda")
 
     permutation = torch.randperm(n_padded_transitions, device=cfg.device)
     if n_local_transitions < n_padded_transitions:
-        valid_mask = permutation < n_local_transitions
         permutation = permutation % n_local_transitions
-    else:
-        valid_mask = None
 
     for batch_start in range(0, n_padded_transitions, cfg.batch_size):
         batch_end = min(batch_start + cfg.batch_size, n_padded_transitions)
         batch_indices = permutation[batch_start:batch_end]
         batch = rollout.get_batch(batch_indices, cfg.device)
 
-        with torch.amp.autocast("cuda", enabled=amp_enabled):
-            new_log_probs, entropy, new_values = evaluate_actions(
-                model, batch["states"], batch["actions"], batch["positions"],
-            )
-            ratio = torch.exp(new_log_probs - batch["log_probs"])
-            advantages = batch["advantages"]
+        new_log_probs, entropy, new_values = evaluate_actions(
+            model, batch["states"], batch["actions"], batch["positions"],
+        )
+        ratio = torch.exp(new_log_probs - batch["log_probs"])
+        advantages = batch["advantages"]
 
-            surrogate = torch.min(
-                ratio * advantages,
-                torch.clamp(ratio, 1 - cfg.policy_clip, 1 + cfg.policy_clip) * advantages,
-            )
-
-            if valid_mask is not None:
-                batch_weight = valid_mask[batch_start:batch_end].float()
-                n_valid = batch_weight.sum().clamp(min=1)
-                policy_loss = -(surrogate * batch_weight).sum() / n_valid
-                value_loss = (
-                    F.mse_loss(new_values, batch["returns"], reduction="none")
-                    * batch_weight
-                ).sum() / n_valid
-                entropy_term = (entropy * batch_weight).sum() / n_valid
-            else:
-                policy_loss = -surrogate.mean()
-                value_loss = F.mse_loss(new_values, batch["returns"])
-                entropy_term = entropy.mean()
-
-            total_loss = (
-                policy_loss
-                + cfg.value_coeff * value_loss
-                - entropy_coeff * entropy_term
-            )
+        policy_loss = -torch.min(
+            ratio * advantages,
+            torch.clamp(ratio, 1 - cfg.policy_clip, 1 + cfg.policy_clip) * advantages,
+        ).mean()
+        value_loss = F.mse_loss(new_values, batch["returns"])
+        total_loss = (
+            policy_loss
+            + cfg.value_coeff * value_loss
+            - cfg.entropy_coeff * entropy.mean()
+        )
 
         optimizer.zero_grad()
-        scaler.scale(total_loss).backward()
-        scaler.unscale_(optimizer)
+        total_loss.backward()
         nn.utils.clip_grad_norm_(base_model.parameters(), cfg.grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
+        optimizer.step()
 
         policy_loss_sum += policy_loss.item()
         value_loss_sum += value_loss.item()
-        entropy_sum += entropy_term.item()
+        entropy_sum += entropy.mean().item()
         n_batches += 1
 
     if _world > 1:
@@ -890,8 +821,7 @@ def build_test_results(episodes, eval_result, cfg):
                 "symbol": episode["symbol"],
                 "date": dates[step],
                 "price": prices[step],
-                "old_position": int(eval_result["old_positions"][episode_idx, step]),
-                "new_position": int(eval_result["new_positions"][episode_idx, step]),
+                "position": int(eval_result["model_positions"][episode_idx, step]),
                 "model_reward": float(
                     eval_result["model_rewards"][episode_idx, step],
                 ),
@@ -934,22 +864,6 @@ def _allreduce_eval(result, local_count, device):
     }
 
 
-def _allreduce_ablation(result, local_count, device):
-    tensor = torch.tensor([
-        result["no_market"] * local_count,
-        result["no_stock"] * local_count,
-        float(local_count),
-    ], device=device, dtype=torch.float64)
-    dist.all_reduce(tensor)
-    total = tensor[2].item()
-    if total < 1:
-        return result
-    return {
-        "no_market": float(tensor[0].item() / total),
-        "no_stock": float(tensor[1].item() / total),
-    }
-
-
 def _allreduce_max_int(value, device):
     tensor = torch.tensor([value], device=device, dtype=torch.long)
     dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
@@ -985,77 +899,45 @@ def _gather_test_rows(local_rows, device):
     return None
 
 
-
 # Plotting and checkpointing
 
 @timed
 def plot_training(history, path):
-    """Plot training curves on a 2x3 grid.
-
-    Top row: policy loss, value loss, entropy.
-    Bottom row: train/val sortino, ablation sortino, val beat rate.
-    """
-    from matplotlib.ticker import MaxNLocator
-
-    C_TRAIN = "b"
-    C_VAL = "r"
-    C_NO_MARKET = "darkorange"
-    C_NO_STOCK = "purple"
-
     epochs = range(1, len(history["train_model"]) + 1)
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
-    axes[0, 0].plot(epochs, history["policy_loss"], "b-", alpha=0.8)
-    axes[0, 0].set_ylabel("Loss")
-    axes[0, 0].set_title("Policy Loss")
+    axes[0, 0].plot(epochs, history["train_model"], "b-", label="Train model", alpha=0.8)
+    axes[0, 0].plot(epochs, history["val_model"], "r-", label="Val model", alpha=0.8)
+    axes[0, 0].plot(
+        epochs, history["train_baseline"], "b--", label="Train baseline", alpha=0.5,
+    )
+    axes[0, 0].plot(
+        epochs, history["val_baseline"], "r--", label="Val baseline", alpha=0.5,
+    )
+    axes[0, 0].set_ylabel("Sortino")
+    axes[0, 0].set_title("Returns")
+    axes[0, 0].legend(fontsize=8)
     axes[0, 0].grid(True, alpha=0.3)
 
-    axes[0, 1].plot(epochs, history["value_loss"], "b-", alpha=0.8)
-    axes[0, 1].set_ylabel("Loss")
-    axes[0, 1].set_title("Value Loss")
+    axes[0, 1].plot(epochs, history["beat_rate"], "g-", alpha=0.8)
+    axes[0, 1].set_ylabel("Beat Rate")
+    axes[0, 1].set_title("Beat Rate")
+    axes[0, 1].set_ylim(0, 1)
     axes[0, 1].grid(True, alpha=0.3)
 
-    axes[0, 2].plot(epochs, history["entropy"], "b-", alpha=0.8)
-    axes[0, 2].set_ylabel("Entropy")
-    axes[0, 2].set_title("Entropy")
-    axes[0, 2].grid(True, alpha=0.3)
-
-    axes[1, 0].plot(epochs, history["train_model"], color=C_TRAIN, label="Train model", alpha=0.8)
-    axes[1, 0].plot(epochs, history["val_model"], color=C_VAL, label="Val model", alpha=0.8)
-    axes[1, 0].plot(epochs, history["train_baseline"], color=C_TRAIN, linestyle="--", label="Train baseline", alpha=0.5)
-    axes[1, 0].plot(epochs, history["val_baseline"], color=C_VAL, linestyle="--", label="Val baseline", alpha=0.5)
+    axes[1, 0].plot(epochs, history["policy_loss"], "b-", label="Policy", alpha=0.8)
+    axes[1, 0].plot(epochs, history["value_loss"], "r-", label="Value", alpha=0.8)
     axes[1, 0].set_xlabel("Epoch")
-    axes[1, 0].set_ylabel("Sortino")
-    axes[1, 0].set_title("Train vs Val")
+    axes[1, 0].set_ylabel("Loss")
+    axes[1, 0].set_title("Losses")
     axes[1, 0].legend(fontsize=8)
     axes[1, 0].grid(True, alpha=0.3)
 
-    ablation_epochs = history.get("ablation_epochs", [])
-    axes[1, 1].plot(epochs, history["val_model"], color=C_VAL, label="Val model", alpha=0.8)
-    if ablation_epochs:
-        axes[1, 1].plot(
-            ablation_epochs, history["val_no_market"], color=C_NO_MARKET,
-            label="Val no-market", alpha=0.8,
-        )
-        axes[1, 1].plot(
-            ablation_epochs, history["val_no_stock"], color=C_NO_STOCK,
-            label="Val no-stock", alpha=0.8,
-        )
+    axes[1, 1].plot(epochs, history["entropy"], "g-", alpha=0.8)
     axes[1, 1].set_xlabel("Epoch")
-    axes[1, 1].set_ylabel("Sortino")
-    axes[1, 1].set_title("Feature Ablation")
-    axes[1, 1].legend(fontsize=8)
+    axes[1, 1].set_ylabel("Entropy")
+    axes[1, 1].set_title("Entropy")
     axes[1, 1].grid(True, alpha=0.3)
-
-    axes[1, 2].plot(epochs, history["beat_rate"], color=C_VAL, alpha=0.8)
-    axes[1, 2].set_xlabel("Epoch")
-    axes[1, 2].set_ylabel("Beat Rate")
-    axes[1, 2].set_title("Val Beat Rate")
-    axes[1, 2].set_ylim(0, 1)
-    axes[1, 2].grid(True, alpha=0.3)
-
-    for ax in axes.flat:
-        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
 
     plt.tight_layout()
     plt.savefig(path, dpi=150, bbox_inches="tight")
@@ -1072,11 +954,6 @@ def warmup_cosine_lr(base_lr, epoch, n_epochs, warmup_epochs):
         return base_lr * epoch / warmup_epochs
     progress = (epoch - warmup_epochs) / (n_epochs - warmup_epochs)
     return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
-
-
-def cosine_entropy_coeff(start, end, epoch, n_epochs):
-    progress = min(epoch / n_epochs, 1.0)
-    return end + 0.5 * (start - end) * (1.0 + math.cos(math.pi * progress))
 
 
 # Training loop
@@ -1143,7 +1020,7 @@ def train(cfg):
     _log()
     _log("[Model]")
     base_model = PolicyNetwork(
-        stock_groups, market_groups,
+        stock_groups,
         stock_feature_indices, market_feature_indices, cfg,
     ).to(cfg.device)
     model = base_model
@@ -1157,39 +1034,16 @@ def train(cfg):
     device_label = f"{_world} GPUs (DDP)" if distributed else cfg.device
     _log(f"    {'Device':<20s}: {device_label}")
 
-    effective_lr = cfg.lr * math.sqrt(_world)
-
-    decay_params, xattn_decay_params, no_decay_params = [], [], []
-    for name, param in base_model.named_parameters():
-        if not param.requires_grad:
-            continue
-        is_norm_or_bias = param.dim() < 2 or "norm" in name
-        if is_norm_or_bias:
-            no_decay_params.append(param)
-        elif "xattn." in name:
-            xattn_decay_params.append(param)
-        else:
-            decay_params.append(param)
-
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": decay_params, "weight_decay": cfg.weight_decay},
-            {"params": xattn_decay_params, "weight_decay": cfg.xattn_weight_decay},
-            {"params": no_decay_params, "weight_decay": 0.0},
-        ],
+    effective_lr = cfg.lr * _world
+    optimizer = torch.optim.Adam(
+        base_model.parameters(),
         lr=effective_lr, eps=1e-5
     )
     reward_normalizer = RewardNormalizer(
-        cfg.reward_clip, cfg.pytorch_eps, cfg.reward_ema_decay,
+        cfg.reward_clip, cfg.pytorch_eps
     )
-    amp_enabled = cfg.use_amp and cfg.device.startswith("cuda")
-    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
-    _log(f"    {'Decay params':<20s}: {sum(p.numel() for p in decay_params):,} (wd={cfg.weight_decay})")
-    _log(f"    {'Xattn params':<20s}: {sum(p.numel() for p in xattn_decay_params):,} (wd={cfg.xattn_weight_decay})")
-    _log(f"    {'No decay params':<20s}: {sum(p.numel() for p in no_decay_params):,} (wd=0)")
-    _log(f"    {'Mixed precision':<20s}: {'float16' if amp_enabled else 'disabled'}")
     if _world > 1:
-        _log(f"    {'LR (sqrt scaled)':<20s}: {cfg.lr} x sqrt({_world}) = {effective_lr:.6f}")
+        _log(f"    {'LR (linear scaled)':<20s}: {cfg.lr} x {_world} = {effective_lr:.6f}")
 
     history = defaultdict(list)
     best_smoothed_sortino = -float("inf")
@@ -1200,29 +1054,26 @@ def train(cfg):
     if os.path.exists(latest_path):
         ckpt = torch.load(latest_path, map_location=cfg.device, weights_only=False)
         base_model.load_state_dict(ckpt["model_state_dict"])
-        saved_groups = ckpt["optimizer_state_dict"].get("param_groups", [])
-        if len(saved_groups) == len(optimizer.param_groups):
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        else:
-            _log("    Optimizer param groups changed, resetting optimizer state")
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         start_epoch = ckpt["epoch"] + 1
         patience_counter = ckpt.get("patience_counter", 0)
         if "reward_normalizer" in ckpt:
             reward_normalizer.load_state_dict(ckpt["reward_normalizer"])
-        if "scaler" in ckpt:
-            scaler.load_state_dict(ckpt["scaler"])
-        for key, vals in ckpt.get("history", {}).items():
-            history[key] = list(vals)
+        if "history" in ckpt:
+            for key, vals in ckpt["history"].items():
+                history[key] = list(vals)
 
-        val_series = history.get("val_model", [])
-        if val_series:
+        if "val_model" in history and len(history["val_model"]) > 0:
+            val_series = history["val_model"]
             window = cfg.patience_smoothing
             best_smoothed_sortino = max(
                 float(np.mean(val_series[max(0, i + 1 - window) : i + 1]))
                 for i in range(len(val_series))
             )
         else:
-            best_smoothed_sortino = ckpt.get("best_smoothed_sortino", -float("inf"))
+            best_smoothed_sortino = ckpt.get(
+                "best_smoothed_sortino", -float("inf"),
+            )
 
         _log()
         _log(
@@ -1253,7 +1104,6 @@ def train(cfg):
             "best_smoothed_sortino": best_smoothed_sortino,
             "patience_counter": patience_counter,
             "reward_normalizer": reward_normalizer.state_dict(),
-            "scaler": scaler.state_dict(),
             "history": dict(history),
         }
 
@@ -1263,9 +1113,6 @@ def train(cfg):
         )
         for param_group in optimizer.param_groups:
             param_group["lr"] = current_lr
-        current_entropy_coeff = cosine_entropy_coeff(
-            cfg.entropy_coeff_start, cfg.entropy_coeff_end, epoch, cfg.n_epochs,
-        )
 
         epoch_rng = np.random.default_rng(cfg.seed + epoch * 7919)
         train_episodes = generate_episodes(train_data, cfg, epoch_rng)
@@ -1287,7 +1134,6 @@ def train(cfg):
 
         n_local_transitions = rollout.compute_gae(
             cfg.gamma, cfg.gae_lambda, cfg.pytorch_eps,
-            distributed, cfg.device,
         )
         if _world > 1:
             n_padded_transitions = _allreduce_max_int(
@@ -1298,11 +1144,10 @@ def train(cfg):
 
         epoch_losses = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
         epoch_start = time.perf_counter()
-        for _ in range(cfg.ppo_epochs):
+        for ppo_pass in range(cfg.ppo_epochs):
             losses = run_ppo_update(
-                model, optimizer, scaler, rollout, cfg,
+                model, optimizer, rollout, cfg,
                 n_local_transitions, n_padded_transitions,
-                current_entropy_coeff,
             )
             for k in epoch_losses:
                 epoch_losses[k] += losses[k]
@@ -1322,23 +1167,6 @@ def train(cfg):
             )
         else:
             val_aggregated = val_result
-
-        run_ablation = (
-            cfg.ablation_interval > 0 and epoch % cfg.ablation_interval == 0
-        )
-        if run_ablation:
-            ablation_result = evaluate_ablated(
-                model, rank_val_episodes, cfg, global_market_features,
-            )
-            if distributed:
-                ablation_aggregated = _allreduce_ablation(
-                    ablation_result, len(rank_val_episodes), cfg.device,
-                )
-            else:
-                ablation_aggregated = ablation_result
-            history["ablation_epochs"].append(epoch)
-            history["val_no_market"].append(ablation_aggregated["no_market"])
-            history["val_no_stock"].append(ablation_aggregated["no_stock"])
 
         for key, value in [
             ("train_model", model_sortino),
@@ -1360,7 +1188,6 @@ def train(cfg):
         if improved:
             best_smoothed_sortino = smoothed_val_sortino
             patience_counter = 0
-
             if is_main:
                 save_checkpoint(
                     _build_checkpoint(),
@@ -1382,11 +1209,7 @@ def train(cfg):
         _log(f"    {'Value loss':<20s}: {epoch_losses['value_loss']:.4f}")
         _log(f"    {'Entropy':<20s}: {epoch_losses['entropy']:.4f}")
         _log(f"    {'LR':<20s}: {current_lr:.2e}")
-        _log(f"    {'Entropy coeff':<20s}: {current_entropy_coeff:.4f}")
         _log(f"    {'Patience':<20s}: {patience_counter}/{cfg.patience}")
-        if run_ablation:
-            _log(f"    {'Val no-market':<20s}: {ablation_aggregated['no_market']:.4f}")
-            _log(f"    {'Val no-stock':<20s}: {ablation_aggregated['no_stock']:.4f}")
         if improved:
             _log(f"    {'New best smoothed':<20s}: {best_smoothed_sortino:.4f}")
 
@@ -1429,21 +1252,18 @@ def train(cfg):
     _log(f"    {'Baseline sortino':<20s}: {test_aggregated['baseline_sortino']:.4f}")
     _log(f"    {'Beat rate':<20s}: {test_aggregated['beat_rate']:.1%}")
 
-    local_rows = build_test_results(rank_test_episodes, test_result, cfg)
     if distributed:
+        local_rows = build_test_results(rank_test_episodes, test_result, cfg)
         all_rows = _gather_test_rows(local_rows, cfg.device)
-    else:
-        all_rows = local_rows
-    if is_main and all_rows:
+        if is_main and all_rows is not None:
+            results_path = os.path.join(cfg.save_dir, "test_results.csv")
+            pd.DataFrame(all_rows).to_csv(results_path, index=False)
+            _log(f"    {'Saved':<20s}: {results_path}")
+    elif is_main:
+        rows = build_test_results(rank_test_episodes, test_result, cfg)
         results_path = os.path.join(cfg.save_dir, "test_results.csv")
-        pd.DataFrame(all_rows).to_csv(results_path, index=False)
+        pd.DataFrame(rows).to_csv(results_path, index=False)
         _log(f"    {'Saved':<20s}: {results_path}")
-
-    if is_main:
-        plot_training(
-            dict(history),
-            os.path.join(cfg.save_dir, "training_curves.png"),
-        )
 
     if distributed:
         dist.destroy_process_group()
