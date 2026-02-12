@@ -14,6 +14,7 @@ Launch:
   Configure all parameters in the Config class.
 """
 
+import argparse
 import os
 import math
 import time
@@ -328,16 +329,16 @@ class PolicyNetwork(nn.Module):
         hidden = self.stock_norm(self.stock_proj(x[..., self.stock_idx])) + self.pos_emb
         if self.has_market:
             market_emb = self.market_norm(self.market_proj(x[..., self.market_idx]))
-            if self.training and self.cfg.market_dropout > 0:
-                keep_mask = torch.bernoulli(torch.full(
-                    (market_emb.shape[0], 1, 1),
-                    1 - self.cfg.market_dropout,
-                    device=market_emb.device, dtype=market_emb.dtype,
-                ))
-                market_emb = market_emb * keep_mask / (1 - self.cfg.market_dropout)
             xattn_out, _ = self.xattn(
                 query=hidden, key=market_emb, value=market_emb,
             )
+            if self.training and self.cfg.market_dropout > 0:
+                keep_mask = torch.bernoulli(torch.full(
+                    (xattn_out.shape[0], 1, 1),
+                    1 - self.cfg.market_dropout,
+                    device=xattn_out.device, dtype=xattn_out.dtype,
+                ))
+                xattn_out = xattn_out * keep_mask / (1 - self.cfg.market_dropout)
             hidden = self.xattn_norm(hidden + xattn_out)
         pooled = self.transformer(hidden).mean(dim=1)
         pos_emb = self.position_emb(position_idx)
@@ -632,7 +633,7 @@ def collect_training_rollout(model, episodes, cfg, global_market_features,
     )
     rollout.register_episodes(episodes)
 
-    model.eval()
+    model.train()
     amp_enabled = cfg.use_amp and cfg.device.startswith("cuda")
     with torch.no_grad(), torch.amp.autocast("cuda", enabled=amp_enabled):
         for batch_start in range(0, n_episodes, cfg.inference_batch):
@@ -1470,7 +1471,19 @@ def _find_free_port():
 
 
 def main():
+    parser = argparse.ArgumentParser(description="PPO + Transformer RL for stock trading")
+    parser.add_argument("--dropout", type=float, default=None,
+                        help="Transformer dropout rate (overrides Config.dropout)")
+    parser.add_argument("--market_dropout", type=float, default=None,
+                        help="Market cross-attention dropout rate (overrides Config.market_dropout)")
+    args = parser.parse_args()
+
     cfg = Config()
+    if args.dropout is not None:
+        cfg.dropout = args.dropout
+    if args.market_dropout is not None:
+        cfg.market_dropout = args.market_dropout
+
     n_gpus = torch.cuda.device_count()
     if n_gpus > 1 and "RANK" not in os.environ:
         port = _find_free_port()

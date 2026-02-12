@@ -1,13 +1,11 @@
 # PRESET =======================================================================
 
-library(patchwork)
 library(foreach)
 library(doFuture)
 library(data.table)
 library(tidyverse)
 
-source("scripts/ehlers.r")
-source("scripts/features.r")
+source("scripts/ehlers_ensemble.r")
 source("scripts/misc.r")
 
 data_dir <- "data/"
@@ -101,7 +99,13 @@ data_combined <- foreach(
       revenue = run_sum(revenue, 4),
       np = run_sum(np, 4),
       np_deduct = run_sum(np_deduct, 4),
-      ocfps = run_sum(ocfps, 4)
+      ocfps = run_sum(ocfps, 4),
+      date = case_when(
+        month(date) == 3  ~ make_date(year(date), 5, 1),
+        month(date) == 6  ~ make_date(year(date), 9, 1),
+        month(date) == 9  ~ make_date(year(date), 11, 1),
+        month(date) == 12 ~ make_date(year(date) + 1L, 5, 1)
+      )
     )
 
   data <- hist %>%
@@ -198,9 +202,10 @@ tsprint(str_glue("Generated market data from {min(mkt_data$date)} to {max(mkt_da
 
 t0 <- proc.time()
 
-feats <- ehlers_features(
+mkt_feats <- ehlers_features(
   close     = mkt_data$close,
   volume    = mkt_data$to,
+  to        = mkt_data$to,
   mc        = mkt_data$mc,
   np        = mkt_data$np,
   np_deduct = mkt_data$np_deduct,
@@ -218,12 +223,12 @@ feats <- ehlers_features(
   as_tibble()
 
 elapsed <- (proc.time() - t0)[3]
-cat(nrow(feats), "x", ncol(feats), "in", round(elapsed, 3), "s\n")
+cat(nrow(mkt_feats), "x", ncol(mkt_feats), "in", round(elapsed, 3), "s\n")
 
-validate_features(feats)
+validate_features(mkt_feats)
 
-write_csv(feats, mkt_feats_path)
-tsprint(str_glue("nrow(mkt_feats) = {nrow(feats)}"))
+write_csv(mkt_feats, mkt_feats_path)
+tsprint(str_glue("nrow(mkt_feats) = {nrow(mkt_feats)}"))
 
 # STOCK FEATURES ===============================================================
 
@@ -286,7 +291,7 @@ tsprint(str_glue("Generated features for {length(unique(feats$symbol))} stocks."
 elapsed <- (proc.time() - t0)[3]
 cat(nrow(feats), "x", ncol(feats), "in", round(elapsed, 3), "s\n")
 
-validate_features(feats)
+validate_features(feats, plot = TRUE)
 
 train <- filter(feats, date < test_start)
 write_csv(train, train_path)

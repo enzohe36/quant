@@ -14,6 +14,7 @@ Launch:
   Configure all parameters in the Config class.
 """
 
+import argparse
 import os
 import math
 import time
@@ -91,6 +92,7 @@ class Config:
     lr: float = 1e-4
     patience: int = 40
     patience_smoothing: int = 10
+    ablation_interval: int = 1
     seed: int = 42
 
     # Numerical
@@ -171,6 +173,10 @@ class VecEnv:
         obs = None if done else self._build_observation()
         return obs, reward, done, position_idx
 
+    def terminal_observation(self):
+        """Build observation at the truncation boundary (current_step == total_steps)."""
+        return self._build_observation()
+
 
 # Reward normalizer
 
@@ -186,7 +192,7 @@ class RewardNormalizer:
         self.eps = eps
         self.count = 0
         self.mean = 0.0
-        self.mean_sq = 0.0
+        self.m2 = 0.0
 
     @staticmethod
     def _batch_stats(rewards):
@@ -197,23 +203,23 @@ class RewardNormalizer:
         return n, float(flat.mean()), float(flat.var() * n)
 
     @staticmethod
-    def _merge(count_a, mean_a, mean_sq_a, count_b, mean_b, mean_sq_b):
+    def _merge(count_a, mean_a, m2_a, count_b, mean_b, m2_b):
         """Combine two sets of Welford statistics."""
         if count_b == 0:
-            return count_a, mean_a, mean_sq_a
+            return count_a, mean_a, m2_a
         if count_a == 0:
-            return count_b, mean_b, mean_sq_b
+            return count_b, mean_b, m2_b
         total = count_a + count_b
         delta = mean_b - mean_a
         new_mean = mean_a + delta * count_b / total
-        new_mean_sq = mean_sq_a + mean_sq_b + delta ** 2 * count_a * count_b / total
-        return total, new_mean, new_mean_sq
+        new_m2 = m2_a + m2_b + delta ** 2 * count_a * count_b / total
+        return total, new_mean, new_m2
 
     def update(self, rewards):
         """Merge a batch of rewards into the running statistics."""
-        n, batch_mean, batch_mean_sq = self._batch_stats(rewards)
-        self.count, self.mean, self.mean_sq = self._merge(
-            self.count, self.mean, self.mean_sq, n, batch_mean, batch_mean_sq,
+        n, batch_mean, batch_m2 = self._batch_stats(rewards)
+        self.count, self.mean, self.m2 = self._merge(
+            self.count, self.mean, self.m2, n, batch_mean, batch_m2,
         )
 
     def update_distributed(self, rewards, device):
@@ -223,9 +229,9 @@ class RewardNormalizer:
         state is updated identically on every rank from the same global
         totals, so historical counts are never double-counted.
         """
-        n, batch_mean, batch_mean_sq = self._batch_stats(rewards)
+        n, batch_mean, batch_m2 = self._batch_stats(rewards)
         local = torch.tensor(
-            [float(n), batch_mean, batch_mean_sq],
+            [float(n), batch_mean, batch_m2],
             device=device, dtype=torch.float64,
         )
         gathered = [
@@ -234,31 +240,31 @@ class RewardNormalizer:
         ]
         dist.all_gather(gathered, local)
 
-        epoch_count, epoch_mean, epoch_mean_sq = 0, 0.0, 0.0
+        epoch_count, epoch_mean, epoch_m2 = 0, 0.0, 0.0
         for t in gathered:
             c, m, s = int(t[0].item()), t[1].item(), t[2].item()
-            epoch_count, epoch_mean, epoch_mean_sq = self._merge(
-                epoch_count, epoch_mean, epoch_mean_sq, c, m, s,
+            epoch_count, epoch_mean, epoch_m2 = self._merge(
+                epoch_count, epoch_mean, epoch_m2, c, m, s,
             )
 
-        self.count, self.mean, self.mean_sq = self._merge(
-            self.count, self.mean, self.mean_sq,
-            epoch_count, epoch_mean, epoch_mean_sq,
+        self.count, self.mean, self.m2 = self._merge(
+            self.count, self.mean, self.m2,
+            epoch_count, epoch_mean, epoch_m2,
         )
 
     def normalize(self, rewards):
         if self.count < 2:
             return rewards
-        std = np.sqrt(self.mean_sq / self.count + self.eps)
+        std = np.sqrt(self.m2 / self.count + self.eps)
         return np.clip(rewards / std, -self.clip, self.clip).astype(np.float32)
 
     def state_dict(self):
-        return {"count": self.count, "mean": self.mean, "mean_sq": self.mean_sq}
+        return {"count": self.count, "mean": self.mean, "m2": self.m2}
 
     def load_state_dict(self, state):
         self.count = state["count"]
         self.mean = state["mean"]
-        self.mean_sq = state["mean_sq"]
+        self.m2 = state["m2"]
 
 
 # Model
@@ -339,16 +345,16 @@ class PolicyNetwork(nn.Module):
         hidden = self.stock_norm(self.stock_proj(x[..., self.stock_idx])) + self.pos_emb
         if self.has_market:
             market_emb = self.market_proj(x[..., self.market_idx])
-            if self.training and self.cfg.market_dropout > 0:
-                keep_mask = torch.bernoulli(torch.full(
-                    (market_emb.shape[0], 1, 1),
-                    1 - self.cfg.market_dropout,
-                    device=market_emb.device, dtype=market_emb.dtype,
-                ))
-                market_emb = market_emb * keep_mask / (1 - self.cfg.market_dropout)
             xattn_out, _ = self.xattn(
                 query=hidden, key=market_emb, value=market_emb,
             )
+            if self.training and self.cfg.market_dropout > 0:
+                keep_mask = torch.bernoulli(torch.full(
+                    (xattn_out.shape[0], 1, 1),
+                    1 - self.cfg.market_dropout,
+                    device=xattn_out.device, dtype=xattn_out.dtype,
+                ))
+                xattn_out = xattn_out * keep_mask / (1 - self.cfg.market_dropout)
             hidden = self.xattn_norm(hidden + xattn_out)
         pooled = self.transformer(hidden).mean(dim=1)
         pos_emb = self.position_emb(position_idx)
@@ -394,6 +400,7 @@ class RolloutBuffer:
         self.log_probs = np.empty((n_episodes, episode_length), dtype=np.float32)
         self.values = np.empty((n_episodes, episode_length), dtype=np.float32)
         self.positions = np.empty((n_episodes, episode_length), dtype=np.int64)
+        self.final_values = np.empty(n_episodes, dtype=np.float32)
 
         self.all_stock_features = None
         self.all_market_indices = None
@@ -412,7 +419,7 @@ class RolloutBuffer:
 
         for step in reversed(range(self.episode_length)):
             if step == self.episode_length - 1:
-                next_value = np.zeros(self.n_episodes, dtype=np.float32)
+                next_value = self.final_values
             else:
                 next_value = self.values[:, step + 1]
             td_error = (
@@ -629,7 +636,7 @@ def collect_training_rollout(model, episodes, cfg, global_market_features,
     )
     rollout.register_episodes(episodes)
 
-    model.eval()
+    model.train()
     with torch.no_grad():
         for batch_start in range(0, n_episodes, cfg.inference_batch):
             batch_end = min(batch_start + cfg.inference_batch, n_episodes)
@@ -659,6 +666,15 @@ def collect_training_rollout(model, episodes, cfg, global_market_features,
                     values.cpu().numpy()
                 )
                 rollout.rewards[batch_start:batch_end, step] = step_rewards
+
+            # Bootstrap V(s_T) at the truncation boundary
+            terminal_obs = env.terminal_observation()
+            terminal_states = torch.from_numpy(terminal_obs).to(cfg.device)
+            terminal_pos = torch.from_numpy(pos_idx).to(cfg.device)
+            _, terminal_values = select_greedy(model, terminal_states, terminal_pos)
+            rollout.final_values[batch_start:batch_end] = (
+                terminal_values.cpu().numpy()
+            )
 
     baseline_rewards = compute_baseline_rewards(episodes, cfg)
     model_sortino = float(compute_episode_sortinos(
@@ -739,6 +755,35 @@ def evaluate_episodes(model, episodes, cfg, global_market_features):
     }
 
 
+@timed
+def evaluate_ablated(model, episodes, cfg, global_market_features):
+    """Evaluate with market or stock features zeroed to measure feature dependency."""
+    if len(episodes) == 0:
+        return {"no_market": 0.0, "no_stock": 0.0}
+
+    zero_market = np.zeros_like(global_market_features)
+    no_market_rewards, _ = evaluate_deterministic(
+        model, episodes, cfg, zero_market,
+    )
+
+    zero_episodes = [
+        {**ep, "stock_features": np.zeros_like(ep["stock_features"])}
+        for ep in episodes
+    ]
+    no_stock_rewards, _ = evaluate_deterministic(
+        model, zero_episodes, cfg, global_market_features,
+    )
+
+    return {
+        "no_market": float(compute_episode_sortinos(
+            no_market_rewards, cfg.sortino_clip, cfg.pytorch_eps,
+        ).mean()),
+        "no_stock": float(compute_episode_sortinos(
+            no_stock_rewards, cfg.sortino_clip, cfg.pytorch_eps,
+        ).mean()),
+    }
+
+
 # PPO update
 
 def run_ppo_update(model, optimizer, rollout, cfg, n_local_transitions,
@@ -749,7 +794,7 @@ def run_ppo_update(model, optimizer, rollout, cfg, n_local_transitions,
     n_padded_transitions) so DDP gradient synchronisation stays aligned.
     Ranks with fewer local transitions wrap indices via modulo.
     """
-    model.eval()
+    model.train()
     base_model = model.module if hasattr(model, "module") else model
     policy_loss_sum = value_loss_sum = entropy_sum = 0.0
     n_batches = 0
@@ -864,6 +909,22 @@ def _allreduce_eval(result, local_count, device):
     }
 
 
+def _allreduce_ablation(result, local_count, device):
+    tensor = torch.tensor([
+        result["no_market"] * local_count,
+        result["no_stock"] * local_count,
+        float(local_count),
+    ], device=device, dtype=torch.float64)
+    dist.all_reduce(tensor)
+    total = tensor[2].item()
+    if total < 1:
+        return result
+    return {
+        "no_market": float(tensor[0].item() / total),
+        "no_stock": float(tensor[1].item() / total),
+    }
+
+
 def _allreduce_max_int(value, device):
     tensor = torch.tensor([value], device=device, dtype=torch.long)
     dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
@@ -903,41 +964,72 @@ def _gather_test_rows(local_rows, device):
 
 @timed
 def plot_training(history, path):
-    epochs = range(1, len(history["train_model"]) + 1)
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    """Plot training curves on a 2x3 grid.
 
-    axes[0, 0].plot(epochs, history["train_model"], "b-", label="Train model", alpha=0.8)
-    axes[0, 0].plot(epochs, history["val_model"], "r-", label="Val model", alpha=0.8)
-    axes[0, 0].plot(
-        epochs, history["train_baseline"], "b--", label="Train baseline", alpha=0.5,
-    )
-    axes[0, 0].plot(
-        epochs, history["val_baseline"], "r--", label="Val baseline", alpha=0.5,
-    )
-    axes[0, 0].set_ylabel("Sortino")
-    axes[0, 0].set_title("Returns")
-    axes[0, 0].legend(fontsize=8)
+    Top row: policy loss, value loss, entropy.
+    Bottom row: train/val sortino, ablation sortino, val beat rate.
+    """
+    from matplotlib.ticker import MaxNLocator
+
+    C_TRAIN = "b"
+    C_VAL = "r"
+    C_NO_MARKET = "darkorange"
+    C_NO_STOCK = "purple"
+
+    epochs = range(1, len(history["train_model"]) + 1)
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+
+    axes[0, 0].plot(epochs, history["policy_loss"], "b-", alpha=0.8)
+    axes[0, 0].set_ylabel("Loss")
+    axes[0, 0].set_title("Policy Loss")
     axes[0, 0].grid(True, alpha=0.3)
 
-    axes[0, 1].plot(epochs, history["beat_rate"], "g-", alpha=0.8)
-    axes[0, 1].set_ylabel("Beat Rate")
-    axes[0, 1].set_title("Beat Rate")
-    axes[0, 1].set_ylim(0, 1)
+    axes[0, 1].plot(epochs, history["value_loss"], "b-", alpha=0.8)
+    axes[0, 1].set_ylabel("Loss")
+    axes[0, 1].set_title("Value Loss")
     axes[0, 1].grid(True, alpha=0.3)
 
-    axes[1, 0].plot(epochs, history["policy_loss"], "b-", label="Policy", alpha=0.8)
-    axes[1, 0].plot(epochs, history["value_loss"], "r-", label="Value", alpha=0.8)
+    axes[0, 2].plot(epochs, history["entropy"], "b-", alpha=0.8)
+    axes[0, 2].set_ylabel("Entropy")
+    axes[0, 2].set_title("Entropy")
+    axes[0, 2].grid(True, alpha=0.3)
+
+    axes[1, 0].plot(epochs, history["train_model"], color=C_TRAIN, label="Train model", alpha=0.8)
+    axes[1, 0].plot(epochs, history["val_model"], color=C_VAL, label="Val model", alpha=0.8)
+    axes[1, 0].plot(epochs, history["train_baseline"], color=C_TRAIN, linestyle="--", label="Train baseline", alpha=0.5)
+    axes[1, 0].plot(epochs, history["val_baseline"], color=C_VAL, linestyle="--", label="Val baseline", alpha=0.5)
     axes[1, 0].set_xlabel("Epoch")
-    axes[1, 0].set_ylabel("Loss")
-    axes[1, 0].set_title("Losses")
+    axes[1, 0].set_ylabel("Sortino")
+    axes[1, 0].set_title("Train vs Val")
     axes[1, 0].legend(fontsize=8)
     axes[1, 0].grid(True, alpha=0.3)
 
-    axes[1, 1].plot(epochs, history["entropy"], "g-", alpha=0.8)
+    ablation_epochs = history.get("ablation_epochs", [])
+    axes[1, 1].plot(epochs, history["val_model"], color=C_VAL, label="Val model", alpha=0.8)
+    if ablation_epochs:
+        axes[1, 1].plot(
+            ablation_epochs, history["val_no_market"], color=C_NO_MARKET,
+            label="Val no-market", alpha=0.8,
+        )
+        axes[1, 1].plot(
+            ablation_epochs, history["val_no_stock"], color=C_NO_STOCK,
+            label="Val no-stock", alpha=0.8,
+        )
     axes[1, 1].set_xlabel("Epoch")
-    axes[1, 1].set_ylabel("Entropy")
-    axes[1, 1].set_title("Entropy")
+    axes[1, 1].set_ylabel("Sortino")
+    axes[1, 1].set_title("Feature Ablation")
+    axes[1, 1].legend(fontsize=8)
     axes[1, 1].grid(True, alpha=0.3)
+
+    axes[1, 2].plot(epochs, history["beat_rate"], color=C_VAL, alpha=0.8)
+    axes[1, 2].set_xlabel("Epoch")
+    axes[1, 2].set_ylabel("Beat Rate")
+    axes[1, 2].set_title("Val Beat Rate")
+    axes[1, 2].set_ylim(0, 1)
+    axes[1, 2].grid(True, alpha=0.3)
+
+    for ax in axes.flat:
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
 
     plt.tight_layout()
     plt.savefig(path, dpi=150, bbox_inches="tight")
@@ -1168,6 +1260,23 @@ def train(cfg):
         else:
             val_aggregated = val_result
 
+        run_ablation = (
+            cfg.ablation_interval > 0 and epoch % cfg.ablation_interval == 0
+        )
+        if run_ablation:
+            ablation_result = evaluate_ablated(
+                model, rank_val_episodes, cfg, global_market_features,
+            )
+            if distributed:
+                ablation_aggregated = _allreduce_ablation(
+                    ablation_result, len(rank_val_episodes), cfg.device,
+                )
+            else:
+                ablation_aggregated = ablation_result
+            history["ablation_epochs"].append(epoch)
+            history["val_no_market"].append(ablation_aggregated["no_market"])
+            history["val_no_stock"].append(ablation_aggregated["no_stock"])
+
         for key, value in [
             ("train_model", model_sortino),
             ("train_baseline", baseline_sortino),
@@ -1210,6 +1319,9 @@ def train(cfg):
         _log(f"    {'Entropy':<20s}: {epoch_losses['entropy']:.4f}")
         _log(f"    {'LR':<20s}: {current_lr:.2e}")
         _log(f"    {'Patience':<20s}: {patience_counter}/{cfg.patience}")
+        if run_ablation:
+            _log(f"    {'Val no-market':<20s}: {ablation_aggregated['no_market']:.4f}")
+            _log(f"    {'Val no-stock':<20s}: {ablation_aggregated['no_stock']:.4f}")
         if improved:
             _log(f"    {'New best smoothed':<20s}: {best_smoothed_sortino:.4f}")
 
@@ -1290,7 +1402,19 @@ def _find_free_port():
 
 
 def main():
+    parser = argparse.ArgumentParser(description="PPO + Transformer RL for stock trading")
+    parser.add_argument("--dropout", type=float, default=None,
+                        help="Transformer dropout rate (overrides Config.dropout)")
+    parser.add_argument("--market_dropout", type=float, default=None,
+                        help="Market cross-attention dropout rate (overrides Config.market_dropout)")
+    args = parser.parse_args()
+
     cfg = Config()
+    if args.dropout is not None:
+        cfg.dropout = args.dropout
+    if args.market_dropout is not None:
+        cfg.market_dropout = args.market_dropout
+
     n_gpus = torch.cuda.device_count()
     if n_gpus > 1 and "RANK" not in os.environ:
         port = _find_free_port()
