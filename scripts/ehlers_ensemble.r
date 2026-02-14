@@ -5,12 +5,12 @@
 # Ehlers Apr 2024 shows US replacing SS in the roofing filter lowpass, but every
 # subsequent indicator (incl. Cybernetic Osc Jun 2025) still explicitly uses SS.
 #
-# All outputs [-1, +1]: bounded indicators native, sigma-normalized via tanh(x/2).
+# All outputs bounded: native indicators [-1, +1], sigma-normalized via clamp [-2.5, +2.5].
 #
 # Normalization naming convention:
 #   run_*    — rolling statistical primitives (run_rms, run_cor, run_pctrank)
 #   agc_*    — Ehlers AGC producing sigma-units, unbounded (agc_ema, agc_rolling)
-#   norm_*   — final bounded [-1, +1] output for RL (norm_ema, norm_rolling, norm_pctrank)
+#   norm_*   — final bounded output for RL (norm_ema, norm_rolling: [-2.5, +2.5]; norm_pctrank: [-1, +1])
 
 HP_PERIOD <- 125
 LP_PERIOD <- 20
@@ -24,10 +24,6 @@ safe_div <- function(a, b) {
 
 clamp <- function(x, limit) {
   pmax(-limit, pmin(limit, x))
-}
-
-tanh_squash <- function(x) {
-  tanh(x / 2)
 }
 
 blank_warmup <- function(df, n_warmup) {
@@ -169,14 +165,14 @@ agc_rolling <- function(x, window = 100) {
   ifelse(!is.na(rms_val) & rms_val > 0, x / rms_val, 0)
 }
 
-# Bounded EMA AGC: sigma-units -> tanh(x/2) -> (-1, +1).
+# Bounded EMA AGC: sigma-units / 2 -> clamp -> [-2.5, +2.5].
 norm_ema <- function(x, alpha = 0.0242) {
-  tanh_squash(agc_ema(x, alpha))
+  clamp(agc_ema(x, alpha) / 2, 2.5)
 }
 
-# Bounded rolling AGC: sigma-units -> tanh(x/2) -> (-1, +1).
+# Bounded rolling AGC: sigma-units / 2 -> clamp -> [-2.5, +2.5].
 norm_rolling <- function(x, window = 100) {
-  tanh_squash(agc_rolling(x, window))
+  clamp(agc_rolling(x, window) / 2, 2.5)
 }
 
 # Expanding percentile rank rescaled to [-1, +1].
@@ -354,7 +350,7 @@ mama_fama <- function(x, fast_limit = 0.5, slow_limit = 0.05) {
 # Ehlers Feature Generators ----------------------------------------------------
 
 # Cybernetic Oscillator (TASC Jun 2025) at grid periods.
-# Octave bandpass: HP(2p) -> SS(p) -> rolling AGC -> tanh. Output (-1, +1).
+# Octave bandpass: HP(2p) -> SS(p) -> rolling AGC -> clamp. Output [-2.5, +2.5].
 feat_roofing <- function(x, periods = GRID) {
   out <- lapply(periods, function(p) {
     norm_rolling(roofing_filter(x, 2 * p, p), 100)
@@ -381,14 +377,13 @@ feat_sinewave <- function(x, periods = GRID) {
 }
 
 # Elegant Oscillator (TASC Feb 2022). Single period per Ehlers' BandEdge = 20.
-# Deriv(2-bar) -> rolling RMS(50) -> IFT(tanh) -> SS(20). Output [-1, +1].
+# Deriv(2-bar) -> SS(20) -> rolling AGC -> clamp. Output [-2.5, +2.5].
 feat_elegant <- function(x, period = 20, rms_window = 50) {
   n <- length(x)
   if (n < 3) return(blank_warmup(data.frame(eleg = rep(NA_real_, n)), n))
   deriv <- c(0, 0, x[3:n] - x[1:(n - 2)])
-  rms_val <- run_rms(deriv, rms_window)
-  ift <- tanh(ifelse(!is.na(rms_val) & rms_val > 0, deriv / rms_val, 0))
-  blank_warmup(data.frame(eleg = super_smoother(ift, period)), max(rms_window, period))
+  eleg <- norm_rolling(super_smoother(deriv, period), rms_window)
+  blank_warmup(data.frame(eleg = eleg), max(rms_window, period))
 }
 
 # Correlation Trend Indicator (TASC May 2020) at grid periods.
@@ -401,7 +396,7 @@ feat_trend <- function(x, periods = GRID) {
 
 # Laguerre Oscillator (TASC Jul 2025) at multiple gammas.
 # US(L0) internally per Ehlers. Period = 30 per Ehlers default.
-# Rolling AGC -> tanh. Output (-1, +1).
+# Rolling AGC -> clamp. Output [-2.5, +2.5].
 feat_laguerre <- function(x, gammas = c(0.3, 0.6, 0.8), period = 30) {
   out <- lapply(gammas, function(g) {
     lag <- laguerre_stages(x, g, period)
@@ -413,7 +408,7 @@ feat_laguerre <- function(x, gammas = c(0.3, 0.6, 0.8), period = 30) {
 
 # MAMA spread and crossover (Rocket Science 2001, Ch. 8).
 # Input: (H+L)/2. Self-adaptive — no period grid.
-# EMA AGC -> tanh. Output (-1, +1).
+# EMA AGC -> clamp. Output [-2.5, +2.5].
 feat_mama <- function(hl2, fast_limit = 0.5, slow_limit = 0.05) {
   mf <- mama_fama(hl2, fast_limit, slow_limit)
   blank_warmup(data.frame(
@@ -460,7 +455,7 @@ feat_dominant_cycle <- function(x, min_period = 10, max_period = 48) {
 # Derived Feature Generators ---------------------------------------------------
 
 # Ultimate Smoother spread/slope/cross-scale at grid periods.
-# EMA AGC -> tanh. Output (-1, +1).
+# EMA AGC -> clamp. Output [-2.5, +2.5].
 feat_smoother <- function(x, periods = GRID) {
   all_periods <- sort(unique(c(periods, 2 * periods)))
   smoothed <- setNames(lapply(all_periods, function(p) ultimate_smoother(x, p)), all_periods)
@@ -475,7 +470,7 @@ feat_smoother <- function(x, periods = GRID) {
   blank_warmup(as.data.frame(out), max(2 * periods))
 }
 
-# Volume: octave bandpass EMA AGC -> tanh; price-volume correlation [-1, +1].
+# Volume: octave bandpass EMA AGC -> clamp [-2.5, +2.5]; price-volume correlation [-1, +1].
 feat_volume <- function(close, volume, periods = GRID) {
   out <- list()
   for (p in periods) {
@@ -490,19 +485,17 @@ feat_volume <- function(close, volume, periods = GRID) {
 # Non-Ehlers Feature Generators ------------------------------------------------
 
 # OHLC microstructure. All outputs [-1, +1].
+# OHLC microstructure. TR-normalized, all outputs [-1, +1].
 feat_ohlc <- function(open, high, low, close) {
   n <- length(close)
-  rng <- high - low
-  rng[rng == 0] <- NA_real_
-  body_pos <- ifelse(is.na(rng), 0.5, (close - low) / rng)
-  upper_wick <- ifelse(is.na(rng), 0, (high - pmax(open, close)) / rng)
-  lower_wick <- ifelse(is.na(rng), 0, (pmin(open, close) - low) / rng)
+  prev_close <- c(open[1], close[-n])
+  tr <- pmax(high - low, abs(high - prev_close), abs(low - prev_close))
   data.frame(
-    ohlc_range = norm_pctrank((high - low) / close),
-    ohlc_body_pos = 2 * body_pos - 1,
-    ohlc_upper_wick = 2 * upper_wick - 1,
-    ohlc_lower_wick = 2 * lower_wick - 1,
-    ohlc_gap = norm_pctrank(c(0, open[-1] - close[-n]) / close)
+    ohlc_range = norm_pctrank(tr / close),
+    ohlc_gap = safe_div(open - prev_close, tr),
+    ohlc_body_pos = 2 * ifelse(tr != 0, (close - low) / tr, 0.5) - 1,
+    ohlc_upper_wick = 2 * safe_div(high - pmax(open, close), tr) - 1,
+    ohlc_lower_wick = 2 * safe_div(pmin(open, close) - low, tr) - 1
   )
 }
 
@@ -520,7 +513,7 @@ avg_cost_basis <- function(close, turnover, amount = NULL, volume = NULL) {
 }
 
 # Cost basis spread/slope at single scale, cross-scale at grid periods.
-# EMA AGC -> tanh. Output (-1, +1).
+# EMA AGC -> clamp. Output [-2.5, +2.5].
 feat_cost <- function(close, avg_cost, periods = GRID) {
   out <- list(
     cost_spread = norm_ema(close - avg_cost),
@@ -628,40 +621,22 @@ validate_features <- function(feats, sample_n = 10000, plot = FALSE) {
     cat("Bounded range: [", round(min(bmat), 4), ",", round(max(bmat), 4), "]\n")
   }
 
-  n_oob <- 0
-  n_const <- 0
-  problems <- character(0)
-  cat(sprintf("\n%-40s %6s %8s %8s %8s\n", "Feature", "NAs", "Min", "Mean", "Max"))
-  cat(strrep("-", 74), "\n")
+  cat(sprintf("\n%-35s %8s %8s %8s %8s %8s\n", "Feature", "NAs", "Min", "Mean", "Max", "SD"))
+  cat(strrep("-", 80), "\n")
 
   for (col in names(feat_cols)) {
     v <- feat_cols[[col]]
     na_count <- sum(is.na(v))
     v_clean <- v[!is.na(v)]
     if (length(v_clean) == 0) {
-      cat(sprintf("%-40s %6d %8s %8s %8s\n", col, na_count, "NA", "NA", "NA"))
+      cat(sprintf("%-35s %8d %8s %8s %8s %8s\n", col, na_count, "NA", "NA", "NA", "NA"))
       next
     }
     vmin <- min(v_clean)
     vmean <- mean(v_clean)
     vmax <- max(v_clean)
-    cat(sprintf("%-40s %6d %8.4f %8.4f %8.4f", col, na_count, vmin, vmean, vmax))
-
-    flags <- character(0)
-    is_dn <- grepl("_dn$", col)
-    if (!is_dn && (vmin < -1.001 || vmax > 1.001)) {
-      flags <- c(flags, "OOB")
-      n_oob <- n_oob + 1
-    }
-    if (sd(v_clean) < 1e-10) {
-      flags <- c(flags, "CONST")
-      n_const <- n_const + 1
-    }
-    if (length(flags) > 0) {
-      flag_str <- paste(flags, collapse = ",")
-      cat("  <-", flag_str)
-      problems <- c(problems, paste0(col, " [", flag_str, "]"))
-    }
+    vsd <- sd(v_clean)
+    cat(sprintf("%-35s %8d %8.3f %8.3f %8.3f %8.3f", col, na_count, vmin, vmean, vmax, vsd))
     cat("\n")
   }
 
@@ -671,13 +646,6 @@ validate_features <- function(feats, sample_n = 10000, plot = FALSE) {
     cat(sprintf("  %-25s %3d\n", g, sum(groups == g)))
   }
   cat(sprintf("  %-25s %3d\n", "TOTAL", ncol(feat_cols)))
-
-  if (length(problems) > 0) {
-    cat("\nProblems (", length(problems), "):\n")
-    for (p in problems) cat("  ", p, "\n")
-  } else {
-    cat("\nAll features OK.\n")
-  }
 
   if (plot) {
     for (col in names(feat_cols)) {
