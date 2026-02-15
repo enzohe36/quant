@@ -19,7 +19,6 @@ import os
 import math
 import time
 import socket
-import pickle
 import functools
 from collections import defaultdict
 
@@ -99,6 +98,7 @@ class Config:
     reward_clip: float = 10.0
     sortino_clip: float = 10.0
     pytorch_eps: float = 1e-8
+    use_amp: bool = True
 
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -111,7 +111,7 @@ class Config:
 def split_feature_groups(column_names):
     groups = defaultdict(list)
     for col_idx, col_name in enumerate(column_names):
-        prefix = col_name.split(".")[0] if "." in col_name else col_name.split("_")[0]
+        prefix = col_name.split(".")[0]
         groups[prefix].append(col_idx)
     stock_groups, market_groups = {}, {}
     for group_name, group_indices in groups.items():
@@ -413,7 +413,7 @@ class RolloutBuffer:
             [ep["market_indices"] for ep in episodes],
         )
 
-    def compute_gae(self, gamma, gae_lambda, eps):
+    def compute_gae(self, gamma, gae_lambda, eps, distributed=False, device=None):
         advantages = np.zeros_like(self.rewards)
         running_gae = np.zeros(self.n_episodes, dtype=np.float32)
 
@@ -431,10 +431,23 @@ class RolloutBuffer:
         returns = advantages + self.values
 
         flat_advantages = advantages.ravel()
-        flat_advantages = (
-            (flat_advantages - flat_advantages.mean())
-            / (flat_advantages.std() + eps)
-        )
+        if distributed and device is not None:
+            stats = torch.tensor(
+                [float(flat_advantages.size),
+                 float(flat_advantages.sum()),
+                 float((flat_advantages ** 2).sum())],
+                device=device, dtype=torch.float64,
+            )
+            dist.all_reduce(stats)
+            n, s, sq = stats[0].item(), stats[1].item(), stats[2].item()
+            global_mean = s / n
+            global_std = math.sqrt(sq / n - global_mean * global_mean + eps)
+            flat_advantages = (flat_advantages - global_mean) / global_std
+        else:
+            flat_advantages = (
+                (flat_advantages - flat_advantages.mean())
+                / (flat_advantages.std() + eps)
+            )
 
         self._flat_advantages = flat_advantages
         self._flat_returns = returns.ravel()
@@ -494,16 +507,16 @@ class RolloutBuffer:
 
 # Data loading
 
-def _read_csv(path):
+def _read_csv(path, **kwargs):
     try:
-        return pd.read_csv(path, engine="pyarrow")
+        return pd.read_csv(path, engine="pyarrow", **kwargs)
     except ImportError:
-        return pd.read_csv(path)
+        return pd.read_csv(path, **kwargs)
 
 
 @timed
 def load_stock_data(path, market_date_to_idx):
-    df = _read_csv(path)
+    df = _read_csv(path, dtype={"symbol": str})
     df.sort_values(["symbol", "date"], inplace=True)
     df.reset_index(drop=True, inplace=True)
     feature_cols = [c for c in df.columns if c not in ("symbol", "date", "price")]
@@ -637,7 +650,8 @@ def collect_training_rollout(model, episodes, cfg, global_market_features,
     rollout.register_episodes(episodes)
 
     model.train()
-    with torch.no_grad():
+    amp_enabled = cfg.use_amp and cfg.device.startswith("cuda")
+    with torch.no_grad(), torch.amp.autocast("cuda", enabled=amp_enabled):
         for batch_start in range(0, n_episodes, cfg.inference_batch):
             batch_end = min(batch_start + cfg.inference_batch, n_episodes)
             batch_episodes = episodes[batch_start:batch_end]
@@ -702,7 +716,8 @@ def evaluate_deterministic(model, episodes, cfg, global_market_features):
     all_positions = np.empty((n_episodes, episode_length), dtype=np.int64)
 
     model.eval()
-    with torch.no_grad():
+    amp_enabled = cfg.use_amp and cfg.device.startswith("cuda")
+    with torch.no_grad(), torch.amp.autocast("cuda", enabled=amp_enabled):
         for batch_start in range(0, n_episodes, cfg.inference_batch):
             batch_end = min(batch_start + cfg.inference_batch, n_episodes)
             batch_episodes = episodes[batch_start:batch_end]
@@ -786,53 +801,75 @@ def evaluate_ablated(model, episodes, cfg, global_market_features):
 
 # PPO update
 
-def run_ppo_update(model, optimizer, rollout, cfg, n_local_transitions,
+def run_ppo_update(model, optimizer, scaler, rollout, cfg, n_local_transitions,
                    n_padded_transitions):
     """One PPO pass over the rollout buffer.
 
     All ranks iterate over the same number of mini-batches (determined by
     n_padded_transitions) so DDP gradient synchronisation stays aligned.
-    Ranks with fewer local transitions wrap indices via modulo.
+    Ranks with fewer local transitions pad with masked transitions that
+    contribute zero loss, avoiding gradient bias from duplicated samples.
     """
     model.train()
     base_model = model.module if hasattr(model, "module") else model
     policy_loss_sum = value_loss_sum = entropy_sum = 0.0
     n_batches = 0
+    amp_enabled = cfg.use_amp and cfg.device.startswith("cuda")
 
     permutation = torch.randperm(n_padded_transitions, device=cfg.device)
     if n_local_transitions < n_padded_transitions:
+        valid_mask = permutation < n_local_transitions
         permutation = permutation % n_local_transitions
+    else:
+        valid_mask = None
 
     for batch_start in range(0, n_padded_transitions, cfg.batch_size):
         batch_end = min(batch_start + cfg.batch_size, n_padded_transitions)
         batch_indices = permutation[batch_start:batch_end]
         batch = rollout.get_batch(batch_indices, cfg.device)
 
-        new_log_probs, entropy, new_values = evaluate_actions(
-            model, batch["states"], batch["actions"], batch["positions"],
-        )
-        ratio = torch.exp(new_log_probs - batch["log_probs"])
-        advantages = batch["advantages"]
+        with torch.amp.autocast("cuda", enabled=amp_enabled):
+            new_log_probs, entropy, new_values = evaluate_actions(
+                model, batch["states"], batch["actions"], batch["positions"],
+            )
+            ratio = torch.exp(new_log_probs - batch["log_probs"])
+            advantages = batch["advantages"]
 
-        policy_loss = -torch.min(
-            ratio * advantages,
-            torch.clamp(ratio, 1 - cfg.policy_clip, 1 + cfg.policy_clip) * advantages,
-        ).mean()
-        value_loss = F.mse_loss(new_values, batch["returns"])
-        total_loss = (
-            policy_loss
-            + cfg.value_coeff * value_loss
-            - cfg.entropy_coeff * entropy.mean()
-        )
+            surrogate = torch.min(
+                ratio * advantages,
+                torch.clamp(ratio, 1 - cfg.policy_clip, 1 + cfg.policy_clip) * advantages,
+            )
+
+            if valid_mask is not None:
+                batch_weight = valid_mask[batch_start:batch_end].float()
+                n_valid = batch_weight.sum().clamp(min=1)
+                policy_loss = -(surrogate * batch_weight).sum() / n_valid
+                value_loss = (
+                    F.mse_loss(new_values, batch["returns"], reduction="none")
+                    * batch_weight
+                ).sum() / n_valid
+                entropy_term = (entropy * batch_weight).sum() / n_valid
+            else:
+                policy_loss = -surrogate.mean()
+                value_loss = F.mse_loss(new_values, batch["returns"])
+                entropy_term = entropy.mean()
+
+            total_loss = (
+                policy_loss
+                + cfg.value_coeff * value_loss
+                - cfg.entropy_coeff * entropy_term
+            )
 
         optimizer.zero_grad()
-        total_loss.backward()
+        scaler.scale(total_loss).backward()
+        scaler.unscale_(optimizer)
         nn.utils.clip_grad_norm_(base_model.parameters(), cfg.grad_clip)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
 
         policy_loss_sum += policy_loss.item()
         value_loss_sum += value_loss.item()
-        entropy_sum += entropy.mean().item()
+        entropy_sum += entropy_term.item()
         n_batches += 1
 
     if _world > 1:
@@ -931,33 +968,36 @@ def _allreduce_max_int(value, device):
     return int(tensor.item())
 
 
-def _gather_test_rows(local_rows, device):
-    local_bytes = pickle.dumps(local_rows)
-    local_size = torch.tensor([len(local_bytes)], dtype=torch.long, device=device)
-    all_sizes = [
-        torch.zeros(1, dtype=torch.long, device=device) for _ in range(_world)
-    ]
-    dist.all_gather(all_sizes, local_size)
+def _gather_test_arrays(test_result, n_local, n_total, episode_length, device):
+    """Gather numeric test result arrays to rank 0 via tensor all_gather."""
+    local = torch.zeros(n_local, episode_length, 3, device=device)
+    local[..., 0] = torch.from_numpy(test_result["model_rewards"]).to(device)
+    local[..., 1] = torch.from_numpy(test_result["baseline_rewards"]).to(device)
+    local[..., 2] = torch.from_numpy(
+        test_result["model_positions"].astype(np.float32),
+    ).to(device)
 
-    max_size = max(s.item() for s in all_sizes)
-    local_padded = torch.zeros(max_size, dtype=torch.uint8, device=device)
-    local_padded[:len(local_bytes)] = torch.tensor(
-        list(local_bytes), dtype=torch.uint8, device=device,
-    )
-    all_padded = [
-        torch.zeros(max_size, dtype=torch.uint8, device=device)
-        for _ in range(_world)
-    ]
-    dist.all_gather(all_padded, local_padded)
+    max_local = (n_total + _world - 1) // _world
+    padded = torch.zeros(max_local, episode_length, 3, device=device)
+    padded[:n_local] = local
 
-    if _rank == 0:
-        all_rows = []
-        for rank_idx in range(_world):
-            size = all_sizes[rank_idx].item()
-            rank_bytes = bytes(all_padded[rank_idx][:size].cpu().numpy().tolist())
-            all_rows.extend(pickle.loads(rank_bytes))
-        return all_rows
-    return None
+    gathered = [torch.zeros_like(padded) for _ in range(_world)]
+    dist.all_gather(gathered, padded)
+
+    if _rank != 0:
+        return None
+
+    result = torch.zeros(n_total, episode_length, 3, device=device)
+    for rank_idx in range(_world):
+        rank_episodes = list(range(rank_idx, n_total, _world))
+        result[rank_episodes] = gathered[rank_idx][:len(rank_episodes)]
+
+    result_np = result.cpu().numpy()
+    return {
+        "model_rewards": result_np[..., 0],
+        "baseline_rewards": result_np[..., 1],
+        "model_positions": result_np[..., 2].astype(np.int64),
+    }
 
 
 # Plotting and checkpointing
@@ -1006,6 +1046,7 @@ def plot_training(history, path):
 
     ablation_epochs = history.get("ablation_epochs", [])
     axes[1, 1].plot(epochs, history["val_model"], color=C_VAL, label="Val model", alpha=0.8)
+    axes[1, 1].plot(epochs, history["val_baseline"], color=C_VAL, linestyle="--", label="Val baseline", alpha=0.5)
     if ablation_epochs:
         axes[1, 1].plot(
             ablation_epochs, history["val_no_market"], color=C_NO_MARKET,
@@ -1126,7 +1167,7 @@ def train(cfg):
     device_label = f"{_world} GPUs (DDP)" if distributed else cfg.device
     _log(f"    {'Device':<20s}: {device_label}")
 
-    effective_lr = cfg.lr * _world
+    effective_lr = cfg.lr * math.sqrt(_world)
     optimizer = torch.optim.Adam(
         base_model.parameters(),
         lr=effective_lr, eps=1e-5
@@ -1134,8 +1175,11 @@ def train(cfg):
     reward_normalizer = RewardNormalizer(
         cfg.reward_clip, cfg.pytorch_eps
     )
+    amp_enabled = cfg.use_amp and cfg.device.startswith("cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     if _world > 1:
-        _log(f"    {'LR (linear scaled)':<20s}: {cfg.lr} x {_world} = {effective_lr:.6f}")
+        _log(f"    {'LR (sqrt scaled)':<20s}: {cfg.lr} x sqrt({_world}) = {effective_lr:.6f}")
+    _log(f"    {'Mixed precision':<20s}: {'float16' if amp_enabled else 'disabled'}")
 
     history = defaultdict(list)
     best_smoothed_sortino = -float("inf")
@@ -1151,21 +1195,20 @@ def train(cfg):
         patience_counter = ckpt.get("patience_counter", 0)
         if "reward_normalizer" in ckpt:
             reward_normalizer.load_state_dict(ckpt["reward_normalizer"])
-        if "history" in ckpt:
-            for key, vals in ckpt["history"].items():
-                history[key] = list(vals)
+        if "scaler" in ckpt:
+            scaler.load_state_dict(ckpt["scaler"])
+        for key, vals in ckpt.get("history", {}).items():
+            history[key] = list(vals)
 
-        if "val_model" in history and len(history["val_model"]) > 0:
-            val_series = history["val_model"]
+        val_series = history.get("val_model", [])
+        if val_series:
             window = cfg.patience_smoothing
             best_smoothed_sortino = max(
                 float(np.mean(val_series[max(0, i + 1 - window) : i + 1]))
                 for i in range(len(val_series))
             )
         else:
-            best_smoothed_sortino = ckpt.get(
-                "best_smoothed_sortino", -float("inf"),
-            )
+            best_smoothed_sortino = ckpt.get("best_smoothed_sortino", -float("inf"))
 
         _log()
         _log(
@@ -1196,6 +1239,7 @@ def train(cfg):
             "best_smoothed_sortino": best_smoothed_sortino,
             "patience_counter": patience_counter,
             "reward_normalizer": reward_normalizer.state_dict(),
+            "scaler": scaler.state_dict(),
             "history": dict(history),
         }
 
@@ -1205,6 +1249,8 @@ def train(cfg):
         )
         for param_group in optimizer.param_groups:
             param_group["lr"] = current_lr
+
+        epoch_start = time.perf_counter()
 
         epoch_rng = np.random.default_rng(cfg.seed + epoch * 7919)
         train_episodes = generate_episodes(train_data, cfg, epoch_rng)
@@ -1226,6 +1272,7 @@ def train(cfg):
 
         n_local_transitions = rollout.compute_gae(
             cfg.gamma, cfg.gae_lambda, cfg.pytorch_eps,
+            distributed, cfg.device,
         )
         if _world > 1:
             n_padded_transitions = _allreduce_max_int(
@@ -1235,10 +1282,9 @@ def train(cfg):
             n_padded_transitions = n_local_transitions
 
         epoch_losses = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
-        epoch_start = time.perf_counter()
-        for ppo_pass in range(cfg.ppo_epochs):
+        for _ in range(cfg.ppo_epochs):
             losses = run_ppo_update(
-                model, optimizer, rollout, cfg,
+                model, optimizer, scaler, rollout, cfg,
                 n_local_transitions, n_padded_transitions,
             )
             for k in epoch_losses:
@@ -1297,11 +1343,6 @@ def train(cfg):
         if improved:
             best_smoothed_sortino = smoothed_val_sortino
             patience_counter = 0
-            if is_main:
-                save_checkpoint(
-                    _build_checkpoint(),
-                    os.path.join(cfg.save_dir, "model_best.pt"),
-                )
         else:
             patience_counter += 1
 
@@ -1326,8 +1367,11 @@ def train(cfg):
             _log(f"    {'New best smoothed':<20s}: {best_smoothed_sortino:.4f}")
 
         if is_main:
+            ckpt = _build_checkpoint()
+            if improved:
+                save_checkpoint(ckpt, os.path.join(cfg.save_dir, "model_best.pt"))
             save_checkpoint(
-                _build_checkpoint(),
+                ckpt,
                 os.path.join(cfg.save_dir, "model_latest.pt"),
             )
             plot_training(
@@ -1365,16 +1409,16 @@ def train(cfg):
     _log(f"    {'Beat rate':<20s}: {test_aggregated['beat_rate']:.1%}")
 
     if distributed:
-        local_rows = build_test_results(rank_test_episodes, test_result, cfg)
-        all_rows = _gather_test_rows(local_rows, cfg.device)
-        if is_main and all_rows is not None:
-            results_path = os.path.join(cfg.save_dir, "test_results.csv")
-            pd.DataFrame(all_rows).to_csv(results_path, index=False)
-            _log(f"    {'Saved':<20s}: {results_path}")
-    elif is_main:
-        rows = build_test_results(rank_test_episodes, test_result, cfg)
+        full_result = _gather_test_arrays(
+            test_result, len(rank_test_episodes), len(test_episodes),
+            cfg.episode_length, cfg.device,
+        )
+    else:
+        full_result = test_result
+    if is_main:
+        all_rows = build_test_results(test_episodes, full_result, cfg)
         results_path = os.path.join(cfg.save_dir, "test_results.csv")
-        pd.DataFrame(rows).to_csv(results_path, index=False)
+        pd.DataFrame(all_rows).to_csv(results_path, index=False)
         _log(f"    {'Saved':<20s}: {results_path}")
 
     if distributed:

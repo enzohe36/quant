@@ -19,7 +19,6 @@ import os
 import math
 import time
 import socket
-import pickle
 import functools
 from collections import defaultdict
 
@@ -124,7 +123,7 @@ def _remap_groups(groups, feature_indices):
 def split_feature_groups(column_names):
     groups = defaultdict(list)
     for col_idx, col_name in enumerate(column_names):
-        prefix = col_name.split(".")[0] if "." in col_name else col_name.split("_")[0]
+        prefix = col_name.split(".")[0]
         groups[prefix].append(col_idx)
     stock_groups, market_groups = {}, {}
     for group_name, group_indices in groups.items():
@@ -491,16 +490,16 @@ class RolloutBuffer:
 
 # Data loading
 
-def _read_csv(path):
+def _read_csv(path, **kwargs):
     try:
-        return pd.read_csv(path, engine="pyarrow")
+        return pd.read_csv(path, engine="pyarrow", **kwargs)
     except ImportError:
-        return pd.read_csv(path)
+        return pd.read_csv(path, **kwargs)
 
 
 @timed
 def load_stock_data(path, market_date_to_idx):
-    df = _read_csv(path)
+    df = _read_csv(path, dtype={"symbol": str})
     df.sort_values(["symbol", "date"], inplace=True)
     df.reset_index(drop=True, inplace=True)
     feature_cols = [c for c in df.columns if c not in ("symbol", "date", "price")]
@@ -697,8 +696,7 @@ def evaluate_deterministic(model, episodes, cfg, global_market_features):
     n_episodes = len(episodes)
     episode_length = cfg.episode_length
     all_rewards = np.empty((n_episodes, episode_length), dtype=np.float32)
-    all_old_positions = np.empty((n_episodes, episode_length), dtype=np.int64)
-    all_new_positions = np.empty((n_episodes, episode_length), dtype=np.int64)
+    all_positions = np.empty((n_episodes, episode_length), dtype=np.int64)
 
     model.eval()
     amp_enabled = cfg.use_amp and cfg.device.startswith("cuda")
@@ -717,12 +715,11 @@ def evaluate_deterministic(model, episodes, cfg, global_market_features):
                 pos_tensor = torch.from_numpy(pos_idx).to(cfg.device)
                 actions, _ = select_greedy(model, states, pos_tensor)
                 actions_np = actions.cpu().numpy()
-                all_old_positions[batch_start:batch_end, step] = pos_idx - 1
-                all_new_positions[batch_start:batch_end, step] = actions_np - 1
                 obs, step_rewards, _, pos_idx = env.step(actions_np)
                 all_rewards[batch_start:batch_end, step] = step_rewards
+                all_positions[batch_start:batch_end, step] = actions_np - 1
 
-    return all_rewards, all_old_positions, all_new_positions
+    return all_rewards, all_positions
 
 
 @timed
@@ -732,11 +729,10 @@ def evaluate_episodes(model, episodes, cfg, global_market_features):
             "model_sortino": 0.0, "baseline_sortino": 0.0, "beat_rate": 0.0,
             "model_rewards": np.empty((0, cfg.episode_length)),
             "baseline_rewards": np.empty((0, cfg.episode_length)),
-            "old_positions": np.empty((0, cfg.episode_length), dtype=np.int64),
-            "new_positions": np.empty((0, cfg.episode_length), dtype=np.int64),
+            "model_positions": np.empty((0, cfg.episode_length), dtype=np.int64),
         }
 
-    model_rewards, old_positions, new_positions = evaluate_deterministic(
+    model_rewards, model_positions = evaluate_deterministic(
         model, episodes, cfg, global_market_features,
     )
     baseline_rewards = compute_baseline_rewards(episodes, cfg)
@@ -753,8 +749,7 @@ def evaluate_episodes(model, episodes, cfg, global_market_features):
         "beat_rate": float(np.mean(model_sortinos > baseline_sortinos)),
         "model_rewards": model_rewards,
         "baseline_rewards": baseline_rewards,
-        "old_positions": old_positions,
-        "new_positions": new_positions,
+        "model_positions": model_positions,
     }
 
 
@@ -765,7 +760,7 @@ def evaluate_ablated(model, episodes, cfg, global_market_features):
         return {"no_market": 0.0, "no_stock": 0.0}
 
     zero_market = np.zeros_like(global_market_features)
-    no_market_rewards, _, _ = evaluate_deterministic(
+    no_market_rewards, _ = evaluate_deterministic(
         model, episodes, cfg, zero_market,
     )
 
@@ -773,7 +768,7 @@ def evaluate_ablated(model, episodes, cfg, global_market_features):
         {**ep, "stock_features": np.zeros_like(ep["stock_features"])}
         for ep in episodes
     ]
-    no_stock_rewards, _, _ = evaluate_deterministic(
+    no_stock_rewards, _ = evaluate_deterministic(
         model, zero_episodes, cfg, global_market_features,
     )
 
@@ -891,8 +886,7 @@ def build_test_results(episodes, eval_result, cfg):
                 "symbol": episode["symbol"],
                 "date": dates[step],
                 "price": prices[step],
-                "old_position": int(eval_result["old_positions"][episode_idx, step]),
-                "new_position": int(eval_result["new_positions"][episode_idx, step]),
+                "position": int(eval_result["model_positions"][episode_idx, step]),
                 "model_reward": float(
                     eval_result["model_rewards"][episode_idx, step],
                 ),
@@ -957,34 +951,36 @@ def _allreduce_max_int(value, device):
     return int(tensor.item())
 
 
-def _gather_test_rows(local_rows, device):
-    local_bytes = pickle.dumps(local_rows)
-    local_size = torch.tensor([len(local_bytes)], dtype=torch.long, device=device)
-    all_sizes = [
-        torch.zeros(1, dtype=torch.long, device=device) for _ in range(_world)
-    ]
-    dist.all_gather(all_sizes, local_size)
+def _gather_test_arrays(test_result, n_local, n_total, episode_length, device):
+    """Gather numeric test result arrays to rank 0 via tensor all_gather."""
+    local = torch.zeros(n_local, episode_length, 3, device=device)
+    local[..., 0] = torch.from_numpy(test_result["model_rewards"]).to(device)
+    local[..., 1] = torch.from_numpy(test_result["baseline_rewards"]).to(device)
+    local[..., 2] = torch.from_numpy(
+        test_result["model_positions"].astype(np.float32),
+    ).to(device)
 
-    max_size = max(s.item() for s in all_sizes)
-    local_padded = torch.zeros(max_size, dtype=torch.uint8, device=device)
-    local_padded[:len(local_bytes)] = torch.tensor(
-        list(local_bytes), dtype=torch.uint8, device=device,
-    )
-    all_padded = [
-        torch.zeros(max_size, dtype=torch.uint8, device=device)
-        for _ in range(_world)
-    ]
-    dist.all_gather(all_padded, local_padded)
+    max_local = (n_total + _world - 1) // _world
+    padded = torch.zeros(max_local, episode_length, 3, device=device)
+    padded[:n_local] = local
 
-    if _rank == 0:
-        all_rows = []
-        for rank_idx in range(_world):
-            size = all_sizes[rank_idx].item()
-            rank_bytes = bytes(all_padded[rank_idx][:size].cpu().numpy().tolist())
-            all_rows.extend(pickle.loads(rank_bytes))
-        return all_rows
-    return None
+    gathered = [torch.zeros_like(padded) for _ in range(_world)]
+    dist.all_gather(gathered, padded)
 
+    if _rank != 0:
+        return None
+
+    result = torch.zeros(n_total, episode_length, 3, device=device)
+    for rank_idx in range(_world):
+        rank_episodes = list(range(rank_idx, n_total, _world))
+        result[rank_episodes] = gathered[rank_idx][:len(rank_episodes)]
+
+    result_np = result.cpu().numpy()
+    return {
+        "model_rewards": result_np[..., 0],
+        "baseline_rewards": result_np[..., 1],
+        "model_positions": result_np[..., 2].astype(np.int64),
+    }
 
 
 # Plotting and checkpointing
@@ -1033,6 +1029,7 @@ def plot_training(history, path):
 
     ablation_epochs = history.get("ablation_epochs", [])
     axes[1, 1].plot(epochs, history["val_model"], color=C_VAL, label="Val model", alpha=0.8)
+    axes[1, 1].plot(epochs, history["val_baseline"], color=C_VAL, linestyle="--", label="Val baseline", alpha=0.5)
     if ablation_epochs:
         axes[1, 1].plot(
             ablation_epochs, history["val_no_market"], color=C_NO_MARKET,
@@ -1268,6 +1265,8 @@ def train(cfg):
             cfg.entropy_coeff_start, cfg.entropy_coeff_end, epoch, cfg.n_epochs,
         )
 
+        epoch_start = time.perf_counter()
+
         epoch_rng = np.random.default_rng(cfg.seed + epoch * 7919)
         train_episodes = generate_episodes(train_data, cfg, epoch_rng)
         rank_train_episodes = train_episodes[_rank::_world]
@@ -1298,7 +1297,6 @@ def train(cfg):
             n_padded_transitions = n_local_transitions
 
         epoch_losses = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
-        epoch_start = time.perf_counter()
         for _ in range(cfg.ppo_epochs):
             losses = run_ppo_update(
                 model, optimizer, scaler, rollout, cfg,
@@ -1361,12 +1359,6 @@ def train(cfg):
         if improved:
             best_smoothed_sortino = smoothed_val_sortino
             patience_counter = 0
-
-            if is_main:
-                save_checkpoint(
-                    _build_checkpoint(),
-                    os.path.join(cfg.save_dir, "model_best.pt"),
-                )
         else:
             patience_counter += 1
 
@@ -1392,8 +1384,11 @@ def train(cfg):
             _log(f"    {'New best smoothed':<20s}: {best_smoothed_sortino:.4f}")
 
         if is_main:
+            ckpt = _build_checkpoint()
+            if improved:
+                save_checkpoint(ckpt, os.path.join(cfg.save_dir, "model_best.pt"))
             save_checkpoint(
-                _build_checkpoint(),
+                ckpt,
                 os.path.join(cfg.save_dir, "model_latest.pt"),
             )
             plot_training(
@@ -1430,21 +1425,18 @@ def train(cfg):
     _log(f"    {'Baseline sortino':<20s}: {test_aggregated['baseline_sortino']:.4f}")
     _log(f"    {'Beat rate':<20s}: {test_aggregated['beat_rate']:.1%}")
 
-    local_rows = build_test_results(rank_test_episodes, test_result, cfg)
     if distributed:
-        all_rows = _gather_test_rows(local_rows, cfg.device)
+        full_result = _gather_test_arrays(
+            test_result, len(rank_test_episodes), len(test_episodes),
+            cfg.episode_length, cfg.device,
+        )
     else:
-        all_rows = local_rows
-    if is_main and all_rows:
+        full_result = test_result
+    if is_main:
+        all_rows = build_test_results(test_episodes, full_result, cfg)
         results_path = os.path.join(cfg.save_dir, "test_results.csv")
         pd.DataFrame(all_rows).to_csv(results_path, index=False)
         _log(f"    {'Saved':<20s}: {results_path}")
-
-    if is_main:
-        plot_training(
-            dict(history),
-            os.path.join(cfg.save_dir, "training_curves.png"),
-        )
 
     if distributed:
         dist.destroy_process_group()
