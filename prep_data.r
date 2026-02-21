@@ -5,7 +5,7 @@ library(doFuture)
 library(data.table)
 library(tidyverse)
 
-source("scripts/ehlers_ensemble.r")
+source("scripts/ehlers.r")
 source("scripts/misc.r")
 
 data_dir <- "data/"
@@ -18,6 +18,7 @@ spot_combined_path <- paste0(data_dir, "spot_combined.csv")
 
 data_combined_path <- paste0(data_dir, "data_combined.rds")
 train_path <- paste0(data_dir, "train.csv")
+val_path <- paste0(data_dir, "val.csv")
 test_path <- paste0(data_dir, "test.csv")
 example_path <- paste0(data_dir, "example.csv")
 
@@ -39,7 +40,8 @@ log_path <- paste0(logs_dir, format(now(), "%Y%m%d_%H%M%S"), ".log")
 
 last_td <- as_date("2026-01-23")
 train_start <- last_td %m-% years(10)
-test_start <- last_td %m-% years(2)
+val_start <- last_td %m-% years(2)
+test_start <- last_td %m-% years(1)
 
 set.seed(42)
 
@@ -293,9 +295,13 @@ cat(nrow(feats), "x", ncol(feats), "in", round(elapsed, 3), "s\n")
 
 validate_features(feats, plot = TRUE)
 
-train <- filter(feats, date < test_start)
+train <- filter(feats, date < val_start)
 write_csv(train, train_path)
 tsprint(str_glue("nrow(train) = {nrow(train)}"))
+
+val <- filter(feats, date >= val_start & date < test_start)
+write_csv(val, val_path)
+tsprint(str_glue("nrow(val) = {nrow(val)}"))
 
 test <- filter(feats, date >= test_start)
 write_csv(test, test_path)
