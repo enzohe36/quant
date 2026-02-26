@@ -6,9 +6,22 @@
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate py311
 
-python train_model.py --dropout=0.0 --market_dropout=0.5 >> training.log 2>&1
-mv training.log checkpoints/
-cp train_model.py example.csv checkpoints/
+JOBS=(
+  "python train_model.py --market_dropout=0.5"
+  "python train_model_beta.py --market_dropout=0.5"
+)
 
-zip -r "checkpoints_$(date +%Y%m%d)_drop00_mdrop05.zip" checkpoints/
-rm -rf checkpoints
+for TRAIN_CMD in "${JOBS[@]}"; do
+  FLAG_SUFFIX=$(echo "$TRAIN_CMD" | grep -oP '\-\-\S+' | sed 's/--//;s/=//;s/^/_/' | tr -d '\n')
+
+  SCRIPT_NAME=$(echo "$TRAIN_CMD" | awk '{print $2}')
+
+  $TRAIN_CMD >> training.log 2>&1
+  mv training.log checkpoints/
+  cp "$SCRIPT_NAME" example.csv checkpoints/
+
+  SCRIPT_BASE=$(basename "$SCRIPT_NAME" .py)
+
+  zip -r "checkpoints_$(date +%Y%m%d)_${SCRIPT_BASE}${FLAG_SUFFIX}.zip" checkpoints/
+  rm -rf checkpoints
+done

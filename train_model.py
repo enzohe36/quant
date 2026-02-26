@@ -73,7 +73,7 @@ class Config:
     d_ff: int = 512
     n_heads: int = 8
     n_layers: int = 3
-    dropout: float = 0.1
+    dropout: float = 0.0
     market_dropout: float = 0.0
     position_dim: int = 16
     head_hidden_dim: int = 128
@@ -105,10 +105,13 @@ class Config:
     seed: int = 42
 
     # Numerical
-    reward_clip: float = 10.0
+    reward_clip: float = 0.225
     reward_ema_decay: float = 0.99
     pytorch_eps: float = 1e-8
     use_amp: bool = True
+
+    # Diagnostics
+    diagnostic: bool = True
 
     # Position histogram
     position_bins: int = 50
@@ -197,6 +200,9 @@ class VecEnv:
 
 # Reward normalizer
 
+_NORMALIZED_CLIP = 10.0  # safety bound in normalized space (essentially inactive)
+
+
 class RewardNormalizer:
     """EMA reward normalizer for non-stationary reward scaling.
 
@@ -206,8 +212,7 @@ class RewardNormalizer:
     policy improves, unlike a monotonically accumulating estimator.
     """
 
-    def __init__(self, clip, eps, decay):
-        self.clip = clip
+    def __init__(self, eps, decay):
         self.eps = eps
         self.decay = decay
         self.mean_sq = 1.0
@@ -245,7 +250,7 @@ class RewardNormalizer:
             return rewards
         std = np.sqrt(self.mean_sq + self.eps)
         return np.clip(
-            rewards / std, -self.clip, self.clip,
+            rewards / std, -_NORMALIZED_CLIP, _NORMALIZED_CLIP,
         ).astype(np.float32)
 
     def state_dict(self):
@@ -322,11 +327,15 @@ class PolicyNetwork(nn.Module):
         head_input_dim = cfg.d_model + cfg.position_dim
 
         self.policy_head = nn.Sequential(
-            nn.Linear(head_input_dim, cfg.head_hidden_dim), nn.ReLU(), nn.Linear(cfg.head_hidden_dim, 1),
+            nn.Linear(head_input_dim, cfg.head_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(cfg.head_hidden_dim, 1),
         )
         self.log_std = nn.Parameter(torch.tensor(cfg.log_std_init))
         self.value_head = nn.Sequential(
-            nn.Linear(head_input_dim, cfg.head_hidden_dim), nn.ReLU(), nn.Linear(cfg.head_hidden_dim, 1),
+            nn.Linear(head_input_dim, cfg.head_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(cfg.head_hidden_dim, 1),
         )
 
     def forward(self, x, position):
@@ -519,10 +528,7 @@ class RolloutBuffer:
 # Data loading
 
 def _read_csv(path, **kwargs):
-    try:
-        return pd.read_csv(path, engine="pyarrow", **kwargs)
-    except ImportError:
-        return pd.read_csv(path, **kwargs)
+    return pd.read_csv(path, engine="pyarrow", **kwargs)
 
 
 @timed
@@ -704,6 +710,10 @@ def collect_training_rollout(model, episodes, cfg, global_market_features,
     model_return = float(compute_episode_returns(rollout.rewards).mean())
     baseline_return = float(compute_episode_returns(baseline_rewards).mean())
 
+    # Clip raw rewards to protect against data anomalies
+    rollout.rewards = np.clip(rollout.rewards, -cfg.reward_clip, cfg.reward_clip)
+
+    # EMA update and normalize (after raw clip, so EMA tracks clipped distribution)
     if distributed:
         reward_normalizer.update_distributed(rollout.rewards, cfg.device)
     else:
@@ -811,7 +821,60 @@ def evaluate_ablated(model, episodes, cfg, global_market_features):
     }
 
 
+# Gradient diagnostics
+
+def diagnose_gradient_contributions(model, batch, cfg, entropy_coeff):
+    """Run separate backward passes to measure each loss term's gradient norm.
+
+    Uses the base model (unwrapped from DDP) in full precision to avoid
+    DDP synchronisation and AMP scaling artifacts.
+    """
+    base_model = model.module if hasattr(model, "module") else model
+    base_model.zero_grad()
+
+    with torch.amp.autocast("cuda", enabled=False):
+        states = batch["states"].float()
+        raw_actions = batch["raw_actions"].float()
+        positions = batch["positions"].float()
+        log_probs_old = batch["log_probs"].float()
+        advantages = batch["advantages"].float()
+        returns = batch["returns"].float()
+
+        new_log_probs, entropy, new_values = evaluate_actions(
+            base_model, states, raw_actions, positions,
+        )
+        ratio = torch.exp(new_log_probs - log_probs_old)
+        surrogate = torch.min(
+            ratio * advantages,
+            torch.clamp(ratio, 1 - cfg.policy_clip, 1 + cfg.policy_clip)
+            * advantages,
+        )
+        policy_loss = -surrogate.mean()
+        value_loss = cfg.value_coeff * F.mse_loss(new_values, returns)
+        entropy_loss = -entropy_coeff * entropy.mean()
+
+    norms = {}
+    for name, loss in [
+        ("policy", policy_loss),
+        ("value", value_loss),
+    ]:
+        base_model.zero_grad()
+        loss.backward(retain_graph=True)
+        total = 0.0
+        for p in base_model.parameters():
+            if p.grad is not None:
+                total += p.grad.data.norm(2).item() ** 2
+        norms[name] = total ** 0.5
+
+    base_model.zero_grad()
+    return norms
+
+
 # PPO update
+
+_VALUE_ERROR_BINS = 50
+_VALUE_ERROR_RANGE = (-3.0, 3.0)
+
 
 def run_ppo_update(model, optimizer, scaler, rollout, cfg, n_local_transitions,
                    n_padded_transitions, entropy_coeff):
@@ -827,19 +890,12 @@ def run_ppo_update(model, optimizer, scaler, rollout, cfg, n_local_transitions,
     policy_loss_sum = value_loss_sum = entropy_sum = 0.0
     clip_fraction_sum = approx_kl_sum = 0.0
     grad_norm_sum = 0.0
-    explained_var_num = explained_var_den = 0.0
+    grad_norm_count = 0
+    skipped_batches = 0
+    all_ratios = []
+    value_error_hist = np.zeros(_VALUE_ERROR_BINS, dtype=np.float64)
     n_batches = 0
     amp_enabled = cfg.use_amp and cfg.device.startswith("cuda")
-
-    # Global return mean for explained variance
-    global_ret_mean = float(rollout._flat_returns[:n_local_transitions].mean())
-    if _world > 1:
-        ret_stats = torch.tensor(
-            [global_ret_mean * n_local_transitions, float(n_local_transitions)],
-            device=cfg.device, dtype=torch.float64,
-        )
-        dist.all_reduce(ret_stats)
-        global_ret_mean = ret_stats[0].item() / ret_stats[1].item()
 
     permutation = torch.randperm(n_padded_transitions, device=cfg.device)
     if n_local_transitions < n_padded_transitions:
@@ -860,6 +916,15 @@ def run_ppo_update(model, optimizer, scaler, rollout, cfg, n_local_transitions,
             ratio = torch.exp(new_log_probs - batch["log_probs"])
             advantages = batch["advantages"]
 
+            with torch.no_grad():
+                if valid_mask is not None:
+                    bw = valid_mask[batch_start:batch_end]
+                    valid_ratios = ratio[bw]
+                    if valid_ratios.numel() > 0:
+                        all_ratios.append(valid_ratios.cpu())
+                else:
+                    all_ratios.append(ratio.cpu())
+
             surrogate = torch.min(
                 ratio * advantages,
                 torch.clamp(ratio, 1 - cfg.policy_clip, 1 + cfg.policy_clip) * advantages,
@@ -874,7 +939,6 @@ def run_ppo_update(model, optimizer, scaler, rollout, cfg, n_local_transitions,
                     * batch_weight
                 ).sum() / n_valid
                 entropy_term = (entropy * batch_weight).sum() / n_valid
-                # Diagnostics with masking
                 clipped = ((ratio - 1.0).abs() > cfg.policy_clip).float()
                 clip_frac = (clipped * batch_weight).sum() / n_valid
                 approx_kl_batch = ((ratio - 1.0 - ratio.log()) * batch_weight).sum() / n_valid
@@ -896,36 +960,39 @@ def run_ppo_update(model, optimizer, scaler, rollout, cfg, n_local_transitions,
         scaler.scale(total_loss).backward()
         scaler.unscale_(optimizer)
         grad_norm = nn.utils.clip_grad_norm_(base_model.parameters(), cfg.grad_clip)
+        grad_norm_val = grad_norm.item()
+        if math.isinf(grad_norm_val):
+            skipped_batches += 1
         scaler.step(optimizer)
         scaler.update()
 
-        # Explained variance components (accumulate across batches)
+        # Value error histogram (in normalized reward space)
         with torch.no_grad():
-            batch_returns = batch["returns"]
-            batch_values = new_values.detach()
-            residual = batch_returns - batch_values
+            residual = (new_values - batch["returns"]).float().cpu().numpy()
             if valid_mask is not None:
-                bw = valid_mask[batch_start:batch_end].float()
-                explained_var_num += ((residual ** 2) * bw).sum().item()
-                explained_var_den += (((batch_returns - global_ret_mean) ** 2) * bw).sum().item()
-            else:
-                explained_var_num += (residual ** 2).sum().item()
-                explained_var_den += ((batch_returns - global_ret_mean) ** 2).sum().item()
+                bw_np = valid_mask[batch_start:batch_end].cpu().numpy().astype(bool)
+                residual = residual[bw_np]
+            hist, _ = np.histogram(
+                residual, bins=_VALUE_ERROR_BINS, range=_VALUE_ERROR_RANGE,
+            )
+            value_error_hist += hist.astype(np.float64)
 
         policy_loss_sum += policy_loss.item()
         value_loss_sum += value_loss.item()
         entropy_sum += entropy_term.item()
         clip_fraction_sum += clip_frac.item()
         approx_kl_sum += approx_kl_batch.item()
-        grad_norm_sum += grad_norm.item()
+        if not math.isinf(grad_norm_val):
+            grad_norm_sum += grad_norm_val
+            grad_norm_count += 1
         n_batches += 1
 
     if _world > 1:
         sync_tensor = torch.tensor(
             [policy_loss_sum, value_loss_sum, entropy_sum,
              clip_fraction_sum, approx_kl_sum, grad_norm_sum,
-             explained_var_num, explained_var_den,
-             float(n_batches)],
+             float(n_batches), float(skipped_batches),
+             float(grad_norm_count)],
             device=cfg.device,
         )
         dist.all_reduce(sync_tensor)
@@ -935,22 +1002,48 @@ def run_ppo_update(model, optimizer, scaler, rollout, cfg, n_local_transitions,
         clip_fraction_sum = sync_tensor[3].item()
         approx_kl_sum = sync_tensor[4].item()
         grad_norm_sum = sync_tensor[5].item()
-        explained_var_num = sync_tensor[6].item()
-        explained_var_den = sync_tensor[7].item()
-        n_batches = int(sync_tensor[8].item())
+        n_batches = int(sync_tensor[6].item())
+        skipped_batches = int(sync_tensor[7].item())
+        grad_norm_count = int(sync_tensor[8].item())
+
+        # All-reduce value error histogram
+        hist_tensor = torch.tensor(value_error_hist, device=cfg.device, dtype=torch.float64)
+        dist.all_reduce(hist_tensor)
+        value_error_hist = hist_tensor.cpu().numpy()
+
+    # Compute p99 ratio from collected ratios
+    if all_ratios:
+        all_ratios = torch.cat(all_ratios)
+        if _world > 1:
+            local_size = torch.tensor([all_ratios.numel()], device=cfg.device)
+            all_sizes = [torch.zeros(1, device=cfg.device, dtype=torch.long) for _ in range(_world)]
+            dist.all_gather(all_sizes, local_size.long())
+            max_size = max(s.item() for s in all_sizes)
+            padded = torch.zeros(max_size, device=cfg.device)
+            padded[:all_ratios.numel()] = all_ratios.to(cfg.device)
+            gathered = [torch.zeros(max_size, device=cfg.device) for _ in range(_world)]
+            dist.all_gather(gathered, padded)
+            global_ratios = torch.cat([
+                gathered[i][:all_sizes[i].item()] for i in range(_world)
+            ])
+            p99_ratio = torch.quantile(global_ratios, 0.99).item()
+        else:
+            p99_ratio = torch.quantile(all_ratios, 0.99).item()
+    else:
+        p99_ratio = 0.0
 
     n_batches = max(n_batches, 1)
-    explained_variance = (
-        1.0 - explained_var_num / max(explained_var_den, 1e-8)
-    )
     return {
         "policy_loss": policy_loss_sum / n_batches,
         "value_loss": value_loss_sum / n_batches,
         "entropy": entropy_sum / n_batches,
         "clip_fraction": clip_fraction_sum / n_batches,
         "approx_kl": approx_kl_sum / n_batches,
-        "grad_norm": grad_norm_sum / n_batches,
-        "explained_variance": explained_variance,
+        "grad_norm": grad_norm_sum / max(grad_norm_count, 1),
+        "p99_ratio": p99_ratio,
+        "value_error_histogram": value_error_hist,
+        "skipped_batches": skipped_batches,
+        "total_batches": n_batches,
     }
 
 
@@ -1078,13 +1171,36 @@ def _gather_test_arrays(test_result, n_local, n_total, episode_length, device):
 
 # Plotting and checkpointing
 
+def _plot_heatmap(ax, fig, hist_list, n_bins, y_range, xlabel, ylabel, title, cmap="viridis"):
+    """Plot a frequency heatmap from a list of per-epoch histograms."""
+    if not hist_list:
+        ax.set_visible(False)
+        return
+    heatmap_data = np.array(hist_list).T  # (n_bins, n_epochs)
+    col_sums = heatmap_data.sum(axis=0, keepdims=True)
+    col_sums = np.where(col_sums > 0, col_sums, 1.0)
+    heatmap_data = heatmap_data / col_sums
+    im = ax.imshow(
+        heatmap_data,
+        aspect="auto",
+        origin="lower",
+        extent=[1, len(hist_list), y_range[0], y_range[1]],
+        cmap=cmap,
+        interpolation="nearest",
+    )
+    fig.colorbar(im, ax=ax, label="Frequency")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+
+
 @timed
 def plot_training(history, path, cfg):
-    """Plot training curves on a 3x4 grid.
+    """Plot training curves on a 3x5 grid.
 
-    Row 1: policy loss, value loss, entropy, gradient norm
-    Row 2: clip fraction, approx KL, explained variance, episode return
-    Row 3: val beat rate, val max drawdown, val turnover, position heatmap
+    Row 1 (returns + behavior): episode return, beat rate, max drawdown, turnover, position heatmap
+    Row 2 (loss + PPO stability): policy loss, value loss, entropy, clip fraction, approx KL
+    Row 3 (gradient health): p99 ratio, value error heatmap, gradient norms, loss scale, skip rate
     """
     from matplotlib.ticker import MaxNLocator
 
@@ -1092,116 +1208,130 @@ def plot_training(history, path, cfg):
     C_VAL = "r"
     C_NO_MARKET = "darkorange"
     C_NO_STOCK = "purple"
+    C_POLICY = "#2196F3"
+    C_VALUE = "#F44336"
+    C_ENTROPY = "#4CAF50"
 
     epochs = range(1, len(history["policy_loss"]) + 1)
-    fig, axes = plt.subplots(3, 4, figsize=(24, 15))
+    fig, axes = plt.subplots(3, 5, figsize=(30, 15))
 
-    # Row 1: PPO diagnostics
-    axes[0, 0].plot(epochs, history["policy_loss"], color=C_TRAIN, alpha=0.8)
-    axes[0, 0].set_ylabel("Loss")
-    axes[0, 0].set_title("Policy Loss")
-    axes[0, 0].grid(True, alpha=0.3)
-
-    axes[0, 1].plot(epochs, history["value_loss"], color=C_TRAIN, alpha=0.8)
-    axes[0, 1].set_ylabel("Loss")
-    axes[0, 1].set_title("Value Loss")
-    axes[0, 1].grid(True, alpha=0.3)
-
-    axes[0, 2].plot(epochs, history["entropy"], color=C_TRAIN, alpha=0.8)
-    axes[0, 2].set_ylabel("Entropy")
-    axes[0, 2].set_title("Entropy")
-    axes[0, 2].grid(True, alpha=0.3)
-
-    axes[0, 3].plot(epochs, history["grad_norm"], color=C_TRAIN, alpha=0.8)
-    axes[0, 3].set_ylabel("Gradient Norm")
-    axes[0, 3].set_title("Gradient Norm")
-    axes[0, 3].grid(True, alpha=0.3)
-
-    # Row 2: PPO diagnostics (cont) + returns
-    axes[1, 0].plot(epochs, history["clip_fraction"], color=C_TRAIN, alpha=0.8)
-    axes[1, 0].set_ylabel("Clip Fraction")
-    axes[1, 0].set_title("Clip Fraction")
-    axes[1, 0].set_ylim(bottom=0)
-    axes[1, 0].grid(True, alpha=0.3)
-
-    axes[1, 1].plot(epochs, history["approx_kl"], color=C_TRAIN, alpha=0.8)
-    axes[1, 1].set_ylabel("Approx KL")
-    axes[1, 1].set_title("Approx KL")
-    axes[1, 1].set_ylim(bottom=0)
-    axes[1, 1].grid(True, alpha=0.3)
-
-    axes[1, 2].plot(epochs, history["explained_variance"], color=C_TRAIN, alpha=0.8)
-    axes[1, 2].set_ylabel("Explained Variance")
-    axes[1, 2].set_title("Explained Variance")
-    axes[1, 2].axhline(y=0, color="gray", linestyle="--", alpha=0.5)
-    axes[1, 2].grid(True, alpha=0.3)
-
+    # Row 1 — Performance
     ablation_epochs = history.get("ablation_epochs", [])
-    axes[1, 3].plot(epochs, history["train_return"], color=C_TRAIN, label="Train return", alpha=0.8)
-    axes[1, 3].plot(epochs, history["train_baseline"], color=C_TRAIN, linestyle="--", label="Train baseline", alpha=0.5)
-    axes[1, 3].plot(epochs, history["val_return"], color=C_VAL, label="Val return", alpha=0.8)
-    axes[1, 3].plot(epochs, history["val_baseline"], color=C_VAL, linestyle="--", label="Val baseline", alpha=0.5)
+    axes[0, 0].plot(epochs, history["train_return"], color=C_TRAIN, label="Train return", alpha=0.8)
+    axes[0, 0].plot(epochs, history["train_baseline"], color=C_TRAIN, linestyle="--", label="Train baseline", alpha=0.5)
+    axes[0, 0].plot(epochs, history["val_return"], color=C_VAL, label="Val return", alpha=0.8)
+    axes[0, 0].plot(epochs, history["val_baseline"], color=C_VAL, linestyle="--", label="Val baseline", alpha=0.5)
     if ablation_epochs:
-        axes[1, 3].plot(
+        axes[0, 0].plot(
             ablation_epochs, history["val_no_market"], color=C_NO_MARKET,
             label="No-market", alpha=0.8,
         )
-        axes[1, 3].plot(
+        axes[0, 0].plot(
             ablation_epochs, history["val_no_stock"], color=C_NO_STOCK,
             label="No-stock", alpha=0.8,
         )
-    axes[1, 3].set_xlabel("Epoch")
-    axes[1, 3].set_ylabel("Return")
-    axes[1, 3].set_title("Episode Return")
-    axes[1, 3].legend(fontsize=7)
+    axes[0, 0].set_ylabel("Return")
+    axes[0, 0].set_title("Episode Return")
+    axes[0, 0].legend(fontsize=7)
+    axes[0, 0].grid(True, alpha=0.3)
+
+    axes[0, 1].plot(epochs, history["val_beat_rate"], color=C_VAL, alpha=0.8)
+    axes[0, 1].set_ylabel("Beat Rate")
+    axes[0, 1].set_title("Val Beat Rate")
+    axes[0, 1].set_ylim(0, 1)
+    axes[0, 1].grid(True, alpha=0.3)
+
+    axes[0, 2].plot(epochs, history["val_max_drawdown"], color=C_VAL, alpha=0.8)
+    axes[0, 2].set_ylabel("Max Drawdown")
+    axes[0, 2].set_title("Val Max Drawdown")
+    axes[0, 2].grid(True, alpha=0.3)
+
+    axes[0, 3].plot(epochs, history["val_turnover"], color=C_VAL, alpha=0.8)
+    axes[0, 3].set_ylabel("Turnover")
+    axes[0, 3].set_title("Val Turnover")
+    axes[0, 3].grid(True, alpha=0.3)
+
+    _plot_heatmap(
+        axes[0, 4], fig,
+        history.get("position_histogram", []),
+        cfg.position_bins, (-1.0, 1.0),
+        "Epoch", "Position", "Position Distribution",
+    )
+
+    # Row 2 — Loss + PPO stability
+    axes[1, 0].plot(epochs, history["policy_loss"], color=C_TRAIN, alpha=0.8)
+    axes[1, 0].set_ylabel("Loss")
+    axes[1, 0].set_title("Policy Loss")
+    axes[1, 0].grid(True, alpha=0.3)
+
+    axes[1, 1].plot(epochs, history["value_loss"], color=C_TRAIN, alpha=0.8)
+    axes[1, 1].set_ylabel("Loss")
+    axes[1, 1].set_title("Value Loss")
+    axes[1, 1].grid(True, alpha=0.3)
+
+    axes[1, 2].plot(epochs, history["entropy"], color=C_TRAIN, alpha=0.8)
+    axes[1, 2].set_ylabel("Entropy")
+    axes[1, 2].set_title("Entropy")
+    axes[1, 2].grid(True, alpha=0.3)
+
+    axes[1, 3].plot(epochs, history["clip_fraction"], color=C_TRAIN, alpha=0.8)
+    axes[1, 3].set_ylabel("Clip Fraction")
+    axes[1, 3].set_title("Clip Fraction")
     axes[1, 3].grid(True, alpha=0.3)
 
-    # Row 3: Validation behavior
-    axes[2, 0].plot(epochs, history["val_beat_rate"], color=C_VAL, alpha=0.8)
+    axes[1, 4].plot(epochs, history["approx_kl"], color=C_TRAIN, alpha=0.8)
+    axes[1, 4].set_ylabel("Approx KL")
+    axes[1, 4].set_title("Approx KL")
+    axes[1, 4].grid(True, alpha=0.3)
+
+    # Row 3 — Gradient health
+    axes[2, 0].plot(epochs, history["p99_ratio"], color=C_TRAIN, alpha=0.8)
     axes[2, 0].set_xlabel("Epoch")
-    axes[2, 0].set_ylabel("Val Beat Rate")
-    axes[2, 0].set_title("Val Beat Rate")
-    axes[2, 0].set_ylim(0, 1)
+    axes[2, 0].set_ylabel("P99 Ratio")
+    axes[2, 0].set_title("P99 Ratio")
     axes[2, 0].grid(True, alpha=0.3)
 
-    axes[2, 1].plot(epochs, history["val_max_drawdown"], color=C_VAL, alpha=0.8)
-    axes[2, 1].set_xlabel("Epoch")
-    axes[2, 1].set_ylabel("Val Max Drawdown")
-    axes[2, 1].set_title("Val Max Drawdown")
-    axes[2, 1].set_ylim(bottom=0)
-    axes[2, 1].grid(True, alpha=0.3)
+    _plot_heatmap(
+        axes[2, 1], fig,
+        history.get("value_error_histogram", []),
+        _VALUE_ERROR_BINS, _VALUE_ERROR_RANGE,
+        "Epoch", "Pred − Target", "Value Error Distribution",
+        cmap="RdBu_r",
+    )
 
-    axes[2, 2].plot(epochs, history["val_turnover"], color=C_VAL, alpha=0.8)
+    # Gradient norms (total + per-term combined)
+    axes[2, 2].plot(epochs, history["grad_norm"], color=C_TRAIN, label="Total", alpha=0.8)
+    has_grad_diag = (
+        len(history.get("grad_norm_policy", [])) > 0
+        and len(history["grad_norm_policy"]) == len(history["policy_loss"])
+    )
+    if has_grad_diag:
+        diag_epochs = range(1, len(history["grad_norm_policy"]) + 1)
+        axes[2, 2].plot(diag_epochs, history["grad_norm_policy"], color=C_POLICY, label="Policy", alpha=0.7)
+        axes[2, 2].plot(diag_epochs, history["grad_norm_value"], color=C_VALUE, label="Value", alpha=0.7)
     axes[2, 2].set_xlabel("Epoch")
-    axes[2, 2].set_ylabel("Val Turnover")
-    axes[2, 2].set_title("Val Turnover")
-    axes[2, 2].set_ylim(bottom=0)
+    axes[2, 2].set_ylabel("Gradient Norm")
+    axes[2, 2].set_title("Gradient Norms")
+    axes[2, 2].legend(fontsize=7)
+    axes[2, 2].set_yscale("log")
     axes[2, 2].grid(True, alpha=0.3)
 
-    # Position distribution heatmap
-    pos_hists = history.get("position_histogram", [])
-    if pos_hists:
-        n_bins = cfg.position_bins
-        heatmap_data = np.array(pos_hists).T  # (n_bins, n_epochs)
-        # Normalize each column to get frequency
-        col_sums = heatmap_data.sum(axis=0, keepdims=True)
-        col_sums = np.where(col_sums > 0, col_sums, 1.0)
-        heatmap_data = heatmap_data / col_sums
-        im = axes[2, 3].imshow(
-            heatmap_data,
-            aspect="auto",
-            origin="lower",
-            extent=[1, len(pos_hists), -1, 1],
-            cmap="viridis",
-            interpolation="nearest",
-        )
-        fig.colorbar(im, ax=axes[2, 3], label="Frequency")
+    axes[2, 3].plot(epochs, history["loss_scale"], color=C_TRAIN, alpha=0.8)
     axes[2, 3].set_xlabel("Epoch")
-    axes[2, 3].set_ylabel("Position")
-    axes[2, 3].set_title("Position Distribution")
+    axes[2, 3].set_ylabel("Loss Scale")
+    axes[2, 3].set_title("Loss Scale")
+    axes[2, 3].set_yscale("log")
+    axes[2, 3].grid(True, alpha=0.3)
+
+    axes[2, 4].bar(list(epochs), history["skip_rate"], color=C_VAL, alpha=0.6, width=0.8)
+    axes[2, 4].set_xlabel("Epoch")
+    axes[2, 4].set_ylabel("Skip Rate")
+    axes[2, 4].set_title("Skip Rate")
+    axes[2, 4].grid(True, alpha=0.3)
 
     for ax in axes.flat:
-        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        if ax.get_visible():
+            ax.xaxis.set_major_locator(MaxNLocator(integer=True))
 
     plt.tight_layout()
     plt.savefig(path, dpi=150, bbox_inches="tight")
@@ -1279,6 +1409,8 @@ def train(cfg):
         stock_groups, market_groups,
         stock_feature_indices, market_feature_indices, cfg,
     ).to(cfg.device)
+    if cfg.device.startswith("cuda"):
+        base_model = torch.compile(base_model)
     model = base_model
     if distributed:
         model = DDP(base_model, device_ids=[int(os.environ["LOCAL_RANK"])])
@@ -1310,9 +1442,7 @@ def train(cfg):
         ],
         lr=effective_lr, eps=1e-5
     )
-    reward_normalizer = RewardNormalizer(
-        cfg.reward_clip, cfg.pytorch_eps, cfg.reward_ema_decay,
-    )
+    reward_normalizer = RewardNormalizer(cfg.pytorch_eps, cfg.reward_ema_decay)
     amp_enabled = cfg.use_amp and cfg.device.startswith("cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     _log(f"    {'Decay params':<20s}: {sum(p.numel() for p in decay_params):,}")
@@ -1325,7 +1455,7 @@ def train(cfg):
         _log(f"    {'Scaled LR':<20s}: {effective_lr:.2e}")
 
     history = defaultdict(list)
-    best_smoothed_score = -float("inf")
+    best_score = -float("inf")
     patience_counter = 0
     start_epoch = 1
 
@@ -1347,21 +1477,20 @@ def train(cfg):
         for key, vals in ckpt.get("history", {}).items():
             history[key] = list(vals)
 
-        val_scores = history.get("val_score", [])
-        if val_scores:
+        val_returns = history.get("val_return", [])
+        if val_returns:
             window = cfg.patience_smoothing
-            best_smoothed_score = max(
-                float(np.mean(val_scores[max(0, i + 1 - window) : i + 1]))
-                for i in range(len(val_scores))
+            best_score = max(
+                float(np.mean(val_returns[max(0, i + 1 - window) : i + 1]))
+                for i in range(len(val_returns))
             )
         else:
-            best_smoothed_score = ckpt.get("best_smoothed_score",
-                                           ckpt.get("best_smoothed_return", -float("inf")))
+            best_score = ckpt.get("best_score", -float("inf"))
 
         _log()
         _log(
             f"Resumed from epoch {ckpt['epoch']}"
-            f" (best smoothed {best_smoothed_score:.4f},"
+            f" (best score {best_score:.4f},"
             f" patience {patience_counter})"
         )
 
@@ -1382,7 +1511,7 @@ def train(cfg):
             "stock_indices": stock_feature_indices,
             "market_indices": market_feature_indices,
             "epoch": epoch,
-            "best_smoothed_score": best_smoothed_score,
+            "best_score": best_score,
             "patience_counter": patience_counter,
             "reward_normalizer": reward_normalizer.state_dict(),
             "scaler": scaler.state_dict(),
@@ -1400,6 +1529,8 @@ def train(cfg):
         )
 
         epoch_start = time.perf_counter()
+        _log()
+        _log(f"[Epoch {epoch}/{cfg.n_epochs}]")
 
         epoch_rng = np.random.default_rng(cfg.seed + epoch * 7919)
         train_episodes = generate_episodes(train_data, cfg, epoch_rng)
@@ -1431,11 +1562,26 @@ def train(cfg):
         else:
             n_padded_transitions = n_local_transitions
 
+        # Gradient diagnostics (before PPO updates, on a fresh batch)
+        grad_contrib = None
+        if cfg.diagnostic:
+            diag_n = min(cfg.batch_size, n_local_transitions)
+            diag_indices = np.random.choice(
+                n_local_transitions, diag_n, replace=False,
+            )
+            diag_batch = rollout.get_batch(diag_indices, cfg.device)
+            grad_contrib = diagnose_gradient_contributions(
+                model, diag_batch, cfg, current_entropy_coeff,
+            )
+
         epoch_losses = {
             "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0,
-            "clip_fraction": 0.0, "approx_kl": 0.0,
-            "grad_norm": 0.0, "explained_variance": 0.0,
+            "clip_fraction": 0.0, "approx_kl": 0.0, "grad_norm": 0.0,
         }
+        epoch_p99_ratio = 0.0
+        epoch_value_error_hist = np.zeros(_VALUE_ERROR_BINS, dtype=np.float64)
+        epoch_skipped = 0
+        epoch_total = 0
         for _ in range(cfg.ppo_epochs):
             losses = run_ppo_update(
                 model, optimizer, scaler, rollout, cfg,
@@ -1444,8 +1590,14 @@ def train(cfg):
             )
             for k in epoch_losses:
                 epoch_losses[k] += losses[k]
+            epoch_p99_ratio = max(epoch_p99_ratio, losses["p99_ratio"])
+            epoch_value_error_hist += losses["value_error_histogram"]
+            epoch_skipped += losses["skipped_batches"]
+            epoch_total += losses["total_batches"]
         for k in epoch_losses:
             epoch_losses[k] /= cfg.ppo_epochs
+        skip_rate = epoch_skipped / max(epoch_total, 1)
+        loss_scale = scaler.get_scale()
 
         del rollout
         if cfg.device.startswith("cuda"):
@@ -1486,42 +1638,47 @@ def train(cfg):
             ("val_turnover", val_aggregated["mean_turnover"]),
             ("policy_loss", epoch_losses["policy_loss"]),
             ("value_loss", epoch_losses["value_loss"]),
+            ("entropy", epoch_losses["entropy"]),
             ("clip_fraction", epoch_losses["clip_fraction"]),
             ("approx_kl", epoch_losses["approx_kl"]),
-            ("explained_variance", epoch_losses["explained_variance"]),
             ("grad_norm", epoch_losses["grad_norm"]),
-            ("entropy", epoch_losses["entropy"]),
+            ("p99_ratio", epoch_p99_ratio),
+            ("loss_scale", loss_scale),
+            ("skip_rate", skip_rate),
         ]:
             history[key].append(value)
 
-        # Position histogram from validation
+        if grad_contrib is not None:
+            history["grad_norm_policy"].append(grad_contrib["policy"])
+            history["grad_norm_value"].append(grad_contrib["value"])
+
+        # Histograms
         history["position_histogram"].append(
             val_aggregated["position_histogram"]
             if "position_histogram" in val_aggregated
             else np.zeros(cfg.position_bins, dtype=np.float64)
         )
-
-        val_mdd = val_aggregated["max_drawdown"]
-        val_ret = val_aggregated["model_return"]
-        val_score = val_ret ** 2 / max(val_mdd, cfg.pytorch_eps)
-        history["val_score"].append(val_score)
+        history["value_error_histogram"].append(epoch_value_error_hist)
 
         window = cfg.patience_smoothing
-        recent_scores = history["val_score"][-window:]
-        smoothed_val_score = float(np.mean(recent_scores))
+        recent_returns = history["val_return"][-window:]
+        current_score = float(np.mean(recent_returns))
 
-        improved = smoothed_val_score > best_smoothed_score
+        improved = current_score > best_score
         if improved:
-            best_smoothed_score = smoothed_val_score
+            best_score = current_score
             patience_counter = 0
         else:
             patience_counter += 1
 
         elapsed = time.perf_counter() - epoch_start
-        _log()
-        _log(f"[Epoch {epoch}/{cfg.n_epochs}] ({elapsed:.1f}s)")
+
+        # Episodes
         _log(f"    {'Train episodes':<20s}: {len(train_episodes)}")
         _log(f"    {'Val episodes':<20s}: {len(val_episodes)}")
+
+        # Returns + Behavior
+        _log()
         _log(f"    {'Train return':<20s}: {model_return:.4f}")
         _log(f"    {'Train baseline':<20s}: {baseline_return:.4f}")
         _log(f"    {'Val return':<20s}: {val_aggregated['model_return']:.4f}")
@@ -1529,22 +1686,39 @@ def train(cfg):
         if run_ablation:
             _log(f"    {'Val no-market':<20s}: {ablation_aggregated['no_market']:.4f}")
             _log(f"    {'Val no-stock':<20s}: {ablation_aggregated['no_stock']:.4f}")
-        _log(f"    {'Val beat rate':<20s}: {val_aggregated['beat_rate']:.4f}")
+        _log(f"    {'Val beat rate':<20s}: {val_aggregated['beat_rate']:.1%}")
         _log(f"    {'Val max drawdown':<20s}: {val_aggregated['max_drawdown']:.4f}")
         _log(f"    {'Val turnover':<20s}: {val_aggregated['mean_turnover']:.4f}")
+
+        # Loss + PPO stability
+        _log()
         _log(f"    {'Policy loss':<20s}: {epoch_losses['policy_loss']:.4f}")
         _log(f"    {'Value loss':<20s}: {epoch_losses['value_loss']:.4f}")
+        _log(f"    {'Entropy':<20s}: {epoch_losses['entropy']:.4f}")
         _log(f"    {'Clip fraction':<20s}: {epoch_losses['clip_fraction']:.4f}")
         _log(f"    {'Approx KL':<20s}: {epoch_losses['approx_kl']:.4f}")
-        _log(f"    {'Explained variance':<20s}: {epoch_losses['explained_variance']:.4f}")
+        _log(f"    {'P99 ratio':<20s}: {epoch_p99_ratio:.4f}")
+
+        # Gradient health
+        _log()
         _log(f"    {'Gradient norm':<20s}: {epoch_losses['grad_norm']:.4f}")
-        _log(f"    {'Entropy':<20s}: {epoch_losses['entropy']:.4f}")
+        if grad_contrib is not None:
+            _log(f"    {'Policy grad norm':<20s}: {grad_contrib['policy']:.4f}")
+            _log(f"    {'Value grad norm':<20s}: {grad_contrib['value']:.4f}")
+        _log(f"    {'Loss scale':<20s}: {loss_scale:.1f}")
+        _log(f"    {'Skip rate':<20s}: {skip_rate:.1%} ({epoch_skipped}/{epoch_total})")
+
+        # Schedule
+        _log()
         _log(f"    {'LR':<20s}: {current_lr:.2e}")
         _log(f"    {'Entropy coeff':<20s}: {current_entropy_coeff:.4f}")
-        _log(f"    {'Val score':<20s}: {val_score:.4f}")
-        _log(f"    {'Val score smoothed':<20s}: {smoothed_val_score:.4f}")
-        _log(f"    {'Best smoothed':<20s}: {best_smoothed_score:.4f}")
+
+        # Early stopping
+        _log()
+        _log(f"    {'Current score':<20s}: {current_score:.4f}")
+        _log(f"    {'Best score':<20s}: {best_score:.4f}")
         _log(f"    {'Patience':<20s}: {patience_counter}/{cfg.patience}")
+        _log(f"    {'Elapsed':<20s}: {elapsed:.1f}s")
 
         if is_main:
             ckpt = _build_checkpoint()
@@ -1565,7 +1739,7 @@ def train(cfg):
             break
 
     _log()
-    _log(f"Training complete, best smoothed val score: {best_smoothed_score:.4f}")
+    _log(f"Training complete, best score: {best_score:.4f}")
 
     best_path = os.path.join(cfg.save_dir, "model_best.pt")
     if os.path.exists(best_path):
@@ -1592,7 +1766,7 @@ def train(cfg):
     _log(f"    {'Test episodes':<20s}: {len(test_episodes)}")
     _log(f"    {'Test return':<20s}: {test_aggregated['model_return']:.4f}")
     _log(f"    {'Test baseline':<20s}: {test_aggregated['baseline_return']:.4f}")
-    _log(f"    {'Test beat rate':<20s}: {test_aggregated['beat_rate']:.4f}")
+    _log(f"    {'Test beat rate':<20s}: {test_aggregated['beat_rate']:.1%}")
     _log(f"    {'Test max drawdown':<20s}: {test_aggregated['max_drawdown']:.4f}")
     _log(f"    {'Test turnover':<20s}: {test_aggregated['mean_turnover']:.4f}")
 
@@ -1637,11 +1811,17 @@ def main():
     cfg = Config()
     parser = argparse.ArgumentParser(description="PPO + Transformer RL for stock trading")
 
+    def _parse_bool(v):
+        if v.lower() not in ("true", "false"):
+            raise argparse.ArgumentTypeError(
+                f"expected 'true' or 'false', got '{v}'")
+        return v.lower() == "true"
+
     for name, ann_type in Config.__annotations__.items():
         default = getattr(cfg, name)
         flag = f"--{name}"
         if ann_type is bool:
-            parser.add_argument(flag, type=lambda v: v.lower() in ("true", "1", "yes"),
+            parser.add_argument(flag, type=_parse_bool,
                                 default=default, metavar="BOOL",
                                 help=f"(default: {default})")
         else:
