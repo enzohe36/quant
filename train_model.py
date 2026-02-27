@@ -7,13 +7,22 @@ Market CSV: date, <mkt_feat_1>, ...  (columns except date start with "mkt_")
 Market features loaded separately, aligned to stock data at each lookback
 window's last date. Features with "mkt_" prefix route through cross-attention.
 
-Continuous position sizing in [-1, 1] with Gaussian + tanh policy.
+Continuous position sizing in [-1, 1] with Beta distribution policy.
+
+Architecture: shared-trunk PolicyNetwork (SB3-style shared feature extractor) with
+transformer trunk. Orthogonal initialization on MLP heads (gain sqrt(2)
+hidden, 0.01 policy output, 1.0 value output).
 
 Launch:
   python train_model.py
   Auto-detects GPUs. Uses DDP when multiple GPUs are available.
   Also works with: torchrun --nproc_per_node=N train_model.py
   Configure all parameters in the Config class.
+
+Hyperparameter sweep:
+  python train_model.py --sweep true
+  Parallel workers: run multiple processes pointing at the same --sweep_db.
+  Monitor with: optuna-dashboard <sweep_db>
 """
 
 import argparse
@@ -22,6 +31,9 @@ import math
 import time
 import socket
 import functools
+import hashlib
+import json
+from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 
 import numpy as np
@@ -56,7 +68,7 @@ def timed(fn):
 
 
 class Config:
-    # Paths
+    # Data
     train_path: str = "train.csv"
     val_path: str = "val.csv"
     test_path: str = "test.csv"
@@ -68,55 +80,57 @@ class Config:
     episode_length: int = 100
     transaction_cost: float = 0.001
 
-    # Model
+    # Architecture
     d_model: int = 256
     d_ff: int = 512
     n_heads: int = 8
     n_layers: int = 3
-    dropout: float = 0.0
-    market_dropout: float = 0.0
-    position_dim: int = 16
     head_hidden_dim: int = 128
-    log_std_init: float = -0.5
+    position_dim: int = 16
+    dropout: float = 0.1
+    market_dropout: float = 0.4
 
     # PPO
     gamma: float = 0.99
     gae_lambda: float = 0.95
     policy_clip: float = 0.2
-    value_coeff: float = 0.5
-    entropy_coeff_start: float = 0.01
-    entropy_coeff_end: float = 0.001
     grad_clip: float = 0.5
+    value_coeff: float = 0.01
+    entropy_coeff: float = 0.1
+    ppo_epochs: int = 2
+    batch_size: int = 4096
 
-    # Regularization
+    # Optimizer
+    lr: float = 1e-4
+    adam_eps: float = 1e-5
     weight_decay: float = 0.02
     xattn_weight_decay: float = 0.05
+    warmup_epochs: int = 5
+
+    # Reward
+    reward_ema_decay: float = 0.99
 
     # Training
     n_epochs: int = 200
-    warmup_epochs: int = 5
-    ppo_epochs: int = 4
-    batch_size: int = 4096
-    inference_batch: int = 65536
-    lr: float = 1e-4
     patience: int = 20
     patience_smoothing: int = 10
-    ablation: bool = True
     seed: int = 42
 
-    # Numerical
-    reward_clip: float = 0.225
-    reward_ema_decay: float = 0.99
-    pytorch_eps: float = 1e-8
+    # Runtime
+    inference_batch: int = 16384
+    env_workers: int = 0
     use_amp: bool = True
+    pytorch_eps: float = 1e-8
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Diagnostics
+    ablation: bool = True
     diagnostic: bool = True
 
-    # Position histogram
-    position_bins: int = 50
-
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    # Sweep
+    sweep: bool = False
+    sweep_trials: int = 100
+    sweep_db: str = "sqlite:///ppo_sweep.db"
 
     def to_dict(self):
         return {k: getattr(self, k) for k in self.__class__.__annotations__}
@@ -198,9 +212,81 @@ class VecEnv:
         return self._build_observation()
 
 
-# Reward normalizer
+# Parallel vectorized environment
 
-_NORMALIZED_CLIP = 10.0  # safety bound in normalized space (essentially inactive)
+
+class ParallelVecEnv:
+    """VecEnv that distributes episodes across worker threads.
+
+    Numpy operations release the GIL, so threads achieve true multi-core
+    parallelism for the observation building (fancy indexing into the global
+    market array) and environment stepping that dominate CPU time during
+    rollout collection. Zero IPC overhead compared to multiprocessing.
+    """
+
+    def __init__(self, episodes, lookback, transaction_cost,
+                 global_market_features, n_workers):
+        n_workers = max(1, min(n_workers, len(episodes)))
+        self.n_envs = len(episodes)
+        self.n_workers = n_workers
+        self._pool = ThreadPoolExecutor(max_workers=n_workers)
+
+        shard_size = math.ceil(len(episodes) / n_workers)
+        shard_ranges = []
+        for i in range(n_workers):
+            start = i * shard_size
+            end = min(start + shard_size, len(episodes))
+            if start >= end:
+                break
+            shard_ranges.append((start, end))
+
+        def _make_shard(start, end):
+            return VecEnv(
+                episodes[start:end], lookback, transaction_cost,
+                global_market_features,
+            )
+
+        futures = [
+            self._pool.submit(_make_shard, s, e) for s, e in shard_ranges
+        ]
+        self._shards = [f.result() for f in futures]
+        self._shard_slices = []
+        offset = 0
+        for s, e in shard_ranges:
+            n = e - s
+            self._shard_slices.append((offset, offset + n))
+            offset += n
+        self.n_workers = len(self._shards)
+
+    def reset(self):
+        futures = [self._pool.submit(s.reset) for s in self._shards]
+        results = [f.result() for f in futures]
+        obs = np.concatenate([r[0] for r in results], axis=0)
+        pos = np.concatenate([r[1] for r in results], axis=0)
+        return obs, pos
+
+    def step(self, actions):
+        futures = [
+            self._pool.submit(shard.step, actions[s:e])
+            for shard, (s, e) in zip(self._shards, self._shard_slices)
+        ]
+        results = [f.result() for f in futures]
+        obs = (np.concatenate([r[0] for r in results], axis=0)
+               if results[0][0] is not None else None)
+        rewards = np.concatenate([r[1] for r in results], axis=0)
+        done = results[0][2]
+        pos = np.concatenate([r[3] for r in results], axis=0)
+        return obs, rewards, done, pos
+
+    def terminal_observation(self):
+        futures = [self._pool.submit(s.terminal_observation) for s in self._shards]
+        return np.concatenate([f.result() for f in futures], axis=0)
+
+    def close(self):
+        self._pool.shutdown(wait=False)
+
+
+# Reward normalizer
 
 
 class RewardNormalizer:
@@ -249,9 +335,7 @@ class RewardNormalizer:
         if not self.initialized:
             return rewards
         std = np.sqrt(self.mean_sq + self.eps)
-        return np.clip(
-            rewards / std, -_NORMALIZED_CLIP, _NORMALIZED_CLIP,
-        ).astype(np.float32)
+        return (rewards / std).astype(np.float32)
 
     def state_dict(self):
         return {"mean_sq": self.mean_sq, "initialized": self.initialized}
@@ -288,7 +372,12 @@ class GroupProjection(nn.Module):
         )
 
 
-class PolicyNetwork(nn.Module):
+class Trunk(nn.Module):
+    """Encoder backbone: group projections, cross-attention, transformer, pooling.
+
+    Shared between policy and value heads (SB3-style shared feature extractor).
+    """
+
     def __init__(self, stock_groups, market_groups, stock_feature_indices,
                  market_feature_indices, cfg):
         super().__init__()
@@ -324,19 +413,10 @@ class PolicyNetwork(nn.Module):
         self.transformer = nn.TransformerEncoder(encoder_layer, cfg.n_layers)
 
         self.position_proj = nn.Linear(1, cfg.position_dim)
-        head_input_dim = cfg.d_model + cfg.position_dim
 
-        self.policy_head = nn.Sequential(
-            nn.Linear(head_input_dim, cfg.head_hidden_dim),
-            nn.ReLU(),
-            nn.Linear(cfg.head_hidden_dim, 1),
-        )
-        self.log_std = nn.Parameter(torch.tensor(cfg.log_std_init))
-        self.value_head = nn.Sequential(
-            nn.Linear(head_input_dim, cfg.head_hidden_dim),
-            nn.ReLU(),
-            nn.Linear(cfg.head_hidden_dim, 1),
-        )
+    @property
+    def output_dim(self):
+        return self.cfg.d_model + self.cfg.position_dim
 
     def forward(self, x, position):
         hidden = self.stock_norm(self.stock_proj(x[..., self.stock_idx])) + self.pos_emb
@@ -355,49 +435,171 @@ class PolicyNetwork(nn.Module):
             hidden = self.xattn_norm(hidden + xattn_out)
         pooled = self.transformer(hidden).mean(dim=1)
         pos_emb = self.position_proj(position.unsqueeze(-1))
-        pooled = torch.cat([pooled, pos_emb], dim=-1)
-        action_mean = self.policy_head(pooled).squeeze(-1)
-        return action_mean, self.log_std, self.value_head(pooled).squeeze(-1)
+        return torch.cat([pooled, pos_emb], dim=-1)
 
 
-def _tanh_log_prob(raw_action, mean, log_std):
-    """Log probability of tanh-squashed Gaussian."""
-    std = log_std.exp()
-    normal_log_prob = (
-        -0.5 * ((raw_action - mean) / std) ** 2
-        - log_std
-        - 0.5 * math.log(2 * math.pi)
+class PolicyNetwork(nn.Module):
+    """Shared-trunk policy network (SB3-style shared feature extractor).
+
+    One transformer trunk (feature extractor) shared between policy and value.
+    Separate MLP heads branch from the pooled trunk output.
+    """
+
+    def __init__(self, stock_groups, market_groups, stock_feature_indices,
+                 market_feature_indices, cfg):
+        super().__init__()
+        self.trunk = Trunk(
+            stock_groups, market_groups,
+            stock_feature_indices, market_feature_indices, cfg,
+        )
+        head_input_dim = self.trunk.output_dim
+        self.policy_head = nn.Sequential(
+            nn.Linear(head_input_dim, cfg.head_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(cfg.head_hidden_dim, 2),
+        )
+        self.value_head = nn.Sequential(
+            nn.Linear(head_input_dim, cfg.head_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(cfg.head_hidden_dim, 1),
+        )
+
+    def forward(self, x, position):
+        pooled = self.trunk(x, position)
+        ab = self.policy_head(pooled)  # (batch, 2)
+        alpha = F.softplus(ab[:, 0]) + 1.0
+        beta = F.softplus(ab[:, 1]) + 1.0
+        values = self.value_head(pooled).squeeze(-1)
+        return alpha, beta, values
+
+
+def _ortho_init(module):
+    """SB3-style orthogonal initialization.
+
+    Hidden linear layers get gain sqrt(2), output layers are identified as the
+    last Linear in each Sequential head and get a role-specific gain:
+      - policy_head output → 0.01 (small initial actions)
+      - value_head output  → 1.0  (neutral value scale)
+    All biases are zeroed. Trunk layers (projections, transformer) keep their
+    default PyTorch init, which is already reasonable for attention/FFN.
+    """
+    for name, sub in module.named_modules():
+        if not isinstance(sub, nn.Sequential):
+            continue
+        # Determine output gain from head name
+        if "policy_head" in name:
+            output_gain = 0.01
+        elif "value_head" in name:
+            output_gain = 1.0
+        else:
+            continue
+        linears = [m for m in sub if isinstance(m, nn.Linear)]
+        for i, layer in enumerate(linears):
+            gain = output_gain if i == len(linears) - 1 else math.sqrt(2)
+            nn.init.orthogonal_(layer.weight, gain=gain)
+            nn.init.constant_(layer.bias, 0.0)
+
+
+def _make_beta(alpha, beta):
+    """Create Beta distribution in float32 for numerical safety under AMP.
+
+    Beta.log_prob and Beta.entropy use lgamma internally, which overflows
+    in float16 once parameters grow beyond ~10. Promoting to float32 here
+    ensures all downstream distribution ops (sample, log_prob, entropy)
+    inherit float32 regardless of autocast context.
+    """
+    return torch.distributions.Beta(
+        alpha.float().clamp(min=1.001), beta.float().clamp(min=1.001),
     )
-    # Stable tanh correction: log(1 - tanh²(x)) = -(2x + 2softplus(-2x) - 2log2)
-    tanh_correction = (
-        2.0 * math.log(2) - 2.0 * raw_action - 2.0 * F.softplus(-2.0 * raw_action)
-    )
-    return normal_log_prob - tanh_correction
 
 
 def sample_stochastic(model, states, position):
-    action_mean, log_std, values = model(states, position)
-    std = log_std.exp()
-    noise = torch.randn_like(action_mean)
-    raw_action = action_mean + std * noise
-    action = torch.tanh(raw_action)
-    log_prob = _tanh_log_prob(raw_action, action_mean, log_std)
-    return action, raw_action, log_prob, values
+    alpha, beta, values = model(states, position)
+    dist_obj = _make_beta(alpha, beta)
+    action_01 = dist_obj.sample()  # in [0, 1]
+    log_prob = dist_obj.log_prob(action_01)
+    action = 2.0 * action_01 - 1.0  # rescale to [-1, 1]
+    return action, action_01, log_prob, values
 
 
 def select_greedy(model, states, position):
-    action_mean, _, values = model(states, position)
-    return torch.tanh(action_mean), values
+    alpha, beta, values = model(states, position)
+    mean_01 = alpha / (alpha + beta)
+    action = 2.0 * mean_01 - 1.0
+    return action, values
+
+
+def select_greedy_actor_only(model, states, position):
+    """Greedy action from model (value output discarded)."""
+    alpha, beta, _ = model(states, position)
+    mean_01 = alpha / (alpha + beta)
+    return 2.0 * mean_01 - 1.0
 
 
 def evaluate_actions(model, states, raw_actions, position):
-    action_mean, log_std, values = model(states, position)
-    log_prob = _tanh_log_prob(raw_actions, action_mean, log_std)
-    # Gaussian entropy (analytic, without tanh correction — standard approximation)
-    entropy = 0.5 * math.log(2 * math.pi * math.e) + log_std
-    # Broadcast scalar entropy to batch
-    entropy = entropy.expand(values.shape)
+    """raw_actions stores the [0, 1] sample from the Beta distribution."""
+    alpha, beta, values = model(states, position)
+    dist_obj = _make_beta(alpha, beta)
+    # Clamp stored samples away from boundaries for numerical stability
+    action_01 = raw_actions.clamp(1e-6, 1.0 - 1e-6)
+    log_prob = dist_obj.log_prob(action_01)
+    entropy = dist_obj.entropy()
     return log_prob, entropy, values
+
+
+
+# Batched inference (GPU chunking for large episode counts)
+
+def _batched_stochastic(model, obs, pos, cfg):
+    """Run sample_stochastic in inference_batch chunks."""
+    n = obs.shape[0]
+    actions = np.empty(n, dtype=np.float32)
+    raw = np.empty(n, dtype=np.float32)
+    logp = np.empty(n, dtype=np.float32)
+    vals = np.empty(n, dtype=np.float32)
+    amp_enabled = cfg.use_amp and cfg.device.startswith("cuda")
+    with torch.no_grad(), torch.amp.autocast("cuda", enabled=amp_enabled):
+        for i in range(0, n, cfg.inference_batch):
+            j = min(i + cfg.inference_batch, n)
+            s = torch.from_numpy(obs[i:j]).to(cfg.device)
+            p = torch.from_numpy(pos[i:j]).to(cfg.device)
+            a, r, lp, v = sample_stochastic(model, s, p)
+            actions[i:j] = a.cpu().numpy()
+            raw[i:j] = r.cpu().numpy()
+            logp[i:j] = lp.cpu().numpy()
+            vals[i:j] = v.cpu().numpy()
+    return actions, raw, logp, vals
+
+
+def _batched_greedy(model, obs, pos, cfg):
+    """Run select_greedy in inference_batch chunks."""
+    n = obs.shape[0]
+    actions = np.empty(n, dtype=np.float32)
+    vals = np.empty(n, dtype=np.float32)
+    amp_enabled = cfg.use_amp and cfg.device.startswith("cuda")
+    with torch.no_grad(), torch.amp.autocast("cuda", enabled=amp_enabled):
+        for i in range(0, n, cfg.inference_batch):
+            j = min(i + cfg.inference_batch, n)
+            s = torch.from_numpy(obs[i:j]).to(cfg.device)
+            p = torch.from_numpy(pos[i:j]).to(cfg.device)
+            a, v = select_greedy(model, s, p)
+            actions[i:j] = a.cpu().numpy()
+            vals[i:j] = v.cpu().numpy()
+    return actions, vals
+
+
+def _batched_greedy_actor_only(model, obs, pos, cfg):
+    """Greedy actions (value output discarded)."""
+    n = obs.shape[0]
+    actions = np.empty(n, dtype=np.float32)
+    amp_enabled = cfg.use_amp and cfg.device.startswith("cuda")
+    with torch.no_grad(), torch.amp.autocast("cuda", enabled=amp_enabled):
+        for i in range(0, n, cfg.inference_batch):
+            j = min(i + cfg.inference_batch, n)
+            s = torch.from_numpy(obs[i:j]).to(cfg.device)
+            p = torch.from_numpy(pos[i:j]).to(cfg.device)
+            actions[i:j] = select_greedy_actor_only(model, s, p).cpu().numpy()
+    return actions
 
 
 # Rollout buffer
@@ -542,11 +744,25 @@ def load_stock_data(path, market_date_to_idx):
     features = df[feature_cols].values.astype(np.float32)
     dates = df["date"].values
 
-    log_returns = np.empty(len(prices), dtype=np.float32)
-    log_returns[0] = 0.0
-    log_returns[1:] = np.log(prices[1:] / prices[:-1]).astype(np.float32)
     symbol_breaks = np.flatnonzero(symbols[1:] != symbols[:-1]) + 1
-    log_returns[symbol_breaks] = 0.0
+
+    ratio = np.ones(len(prices), dtype=np.float64)
+    ratio[1:] = prices[1:] / prices[:-1]
+    ratio[symbol_breaks] = 1.0
+
+    sym_str = symbols.astype(str)
+    starts_with_68 = np.char.startswith(sym_str, "68")
+    starts_with_30 = np.char.startswith(sym_str, "30")
+    import datetime as _dt
+    after_cutoff = dates >= _dt.date(2020, 8, 24)
+    wide = starts_with_68 | (starts_with_30 & after_cutoff)
+
+    lo = np.where(wide, 0.79, 0.89)
+    hi = np.where(wide, 1.21, 1.11)
+    ratio = np.clip(ratio, lo, hi)
+    ratio[symbol_breaks] = 1.0
+    ratio[0] = 1.0
+    log_returns = np.log(ratio).astype(np.float32)
 
     starts = np.empty(len(symbol_breaks) + 1, dtype=np.intp)
     starts[0] = 0
@@ -632,10 +848,10 @@ def compute_episode_returns(reward_matrix):
 
 
 def compute_max_drawdown(reward_matrix):
-    """Mean per-episode max drawdown from cumulative log returns."""
+    """Mean per-episode max drawdown as percentage decline from peak."""
     cum_returns = np.cumsum(reward_matrix, axis=1)
     running_max = np.maximum.accumulate(cum_returns, axis=1)
-    drawdowns = running_max - cum_returns
+    drawdowns = 1.0 - np.exp(cum_returns - running_max)
     return float(drawdowns.max(axis=1).mean())
 
 
@@ -653,6 +869,17 @@ def compute_baseline_rewards(episodes, cfg):
 
 # Rollout collection
 
+
+def _env_n_workers(cfg):
+    """Compute per-rank CPU worker count for ParallelVecEnv."""
+    n_workers = cfg.env_workers
+    if n_workers == 0:
+        n_cores = len(os.sched_getaffinity(0))
+        local_world = int(os.environ.get("LOCAL_WORLD_SIZE", _world))
+        n_workers = max(1, n_cores // local_world)
+    return n_workers
+
+
 @timed
 def collect_training_rollout(model, episodes, cfg, global_market_features,
                              reward_normalizer, distributed):
@@ -664,56 +891,33 @@ def collect_training_rollout(model, episodes, cfg, global_market_features,
     )
     rollout.register_episodes(episodes)
 
+    env = ParallelVecEnv(
+        episodes, cfg.lookback, cfg.transaction_cost,
+        global_market_features, _env_n_workers(cfg),
+    )
+    obs, pos = env.reset()
     model.train()
-    amp_enabled = cfg.use_amp and cfg.device.startswith("cuda")
-    with torch.no_grad(), torch.amp.autocast("cuda", enabled=amp_enabled):
-        for batch_start in range(0, n_episodes, cfg.inference_batch):
-            batch_end = min(batch_start + cfg.inference_batch, n_episodes)
-            batch_episodes = episodes[batch_start:batch_end]
-            env = VecEnv(
-                batch_episodes, cfg.lookback, cfg.transaction_cost,
-                global_market_features,
-            )
-            obs, pos = env.reset()
+    for step in range(episode_length):
+        actions, raw_actions, log_probs, values = _batched_stochastic(
+            model, obs, pos, cfg,
+        )
+        rollout.positions[:, step] = pos
+        rollout.raw_actions[:, step] = raw_actions
+        obs, rewards, _, pos = env.step(actions)
+        rollout.log_probs[:, step] = log_probs
+        rollout.values[:, step] = values
+        rollout.rewards[:, step] = rewards
 
-            for step in range(episode_length):
-                states = torch.from_numpy(obs).to(cfg.device)
-                pos_tensor = torch.from_numpy(pos).to(cfg.device)
-                actions, raw_actions, log_probs, values = sample_stochastic(
-                    model, states, pos_tensor,
-                )
-                actions_np = actions.cpu().numpy()
-                raw_actions_np = raw_actions.cpu().numpy()
-
-                rollout.positions[batch_start:batch_end, step] = pos
-                rollout.raw_actions[batch_start:batch_end, step] = raw_actions_np
-
-                obs, step_rewards, _, pos = env.step(actions_np)
-                rollout.log_probs[batch_start:batch_end, step] = (
-                    log_probs.cpu().numpy()
-                )
-                rollout.values[batch_start:batch_end, step] = (
-                    values.cpu().numpy()
-                )
-                rollout.rewards[batch_start:batch_end, step] = step_rewards
-
-            # Bootstrap V(s_T) at the truncation boundary
-            terminal_obs = env.terminal_observation()
-            terminal_states = torch.from_numpy(terminal_obs).to(cfg.device)
-            terminal_pos = torch.from_numpy(pos).to(cfg.device)
-            _, terminal_values = select_greedy(model, terminal_states, terminal_pos)
-            rollout.final_values[batch_start:batch_end] = (
-                terminal_values.cpu().numpy()
-            )
+    terminal_obs = env.terminal_observation()
+    _, terminal_values = _batched_greedy(model, terminal_obs, pos, cfg)
+    rollout.final_values[:] = terminal_values
+    env.close()
 
     baseline_rewards = compute_baseline_rewards(episodes, cfg)
     model_return = float(compute_episode_returns(rollout.rewards).mean())
     baseline_return = float(compute_episode_returns(baseline_rewards).mean())
 
-    # Clip raw rewards to protect against data anomalies
-    rollout.rewards = np.clip(rollout.rewards, -cfg.reward_clip, cfg.reward_clip)
-
-    # EMA update and normalize (after raw clip, so EMA tracks clipped distribution)
+    # EMA update and normalize
     if distributed:
         reward_normalizer.update_distributed(rollout.rewards, cfg.device)
     else:
@@ -731,26 +935,18 @@ def evaluate_deterministic(model, episodes, cfg, global_market_features):
     all_rewards = np.empty((n_episodes, episode_length), dtype=np.float32)
     all_positions = np.empty((n_episodes, episode_length), dtype=np.float32)
 
+    env = ParallelVecEnv(
+        episodes, cfg.lookback, cfg.transaction_cost,
+        global_market_features, _env_n_workers(cfg),
+    )
+    obs, pos = env.reset()
     model.eval()
-    amp_enabled = cfg.use_amp and cfg.device.startswith("cuda")
-    with torch.no_grad(), torch.amp.autocast("cuda", enabled=amp_enabled):
-        for batch_start in range(0, n_episodes, cfg.inference_batch):
-            batch_end = min(batch_start + cfg.inference_batch, n_episodes)
-            batch_episodes = episodes[batch_start:batch_end]
-            env = VecEnv(
-                batch_episodes, cfg.lookback, cfg.transaction_cost,
-                global_market_features,
-            )
-            obs, pos = env.reset()
-
-            for step in range(episode_length):
-                states = torch.from_numpy(obs).to(cfg.device)
-                pos_tensor = torch.from_numpy(pos).to(cfg.device)
-                actions, _ = select_greedy(model, states, pos_tensor)
-                actions_np = actions.cpu().numpy()
-                obs, step_rewards, _, pos = env.step(actions_np)
-                all_rewards[batch_start:batch_end, step] = step_rewards
-                all_positions[batch_start:batch_end, step] = actions_np
+    for step in range(episode_length):
+        actions = _batched_greedy_actor_only(model, obs, pos, cfg)
+        obs, rewards, _, pos = env.step(actions)
+        all_rewards[:, step] = rewards
+        all_positions[:, step] = actions
+    env.close()
 
     return all_rewards, all_positions
 
@@ -761,7 +957,7 @@ def evaluate_episodes(model, episodes, cfg, global_market_features):
         return {
             "model_return": 0.0, "baseline_return": 0.0, "beat_rate": 0.0,
             "max_drawdown": 0.0, "mean_turnover": 0.0,
-            "position_histogram": np.zeros(cfg.position_bins, dtype=np.float64),
+            "position_histogram": np.zeros(_POSITION_BINS, dtype=np.float64),
             "model_rewards": np.empty((0, cfg.episode_length)),
             "baseline_rewards": np.empty((0, cfg.episode_length)),
             "model_positions": np.empty((0, cfg.episode_length), dtype=np.float32),
@@ -776,7 +972,7 @@ def evaluate_episodes(model, episodes, cfg, global_market_features):
 
     # Position histogram
     pos_hist, _ = np.histogram(
-        model_positions.ravel(), bins=cfg.position_bins, range=(-1.0, 1.0),
+        model_positions.ravel(), bins=_POSITION_BINS, range=(-1.0, 1.0),
     )
     pos_hist = pos_hist.astype(np.float64)
 
@@ -823,7 +1019,7 @@ def evaluate_ablated(model, episodes, cfg, global_market_features):
 
 # Gradient diagnostics
 
-def diagnose_gradient_contributions(model, batch, cfg, entropy_coeff):
+def diagnose_gradient_contributions(model, batch, cfg):
     """Run separate backward passes to measure each loss term's gradient norm.
 
     Uses the base model (unwrapped from DDP) in full precision to avoid
@@ -840,7 +1036,7 @@ def diagnose_gradient_contributions(model, batch, cfg, entropy_coeff):
         advantages = batch["advantages"].float()
         returns = batch["returns"].float()
 
-        new_log_probs, entropy, new_values = evaluate_actions(
+        new_log_probs, _, new_values = evaluate_actions(
             base_model, states, raw_actions, positions,
         )
         ratio = torch.exp(new_log_probs - log_probs_old)
@@ -851,20 +1047,26 @@ def diagnose_gradient_contributions(model, batch, cfg, entropy_coeff):
         )
         policy_loss = -surrogate.mean()
         value_loss = cfg.value_coeff * F.mse_loss(new_values, returns)
-        entropy_loss = -entropy_coeff * entropy.mean()
 
     norms = {}
-    for name, loss in [
-        ("policy", policy_loss),
-        ("value", value_loss),
-    ]:
-        base_model.zero_grad()
-        loss.backward(retain_graph=True)
-        total = 0.0
-        for p in base_model.parameters():
-            if p.grad is not None:
-                total += p.grad.data.norm(2).item() ** 2
-        norms[name] = total ** 0.5
+
+    # Policy gradient norm
+    base_model.zero_grad()
+    policy_loss.backward(retain_graph=True)
+    total = 0.0
+    for p in base_model.parameters():
+        if p.grad is not None:
+            total += p.grad.data.norm(2).item() ** 2
+    norms["policy"] = total ** 0.5
+
+    # Value gradient norm
+    base_model.zero_grad()
+    value_loss.backward()
+    total = 0.0
+    for p in base_model.parameters():
+        if p.grad is not None:
+            total += p.grad.data.norm(2).item() ** 2
+    norms["value"] = total ** 0.5
 
     base_model.zero_grad()
     return norms
@@ -874,9 +1076,11 @@ def diagnose_gradient_contributions(model, batch, cfg, entropy_coeff):
 
 _VALUE_ERROR_BINS = 50
 _VALUE_ERROR_RANGE = (-3.0, 3.0)
+_POSITION_BINS = 50
 
 
-def run_ppo_update(model, optimizer, scaler, rollout, cfg, n_local_transitions,
+def run_ppo_update(model, optimizer, scaler,
+                   rollout, cfg, n_local_transitions,
                    n_padded_transitions, entropy_coeff):
     """One PPO pass over the rollout buffer.
 
@@ -894,6 +1098,9 @@ def run_ppo_update(model, optimizer, scaler, rollout, cfg, n_local_transitions,
     skipped_batches = 0
     all_ratios = []
     value_error_hist = np.zeros(_VALUE_ERROR_BINS, dtype=np.float64)
+    ve_sum = 0.0
+    ve_sum_sq = 0.0
+    ve_count = 0
     n_batches = 0
     amp_enabled = cfg.use_amp and cfg.device.startswith("cuda")
 
@@ -904,8 +1111,8 @@ def run_ppo_update(model, optimizer, scaler, rollout, cfg, n_local_transitions,
     else:
         valid_mask = None
 
-    for batch_start in range(0, n_padded_transitions, cfg.batch_size):
-        batch_end = min(batch_start + cfg.batch_size, n_padded_transitions)
+    for batch_start in range(0, n_padded_transitions - cfg.batch_size + 1, cfg.batch_size):
+        batch_end = batch_start + cfg.batch_size
         batch_indices = permutation[batch_start:batch_end]
         batch = rollout.get_batch(batch_indices, cfg.device)
 
@@ -913,7 +1120,8 @@ def run_ppo_update(model, optimizer, scaler, rollout, cfg, n_local_transitions,
             new_log_probs, entropy, new_values = evaluate_actions(
                 model, batch["states"], batch["raw_actions"], batch["positions"],
             )
-            ratio = torch.exp(new_log_probs - batch["log_probs"])
+            log_ratio = new_log_probs - batch["log_probs"]
+            ratio = torch.exp(log_ratio)
             advantages = batch["advantages"]
 
             with torch.no_grad():
@@ -941,28 +1149,28 @@ def run_ppo_update(model, optimizer, scaler, rollout, cfg, n_local_transitions,
                 entropy_term = (entropy * batch_weight).sum() / n_valid
                 clipped = ((ratio - 1.0).abs() > cfg.policy_clip).float()
                 clip_frac = (clipped * batch_weight).sum() / n_valid
-                approx_kl_batch = ((ratio - 1.0 - ratio.log()) * batch_weight).sum() / n_valid
+                approx_kl_batch = ((log_ratio.exp() - 1.0 - log_ratio) * batch_weight).sum() / n_valid
             else:
                 policy_loss = -surrogate.mean()
                 value_loss = F.mse_loss(new_values, batch["returns"])
                 entropy_term = entropy.mean()
                 clipped = ((ratio - 1.0).abs() > cfg.policy_clip).float()
                 clip_frac = clipped.mean()
-                approx_kl_batch = (ratio - 1.0 - ratio.log()).mean()
+                approx_kl_batch = (log_ratio.exp() - 1.0 - log_ratio).mean()
 
-            total_loss = (
-                policy_loss
-                + cfg.value_coeff * value_loss
-                - entropy_coeff * entropy_term
-            )
+            # Combined loss (SB3-style single backward)
+            loss = policy_loss + cfg.value_coeff * value_loss - entropy_coeff * entropy_term
 
         optimizer.zero_grad()
-        scaler.scale(total_loss).backward()
+        scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        grad_norm = nn.utils.clip_grad_norm_(base_model.parameters(), cfg.grad_clip)
-        grad_norm_val = grad_norm.item()
-        if math.isinf(grad_norm_val):
+        combined_norm = nn.utils.clip_grad_norm_(
+            base_model.parameters(), cfg.grad_clip,
+        ).item()
+
+        if math.isinf(combined_norm):
             skipped_batches += 1
+
         scaler.step(optimizer)
         scaler.update()
 
@@ -976,14 +1184,17 @@ def run_ppo_update(model, optimizer, scaler, rollout, cfg, n_local_transitions,
                 residual, bins=_VALUE_ERROR_BINS, range=_VALUE_ERROR_RANGE,
             )
             value_error_hist += hist.astype(np.float64)
+            ve_sum += residual.sum()
+            ve_sum_sq += (residual ** 2).sum()
+            ve_count += len(residual)
 
         policy_loss_sum += policy_loss.item()
         value_loss_sum += value_loss.item()
         entropy_sum += entropy_term.item()
         clip_fraction_sum += clip_frac.item()
         approx_kl_sum += approx_kl_batch.item()
-        if not math.isinf(grad_norm_val):
-            grad_norm_sum += grad_norm_val
+        if not math.isinf(combined_norm):
+            grad_norm_sum += combined_norm
             grad_norm_count += 1
         n_batches += 1
 
@@ -992,7 +1203,7 @@ def run_ppo_update(model, optimizer, scaler, rollout, cfg, n_local_transitions,
             [policy_loss_sum, value_loss_sum, entropy_sum,
              clip_fraction_sum, approx_kl_sum, grad_norm_sum,
              float(n_batches), float(skipped_batches),
-             float(grad_norm_count)],
+             float(grad_norm_count), ve_sum, ve_sum_sq, float(ve_count)],
             device=cfg.device,
         )
         dist.all_reduce(sync_tensor)
@@ -1005,6 +1216,9 @@ def run_ppo_update(model, optimizer, scaler, rollout, cfg, n_local_transitions,
         n_batches = int(sync_tensor[6].item())
         skipped_batches = int(sync_tensor[7].item())
         grad_norm_count = int(sync_tensor[8].item())
+        ve_sum = sync_tensor[9].item()
+        ve_sum_sq = sync_tensor[10].item()
+        ve_count = int(sync_tensor[11].item())
 
         # All-reduce value error histogram
         hist_tensor = torch.tensor(value_error_hist, device=cfg.device, dtype=torch.float64)
@@ -1044,6 +1258,9 @@ def run_ppo_update(model, optimizer, scaler, rollout, cfg, n_local_transitions,
         "value_error_histogram": value_error_hist,
         "skipped_batches": skipped_batches,
         "total_batches": n_batches,
+        "ve_sum": ve_sum,
+        "ve_sum_sq": ve_sum_sq,
+        "ve_count": ve_count,
     }
 
 
@@ -1194,13 +1411,47 @@ def _plot_heatmap(ax, fig, hist_list, n_bins, y_range, xlabel, ylabel, title, cm
     ax.set_title(title)
 
 
-@timed
+def _hist_mean_sd(hist, bin_range):
+    """Compute mean and standard deviation from a histogram."""
+    n_bins = len(hist)
+    edges = np.linspace(bin_range[0], bin_range[1], n_bins + 1)
+    centers = (edges[:-1] + edges[1:]) / 2
+    total = hist.sum()
+    if total <= 0:
+        return 0.0, 0.0
+    probs = hist / total
+    mean = float((probs * centers).sum())
+    sd = float(np.sqrt((probs * (centers - mean) ** 2).sum()))
+    return mean, sd
+
+
+def _plot_ppo_heatmap(ax, fig, hist_list, n_ppo_epochs, xlabel, ylabel, title, cmap="RdBu_r"):
+    """Plot a heatmap of per-PPO-epoch metrics over training epochs."""
+    if not hist_list:
+        ax.set_visible(False)
+        return
+    data = np.array(hist_list).T  # (n_ppo_epochs, n_outer_epochs)
+    im = ax.imshow(
+        data,
+        aspect="auto",
+        origin="lower",
+        extent=[1, len(hist_list), 0.5, n_ppo_epochs + 0.5],
+        cmap=cmap,
+        interpolation="nearest",
+    )
+    fig.colorbar(im, ax=ax, label="Value")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.set_yticks(range(1, n_ppo_epochs + 1))
+
+
 def plot_training(history, path, cfg):
     """Plot training curves on a 3x5 grid.
 
     Row 1 (returns + behavior): episode return, beat rate, max drawdown, turnover, position heatmap
-    Row 2 (loss + PPO stability): policy loss, value loss, entropy, clip fraction, approx KL
-    Row 3 (gradient health): p99 ratio, value error heatmap, gradient norms, loss scale, skip rate
+    Row 2 (loss + PPO stability): policy loss, value loss, entropy, clip fraction heatmap, approx KL heatmap
+    Row 3 (gradient health): p99 ratio heatmap, value error heatmap, gradient norms, loss scale, skip rate
     """
     from matplotlib.ticker import MaxNLocator
 
@@ -1210,12 +1461,11 @@ def plot_training(history, path, cfg):
     C_NO_STOCK = "purple"
     C_POLICY = "#2196F3"
     C_VALUE = "#F44336"
-    C_ENTROPY = "#4CAF50"
 
     epochs = range(1, len(history["policy_loss"]) + 1)
     fig, axes = plt.subplots(3, 5, figsize=(30, 15))
 
-    # Row 1 — Performance
+    # Row 1 — Returns + Behavior
     ablation_epochs = history.get("ablation_epochs", [])
     axes[0, 0].plot(epochs, history["train_return"], color=C_TRAIN, label="Train return", alpha=0.8)
     axes[0, 0].plot(epochs, history["train_baseline"], color=C_TRAIN, linestyle="--", label="Train baseline", alpha=0.5)
@@ -1244,6 +1494,7 @@ def plot_training(history, path, cfg):
     axes[0, 2].plot(epochs, history["val_max_drawdown"], color=C_VAL, alpha=0.8)
     axes[0, 2].set_ylabel("Max Drawdown")
     axes[0, 2].set_title("Val Max Drawdown")
+    axes[0, 2].set_ylim(0, 1)
     axes[0, 2].grid(True, alpha=0.3)
 
     axes[0, 3].plot(epochs, history["val_turnover"], color=C_VAL, alpha=0.8)
@@ -1254,7 +1505,7 @@ def plot_training(history, path, cfg):
     _plot_heatmap(
         axes[0, 4], fig,
         history.get("position_histogram", []),
-        cfg.position_bins, (-1.0, 1.0),
+        _POSITION_BINS, (-1.0, 1.0),
         "Epoch", "Position", "Position Distribution",
     )
 
@@ -1274,22 +1525,27 @@ def plot_training(history, path, cfg):
     axes[1, 2].set_title("Entropy")
     axes[1, 2].grid(True, alpha=0.3)
 
-    axes[1, 3].plot(epochs, history["clip_fraction"], color=C_TRAIN, alpha=0.8)
-    axes[1, 3].set_ylabel("Clip Fraction")
-    axes[1, 3].set_title("Clip Fraction")
-    axes[1, 3].grid(True, alpha=0.3)
+    _plot_ppo_heatmap(
+        axes[1, 3], fig,
+        history.get("clip_fraction_per_ppo", []),
+        cfg.ppo_epochs,
+        "Epoch", "PPO Epoch", "Clip Fraction",
+    )
 
-    axes[1, 4].plot(epochs, history["approx_kl"], color=C_TRAIN, alpha=0.8)
-    axes[1, 4].set_ylabel("Approx KL")
-    axes[1, 4].set_title("Approx KL")
-    axes[1, 4].grid(True, alpha=0.3)
+    _plot_ppo_heatmap(
+        axes[1, 4], fig,
+        history.get("approx_kl_per_ppo", []),
+        cfg.ppo_epochs,
+        "Epoch", "PPO Epoch", "Approx KL",
+    )
 
     # Row 3 — Gradient health
-    axes[2, 0].plot(epochs, history["p99_ratio"], color=C_TRAIN, alpha=0.8)
-    axes[2, 0].set_xlabel("Epoch")
-    axes[2, 0].set_ylabel("P99 Ratio")
-    axes[2, 0].set_title("P99 Ratio")
-    axes[2, 0].grid(True, alpha=0.3)
+    _plot_ppo_heatmap(
+        axes[2, 0], fig,
+        history.get("p99_ratio_per_ppo", []),
+        cfg.ppo_epochs,
+        "Epoch", "PPO Epoch", "P99 Ratio",
+    )
 
     _plot_heatmap(
         axes[2, 1], fig,
@@ -1327,6 +1583,7 @@ def plot_training(history, path, cfg):
     axes[2, 4].set_xlabel("Epoch")
     axes[2, 4].set_ylabel("Skip Rate")
     axes[2, 4].set_title("Skip Rate")
+    axes[2, 4].set_ylim(bottom=0)
     axes[2, 4].grid(True, alpha=0.3)
 
     for ax in axes.flat:
@@ -1338,30 +1595,20 @@ def plot_training(history, path, cfg):
     plt.close(fig)
 
 
-@timed
-def save_checkpoint(state, path):
-    torch.save(state, path)
-
-
-def warmup_cosine_lr(base_lr, epoch, n_epochs, warmup_epochs):
+def warmup_lr(base_lr, epoch, warmup_epochs):
     if epoch <= warmup_epochs:
         return base_lr * epoch / warmup_epochs
-    progress = (epoch - warmup_epochs) / (n_epochs - warmup_epochs)
-    return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+    return base_lr
 
-
-def cosine_entropy_coeff(start, end, epoch, n_epochs):
-    progress = min(epoch / n_epochs, 1.0)
-    return end + 0.5 * (start - end) * (1.0 + math.cos(math.pi * progress))
 
 
 # Training loop
 
-def train(cfg):
+def train(cfg, trial=None, data=None, sweep_mode=False):
     global _rank, _world
 
     distributed = "RANK" in os.environ
-    if distributed:
+    if distributed and not sweep_mode:
         dist.init_process_group("nccl")
         _rank = dist.get_rank()
         _world = dist.get_world_size()
@@ -1373,86 +1620,100 @@ def train(cfg):
     os.makedirs(cfg.save_dir, exist_ok=True)
 
     _log()
-    _log("[Configuration]")
-    for key, value in cfg.to_dict().items():
-        _log(f"    {key:<20s}: {value}")
+    if not sweep_mode:
+        _log("[Configuration]")
+        for name in Config.__annotations__:
+            _log(f"    {name:<20s}: {getattr(cfg, name)}")
 
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
 
-    _log()
-    _log("[Data]")
-    market = load_market_data(cfg.market_path)
+    if data is not None:
+        market, train_data, val_data, test_data, stock_feature_cols = data
+    else:
+        _log()
+        if not sweep_mode:
+            _log("[Data]")
+        market = load_market_data(cfg.market_path)
+        train_data, stock_feature_cols = load_stock_data(
+            cfg.train_path, market["date_to_idx"],
+        )
+        val_data, _ = load_stock_data(cfg.val_path, market["date_to_idx"])
+        test_data, _ = load_stock_data(cfg.test_path, market["date_to_idx"])
+        if not sweep_mode:
+            _log(f"    {'Train symbols':<20s}: {len(train_data)}")
+            _log(f"    {'Val symbols':<20s}: {len(val_data)}")
+            _log(f"    {'Test symbols':<20s}: {len(test_data)}")
+            _log(f"    {'Train observations':<20s}: {sum(len(d['features']) for d in train_data.values()):,}")
+            _log(f"    {'Val observations':<20s}: {sum(len(d['features']) for d in val_data.values()):,}")
+            _log(f"    {'Test observations':<20s}: {sum(len(d['features']) for d in test_data.values()):,}")
+            _log(f"    {'Stock features':<20s}: {len(stock_feature_cols)}")
+            _log(f"    {'Market features':<20s}: {len(market['columns'])}")
     global_market_features = market["features"]
-    train_data, stock_feature_cols = load_stock_data(
-        cfg.train_path, market["date_to_idx"],
-    )
-    val_data, _ = load_stock_data(cfg.val_path, market["date_to_idx"])
-    test_data, _ = load_stock_data(cfg.test_path, market["date_to_idx"])
     all_feature_cols = stock_feature_cols + market["columns"]
-    _log(f"    {'Train symbols':<20s}: {len(train_data)}")
-    _log(f"    {'Val symbols':<20s}: {len(val_data)}")
-    _log(f"    {'Test symbols':<20s}: {len(test_data)}")
-    _log(f"    {'Train observations':<20s}: {sum(len(d['features']) for d in train_data.values()):,}")
-    _log(f"    {'Val observations':<20s}: {sum(len(d['features']) for d in val_data.values()):,}")
-    _log(f"    {'Test observations':<20s}: {sum(len(d['features']) for d in test_data.values()):,}")
-    _log(f"    {'Stock features':<20s}: {len(stock_feature_cols)}")
-    _log(f"    {'Market features':<20s}: {len(market['columns'])}")
 
     stock_groups, market_groups, stock_feature_indices, market_feature_indices = (
         split_feature_groups(all_feature_cols)
     )
 
-    _log()
-    _log("[Model]")
-    base_model = PolicyNetwork(
+    if not sweep_mode:
+        _log()
+        _log("[Model]")
+    model_args = (
         stock_groups, market_groups,
         stock_feature_indices, market_feature_indices, cfg,
-    ).to(cfg.device)
-    if cfg.device.startswith("cuda"):
-        base_model = torch.compile(base_model)
+    )
+    base_model = PolicyNetwork(*model_args).to(cfg.device)
+
+    # SB3-style orthogonal init for MLP heads
+    _ortho_init(base_model)
+
     model = base_model
     if distributed:
-        model = DDP(base_model, device_ids=[int(os.environ["LOCAL_RANK"])])
+        local_rank_id = int(os.environ["LOCAL_RANK"])
+        model = DDP(base_model, device_ids=[local_rank_id])
         torch.manual_seed(cfg.seed + _rank)
+
     n_params = sum(p.numel() for p in base_model.parameters())
-    _log(f"    {'Stock groups':<20s}: {len(stock_groups)}")
-    _log(f"    {'Market groups':<20s}: {len(market_groups)}")
-    _log(f"    {'Parameters':<20s}: {n_params:,}")
+    if not sweep_mode:
+        _log(f"    {'Stock groups':<20s}: {len(stock_groups)}")
+        _log(f"    {'Market groups':<20s}: {len(market_groups)}")
+        _log(f"    {'Parameters':<20s}: {n_params:,}")
 
     effective_lr = cfg.lr * math.sqrt(_world)
 
-    decay_params, xattn_decay_params, no_decay_params = [], [], []
-    for name, param in base_model.named_parameters():
-        if not param.requires_grad:
-            continue
-        is_norm_or_bias = param.dim() < 2 or "norm" in name
-        if is_norm_or_bias:
-            no_decay_params.append(param)
-        elif "xattn." in name:
-            xattn_decay_params.append(param)
-        else:
-            decay_params.append(param)
+    def _build_optimizer(*nets):
+        decay_params, xattn_decay_params, no_decay_params = [], [], []
+        for net in nets:
+            for name, param in net.named_parameters():
+                if not param.requires_grad:
+                    continue
+                is_norm_or_bias = param.dim() < 2 or "norm" in name
+                if is_norm_or_bias:
+                    no_decay_params.append(param)
+                elif "xattn." in name:
+                    xattn_decay_params.append(param)
+                else:
+                    decay_params.append(param)
+        return torch.optim.AdamW(
+            [
+                {"params": decay_params, "weight_decay": cfg.weight_decay},
+                {"params": xattn_decay_params, "weight_decay": cfg.xattn_weight_decay},
+                {"params": no_decay_params, "weight_decay": 0.0},
+            ],
+            lr=effective_lr, eps=cfg.adam_eps,
+        )
 
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": decay_params, "weight_decay": cfg.weight_decay},
-            {"params": xattn_decay_params, "weight_decay": cfg.xattn_weight_decay},
-            {"params": no_decay_params, "weight_decay": 0.0},
-        ],
-        lr=effective_lr, eps=1e-5
-    )
+    optimizer = _build_optimizer(base_model)
     reward_normalizer = RewardNormalizer(cfg.pytorch_eps, cfg.reward_ema_decay)
     amp_enabled = cfg.use_amp and cfg.device.startswith("cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
-    _log(f"    {'Decay params':<20s}: {sum(p.numel() for p in decay_params):,}")
-    _log(f"    {'Xattn params':<20s}: {sum(p.numel() for p in xattn_decay_params):,}")
-    _log(f"    {'No decay params':<20s}: {sum(p.numel() for p in no_decay_params):,}")
     device_label = f"{_world} GPUs" if distributed else cfg.device
-    _log(f"    {'Device':<20s}: {device_label}")
-    _log(f"    {'Mixed precision':<20s}: {'float16' if amp_enabled else 'disabled'}")
-    if _world > 1:
-        _log(f"    {'Scaled LR':<20s}: {effective_lr:.2e}")
+    if not sweep_mode:
+        _log(f"    {'Device':<20s}: {device_label}")
+        _log(f"    {'Mixed precision':<20s}: {'float16' if amp_enabled else 'disabled'}")
+        if _world > 1:
+            _log(f"    {'Scaled LR':<20s}: {effective_lr:.1e}")
 
     history = defaultdict(list)
     best_score = -float("inf")
@@ -1462,12 +1723,18 @@ def train(cfg):
     latest_path = os.path.join(cfg.save_dir, "model_latest.pt")
     if os.path.exists(latest_path):
         ckpt = torch.load(latest_path, map_location=cfg.device, weights_only=False)
-        base_model.load_state_dict(ckpt["model_state_dict"])
-        saved_groups = ckpt["optimizer_state_dict"].get("param_groups", [])
-        if len(saved_groups) == len(optimizer.param_groups):
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        # Support loading from either old split-model or new shared checkpoints
+        if "model_state_dict" in ckpt:
+            base_model.load_state_dict(ckpt["model_state_dict"])
+            saved_groups = ckpt.get("optimizer_state_dict", {}).get("param_groups", [])
+            if len(saved_groups) == len(optimizer.param_groups):
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            else:
+                _log("    Optimizer param groups changed, resetting optimizer state")
+        elif "actor_state_dict" in ckpt:
+            _log("    Legacy split-model checkpoint, skipping model load")
         else:
-            _log("    Optimizer param groups changed, resetting optimizer state")
+            _log("    Unknown checkpoint format, skipping model load")
         start_epoch = ckpt["epoch"] + 1
         patience_counter = ckpt.get("patience_counter", 0)
         if "reward_normalizer" in ckpt:
@@ -1494,11 +1761,12 @@ def train(cfg):
             f" patience {patience_counter})"
         )
 
-    _log()
-    _log(
-        f"[Training] {cfg.n_epochs} epochs, patience {cfg.patience}"
-        f", smoothing window {cfg.patience_smoothing}"
-    )
+        # Already completed sweep trial — skip re-training
+        if sweep_mode and (
+            start_epoch > cfg.n_epochs or patience_counter >= cfg.patience
+        ):
+            _log(f"    Already complete, returning best score {best_score:.4f}")
+            return best_score
 
     def _build_checkpoint():
         return {
@@ -1519,16 +1787,12 @@ def train(cfg):
         }
 
     for epoch in range(start_epoch, cfg.n_epochs + 1):
-        current_lr = warmup_cosine_lr(
-            effective_lr, epoch, cfg.n_epochs, cfg.warmup_epochs,
+        current_lr = warmup_lr(
+            effective_lr, epoch, cfg.warmup_epochs,
         )
         for param_group in optimizer.param_groups:
             param_group["lr"] = current_lr
-        current_entropy_coeff = cosine_entropy_coeff(
-            cfg.entropy_coeff_start, cfg.entropy_coeff_end, epoch, cfg.n_epochs,
-        )
 
-        epoch_start = time.perf_counter()
         _log()
         _log(f"[Epoch {epoch}/{cfg.n_epochs}]")
 
@@ -1551,10 +1815,12 @@ def train(cfg):
                 local_count=len(rank_train_episodes), device=cfg.device,
             )
 
+        _gae_t = time.perf_counter()
         n_local_transitions = rollout.compute_gae(
             cfg.gamma, cfg.gae_lambda, cfg.pytorch_eps,
             distributed, cfg.device,
         )
+        _log(f"    compute_gae ({time.perf_counter() - _gae_t:.1f}s)")
         if _world > 1:
             n_padded_transitions = _allreduce_max_int(
                 n_local_transitions, cfg.device,
@@ -1565,35 +1831,51 @@ def train(cfg):
         # Gradient diagnostics (before PPO updates, on a fresh batch)
         grad_contrib = None
         if cfg.diagnostic:
+            _diag_t = time.perf_counter()
             diag_n = min(cfg.batch_size, n_local_transitions)
             diag_indices = np.random.choice(
                 n_local_transitions, diag_n, replace=False,
             )
             diag_batch = rollout.get_batch(diag_indices, cfg.device)
             grad_contrib = diagnose_gradient_contributions(
-                model, diag_batch, cfg, current_entropy_coeff,
+                model, diag_batch, cfg,
             )
+            _log(f"    diagnose_gradients ({time.perf_counter() - _diag_t:.1f}s)")
 
         epoch_losses = {
             "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0,
             "clip_fraction": 0.0, "approx_kl": 0.0, "grad_norm": 0.0,
         }
-        epoch_p99_ratio = 0.0
         epoch_value_error_hist = np.zeros(_VALUE_ERROR_BINS, dtype=np.float64)
+        epoch_ve_sum = 0.0
+        epoch_ve_sum_sq = 0.0
+        epoch_ve_count = 0
         epoch_skipped = 0
         epoch_total = 0
+        per_ppo_clip_fraction = []
+        per_ppo_approx_kl = []
+        per_ppo_p99_ratio = []
+        ppo_start = time.perf_counter()
         for _ in range(cfg.ppo_epochs):
             losses = run_ppo_update(
-                model, optimizer, scaler, rollout, cfg,
+                model, optimizer, scaler,
+                rollout, cfg,
                 n_local_transitions, n_padded_transitions,
-                current_entropy_coeff,
+                cfg.entropy_coeff,
             )
             for k in epoch_losses:
                 epoch_losses[k] += losses[k]
-            epoch_p99_ratio = max(epoch_p99_ratio, losses["p99_ratio"])
+            # Accumulate across PPO epochs for consistency with scalar value_loss
             epoch_value_error_hist += losses["value_error_histogram"]
+            epoch_ve_sum += losses["ve_sum"]
+            epoch_ve_sum_sq += losses["ve_sum_sq"]
+            epoch_ve_count += losses["ve_count"]
             epoch_skipped += losses["skipped_batches"]
             epoch_total += losses["total_batches"]
+            per_ppo_clip_fraction.append(losses["clip_fraction"])
+            per_ppo_approx_kl.append(losses["approx_kl"])
+            per_ppo_p99_ratio.append(losses["p99_ratio"])
+        _log(f"    run_ppo_update ({time.perf_counter() - ppo_start:.1f}s)")
         for k in epoch_losses:
             epoch_losses[k] /= cfg.ppo_epochs
         skip_rate = epoch_skipped / max(epoch_total, 1)
@@ -1613,8 +1895,7 @@ def train(cfg):
         else:
             val_aggregated = val_result
 
-        run_ablation = cfg.ablation
-        if run_ablation:
+        if cfg.ablation:
             ablation_result = evaluate_ablated(
                 model, rank_val_episodes, cfg, global_market_features,
             )
@@ -1642,7 +1923,7 @@ def train(cfg):
             ("clip_fraction", epoch_losses["clip_fraction"]),
             ("approx_kl", epoch_losses["approx_kl"]),
             ("grad_norm", epoch_losses["grad_norm"]),
-            ("p99_ratio", epoch_p99_ratio),
+            ("p99_ratio", sum(per_ppo_p99_ratio) / cfg.ppo_epochs),
             ("loss_scale", loss_scale),
             ("skip_rate", skip_rate),
         ]:
@@ -1653,12 +1934,26 @@ def train(cfg):
             history["grad_norm_value"].append(grad_contrib["value"])
 
         # Histograms
-        history["position_histogram"].append(
+        pos_hist = (
             val_aggregated["position_histogram"]
             if "position_histogram" in val_aggregated
-            else np.zeros(cfg.position_bins, dtype=np.float64)
+            else np.zeros(_POSITION_BINS, dtype=np.float64)
         )
+        history["position_histogram"].append(pos_hist)
         history["value_error_histogram"].append(epoch_value_error_hist)
+
+        # Per-PPO-epoch heatmap data
+        history["clip_fraction_per_ppo"].append(per_ppo_clip_fraction)
+        history["approx_kl_per_ppo"].append(per_ppo_approx_kl)
+        history["p99_ratio_per_ppo"].append(per_ppo_p99_ratio)
+
+        # Histogram summary stats
+        pos_mean, pos_sd = _hist_mean_sd(pos_hist, (-1.0, 1.0))
+        if epoch_ve_count > 0:
+            ve_mean = epoch_ve_sum / epoch_ve_count
+            ve_sd = math.sqrt(epoch_ve_sum_sq / epoch_ve_count - ve_mean ** 2)
+        else:
+            ve_mean, ve_sd = 0.0, 0.0
 
         window = cfg.patience_smoothing
         recent_returns = history["val_return"][-window:]
@@ -1668,66 +1963,46 @@ def train(cfg):
         if improved:
             best_score = current_score
             patience_counter = 0
-        else:
+        elif epoch > cfg.warmup_epochs:
             patience_counter += 1
 
-        elapsed = time.perf_counter() - epoch_start
-
-        # Episodes
         _log(f"    {'Train episodes':<20s}: {len(train_episodes)}")
         _log(f"    {'Val episodes':<20s}: {len(val_episodes)}")
-
-        # Returns + Behavior
-        _log()
         _log(f"    {'Train return':<20s}: {model_return:.4f}")
         _log(f"    {'Train baseline':<20s}: {baseline_return:.4f}")
         _log(f"    {'Val return':<20s}: {val_aggregated['model_return']:.4f}")
         _log(f"    {'Val baseline':<20s}: {val_aggregated['baseline_return']:.4f}")
-        if run_ablation:
+        if cfg.ablation:
             _log(f"    {'Val no-market':<20s}: {ablation_aggregated['no_market']:.4f}")
             _log(f"    {'Val no-stock':<20s}: {ablation_aggregated['no_stock']:.4f}")
         _log(f"    {'Val beat rate':<20s}: {val_aggregated['beat_rate']:.1%}")
-        _log(f"    {'Val max drawdown':<20s}: {val_aggregated['max_drawdown']:.4f}")
+        _log(f"    {'Val max drawdown':<20s}: {val_aggregated['max_drawdown']:.1%}")
         _log(f"    {'Val turnover':<20s}: {val_aggregated['mean_turnover']:.4f}")
-
-        # Loss + PPO stability
-        _log()
+        _log(f"    {'Val position':<20s}: {pos_mean:.4f}")
+        _log(f"    {'Val position SD':<20s}: {pos_sd:.4f}")
         _log(f"    {'Policy loss':<20s}: {epoch_losses['policy_loss']:.4f}")
         _log(f"    {'Value loss':<20s}: {epoch_losses['value_loss']:.4f}")
         _log(f"    {'Entropy':<20s}: {epoch_losses['entropy']:.4f}")
         _log(f"    {'Clip fraction':<20s}: {epoch_losses['clip_fraction']:.4f}")
         _log(f"    {'Approx KL':<20s}: {epoch_losses['approx_kl']:.4f}")
-        _log(f"    {'P99 ratio':<20s}: {epoch_p99_ratio:.4f}")
-
-        # Gradient health
-        _log()
+        _log(f"    {'P99 ratio':<20s}: {sum(per_ppo_p99_ratio) / cfg.ppo_epochs:.4f}")
+        _log(f"    {'Value error':<20s}: {ve_mean:.4f}")
+        _log(f"    {'Value error SD':<20s}: {ve_sd:.4f}")
         _log(f"    {'Gradient norm':<20s}: {epoch_losses['grad_norm']:.4f}")
         if grad_contrib is not None:
             _log(f"    {'Policy grad norm':<20s}: {grad_contrib['policy']:.4f}")
             _log(f"    {'Value grad norm':<20s}: {grad_contrib['value']:.4f}")
         _log(f"    {'Loss scale':<20s}: {loss_scale:.1f}")
         _log(f"    {'Skip rate':<20s}: {skip_rate:.1%} ({epoch_skipped}/{epoch_total})")
-
-        # Schedule
-        _log()
-        _log(f"    {'LR':<20s}: {current_lr:.2e}")
-        _log(f"    {'Entropy coeff':<20s}: {current_entropy_coeff:.4f}")
-
-        # Early stopping
-        _log()
         _log(f"    {'Current score':<20s}: {current_score:.4f}")
         _log(f"    {'Best score':<20s}: {best_score:.4f}")
         _log(f"    {'Patience':<20s}: {patience_counter}/{cfg.patience}")
-        _log(f"    {'Elapsed':<20s}: {elapsed:.1f}s")
 
         if is_main:
             ckpt = _build_checkpoint()
             if improved:
-                save_checkpoint(ckpt, os.path.join(cfg.save_dir, "model_best.pt"))
-            save_checkpoint(
-                ckpt,
-                os.path.join(cfg.save_dir, "model_latest.pt"),
-            )
+                torch.save(ckpt, os.path.join(cfg.save_dir, "model_best.pt"))
+            torch.save(ckpt, os.path.join(cfg.save_dir, "model_latest.pt"))
             plot_training(
                 dict(history),
                 os.path.join(cfg.save_dir, "training_curves.png"),
@@ -1738,18 +2013,31 @@ def train(cfg):
             _log(f"    Early stopping at epoch {epoch} (patience {cfg.patience})")
             break
 
+        # Optuna pruning
+        if trial is not None:
+            trial.report(current_score, epoch)
+            if trial.should_prune():
+                _log(f"    Optuna pruned at epoch {epoch}")
+                if distributed and not sweep_mode:
+                    dist.destroy_process_group()
+                import optuna
+                raise optuna.TrialPruned()
+
     _log()
-    _log(f"Training complete, best score: {best_score:.4f}")
+    _log(f"    Training complete, best score: {best_score:.4f}")
 
     best_path = os.path.join(cfg.save_dir, "model_best.pt")
     if os.path.exists(best_path):
         ckpt = torch.load(best_path, map_location=cfg.device, weights_only=False)
-        base_model.load_state_dict(ckpt["model_state_dict"])
+        if "model_state_dict" in ckpt:
+            base_model.load_state_dict(ckpt["model_state_dict"])
 
     test_episode_rng = np.random.default_rng(cfg.seed + 1000)
     test_episodes = generate_episodes(test_data, cfg, test_episode_rng)
     rank_test_episodes = test_episodes[_rank::_world]
-    test_start = time.perf_counter()
+
+    _log()
+    _log("[Final Evaluation]")
     test_result = evaluate_episodes(
         model, rank_test_episodes, cfg, global_market_features,
     )
@@ -1759,15 +2047,12 @@ def train(cfg):
         )
     else:
         test_aggregated = test_result
-    test_elapsed = time.perf_counter() - test_start
 
-    _log()
-    _log(f"[Final Evaluation] ({test_elapsed:.1f}s)")
     _log(f"    {'Test episodes':<20s}: {len(test_episodes)}")
     _log(f"    {'Test return':<20s}: {test_aggregated['model_return']:.4f}")
     _log(f"    {'Test baseline':<20s}: {test_aggregated['baseline_return']:.4f}")
     _log(f"    {'Test beat rate':<20s}: {test_aggregated['beat_rate']:.1%}")
-    _log(f"    {'Test max drawdown':<20s}: {test_aggregated['max_drawdown']:.4f}")
+    _log(f"    {'Test max drawdown':<20s}: {test_aggregated['max_drawdown']:.1%}")
     _log(f"    {'Test turnover':<20s}: {test_aggregated['mean_turnover']:.4f}")
 
     if distributed:
@@ -1781,6 +2066,216 @@ def train(cfg):
         all_rows = build_test_results(test_episodes, full_result, cfg)
         results_path = os.path.join(cfg.save_dir, "test_results.csv")
         pd.DataFrame(all_rows).to_csv(results_path, index=False)
+        _log(f"    {'Saved':<20s}: {results_path}")
+
+    if distributed and not sweep_mode:
+        dist.destroy_process_group()
+
+    return best_score
+
+
+# Optuna sweep
+
+def sweep(cfg):
+    """Run Optuna hyperparameter sweep with TPE sampler and median pruning.
+
+    Each trial overrides Config fields and calls train(). The objective is
+    the best smoothed validation return. Trials are persisted to SQLite so
+    multiple processes can run in parallel against the same database.
+
+    Automatically uses DDP when multiple GPUs are available.  Rank 0 drives
+    Optuna and broadcasts trial parameters to all ranks.
+
+    Monitor with: optuna-dashboard sqlite:///ppo_sweep.db
+    """
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    global _rank, _world
+
+    distributed = "RANK" in os.environ
+    if distributed:
+        dist.init_process_group("nccl")
+        _rank = dist.get_rank()
+        _world = dist.get_world_size()
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        cfg.device = f"cuda:{local_rank}"
+    is_main = _rank == 0
+
+    if is_main:
+        _log()
+        _log("[Configuration]")
+        for name in Config.__annotations__:
+            _log(f"    {name:<20s}: {getattr(cfg, name)}")
+
+    # Load data once for all trials (each rank loads independently)
+    if is_main:
+        _log()
+        _log("[Data]")
+    market = load_market_data(cfg.market_path)
+    train_data, stock_feature_cols = load_stock_data(
+        cfg.train_path, market["date_to_idx"],
+    )
+    val_data, _ = load_stock_data(cfg.val_path, market["date_to_idx"])
+    test_data, _ = load_stock_data(cfg.test_path, market["date_to_idx"])
+    if is_main:
+        _log(f"    {'Train symbols':<20s}: {len(train_data)}")
+        _log(f"    {'Val symbols':<20s}: {len(val_data)}")
+        _log(f"    {'Test symbols':<20s}: {len(test_data)}")
+        _log(f"    {'Train observations':<20s}: {sum(len(d['features']) for d in train_data.values()):,}")
+        _log(f"    {'Val observations':<20s}: {sum(len(d['features']) for d in val_data.values()):,}")
+        _log(f"    {'Test observations':<20s}: {sum(len(d['features']) for d in test_data.values()):,}")
+        _log(f"    {'Stock features':<20s}: {len(stock_feature_cols)}")
+        _log(f"    {'Market features':<20s}: {len(market['columns'])}")
+    data = (market, train_data, val_data, test_data, stock_feature_cols)
+
+    if is_main:
+        all_feature_cols = stock_feature_cols + market["columns"]
+        stock_groups, market_groups, stock_feature_indices, market_feature_indices = (
+            split_feature_groups(all_feature_cols)
+        )
+        _log()
+        _log("[Model]")
+        _log(f"    {'Stock groups':<20s}: {len(stock_groups)}")
+        _log(f"    {'Market groups':<20s}: {len(market_groups)}")
+        tmp_model = PolicyNetwork(
+            stock_groups, market_groups,
+            stock_feature_indices, market_feature_indices, cfg,
+        )
+        n_params = sum(p.numel() for p in tmp_model.parameters())
+        _log(f"    {'Parameters':<20s}: {n_params:,}")
+        del tmp_model
+
+    _SWEEP_KEYS = [
+        "dropout", "market_dropout", "value_coeff", "entropy_coeff",
+        "lr", "weight_decay", "xattn_weight_decay",
+    ]
+
+    def _param_hash(params):
+        return hashlib.md5(
+            json.dumps({k: params[k] for k in sorted(_SWEEP_KEYS)}).encode(),
+        ).hexdigest()[:12]
+
+    # Only rank 0 manages Optuna
+    study = None
+    if is_main:
+        study = optuna.create_study(
+            study_name="ppo_stock_sweep",
+            direction="maximize",
+            sampler=optuna.samplers.TPESampler(n_startup_trials=10),
+            pruner=optuna.pruners.MedianPruner(
+                n_startup_trials=5, n_warmup_steps=20,
+            ),
+            storage=cfg.sweep_db,
+            load_if_exists=True,
+        )
+
+        # Re-enqueue crashed trials that left checkpoints on disk
+        retryable = (optuna.trial.TrialState.FAIL, optuna.trial.TrialState.RUNNING)
+        for t in study.trials:
+            if t.state in retryable and t.params:
+                h = _param_hash(t.params)
+                if os.path.exists(os.path.join("sweep_runs", h, "model_latest.pt")):
+                    study.enqueue_trial(t.params)
+                    _log(f"    Re-enqueued trial {t.number} ({h})")
+
+    results_path = os.path.join("sweep_runs", "sweep_results.csv")
+    plot_path = os.path.join("sweep_runs", "sweep_best_scores.png")
+
+    def _save_results():
+        rows = []
+        for t in study.trials:
+            row = {"trial": t.number, "state": t.state.name, "score": t.value}
+            row.update(t.params)
+            rows.append(row)
+        pd.DataFrame(rows).to_csv(results_path, index=False)
+
+        complete = [
+            t for t in study.trials
+            if t.state == optuna.trial.TrialState.COMPLETE
+        ]
+        if not complete:
+            return
+        scores = [t.value for t in complete]
+        best_so_far = np.maximum.accumulate(scores)
+        trials_x = range(1, len(scores) + 1)
+
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.scatter(trials_x, scores, alpha=0.4, s=15, color="b", label="Trial score")
+        ax.plot(trials_x, best_so_far, color="r", linewidth=2, label="Best so far")
+        ax.set_xlabel("Completed trial")
+        ax.set_ylabel("Score")
+        ax.set_title("Sweep Progress")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+    # Manual trial loop so we can broadcast params across ranks
+    while True:
+        # Rank 0 picks params and checks stopping condition
+        params = None
+        trial_number = -1
+        if is_main:
+            n_complete = len([
+                t for t in study.trials
+                if t.state == optuna.trial.TrialState.COMPLETE
+            ])
+            if n_complete >= cfg.sweep_trials:
+                params = None  # signal to stop
+            else:
+                trial = study.ask()
+                trial.suggest_float("dropout", 0.0, 0.2)
+                trial.suggest_float("market_dropout", 0.3, 0.7)
+                trial.suggest_float("value_coeff", 0.01, 1.0, log=True)
+                trial.suggest_float("entropy_coeff", 0.001, 0.1, log=True)
+                trial.suggest_float("lr", 3e-5, 3e-4, log=True)
+                trial.suggest_float("weight_decay", 0.001, 0.1, log=True)
+                trial.suggest_float("xattn_weight_decay", 0.01, 0.1, log=True)
+                params = trial.params
+                trial_number = trial.number
+
+        # Broadcast params (or None to signal stop)
+        if distributed:
+            broadcast_list = [params]
+            dist.broadcast_object_list(broadcast_list, src=0)
+            params = broadcast_list[0]
+
+        if params is None:
+            break
+
+        # All ranks apply params
+        for k, v in params.items():
+            setattr(cfg, k, v)
+        param_hash = _param_hash(params)
+        cfg.save_dir = os.path.join("sweep_runs", param_hash)
+        cfg.ablation = False
+        cfg.diagnostic = False
+
+        if is_main:
+            _log()
+            _log(f"[Optuna Trial {trial_number}]")
+            _log(f"    {'hash':<20s}: {param_hash}")
+            for key in _SWEEP_KEYS:
+                _log(f"    {key:<20s}: {getattr(cfg, key)}")
+
+        # All ranks train together (DDP sync happens inside train)
+        score = train(cfg, data=data, sweep_mode=True)
+
+        # Rank 0 reports result
+        if is_main:
+            study.tell(trial, score)
+            _save_results()
+
+    if is_main:
+        _log()
+        _log("[Sweep Complete]")
+        _log(f"    {'Best trial':<20s}: {study.best_trial.number}")
+        _log(f"    {'Best score':<20s}: {study.best_value:.4f}")
+        for key, value in study.best_params.items():
+            _log(f"    {key:<20s}: {value}")
         _log(f"    {'Saved':<20s}: {results_path}")
 
     if distributed:
@@ -1798,7 +2293,10 @@ def _spawn_ddp_worker(local_rank, cfg_dict, n_gpus, port):
     cfg = Config()
     for key, value in cfg_dict.items():
         setattr(cfg, key, value)
-    train(cfg)
+    if cfg.sweep:
+        sweep(cfg)
+    else:
+        train(cfg)
 
 
 def _find_free_port():
@@ -1842,6 +2340,8 @@ def main():
             nprocs=n_gpus,
             join=True,
         )
+    elif cfg.sweep:
+        sweep(cfg)
     else:
         train(cfg)
 
