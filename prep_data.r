@@ -248,8 +248,7 @@ for (b in seq_along(batches)) {
     .combine = "c"
   ) %dofuture% {
     data %>%
-      mutate(price = close) %>%
-      select(symbol, date, price) %>%
+      select(symbol, date, open, close) %>%
       bind_cols(
         ehlers_features(
           close     = data$close,

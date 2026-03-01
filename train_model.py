@@ -1,13 +1,13 @@
 """
 PPO + Transformer RL for stock trading.
 
-Stock CSV: symbol, date, price, <stock_feat_1>, ...
+Stock CSV: symbol, date, open, close, <stock_feat_1>, ...
 Market CSV: date, <mkt_feat_1>, ...  (columns except date start with "mkt_")
 
 Market features loaded separately, aligned to stock data at each lookback
 window's last date. Features with "mkt_" prefix route through cross-attention.
 
-Continuous position sizing in [-1, 1] with Beta distribution policy.
+Continuous position sizing in [-1, 1] with squashed Gaussian policy (tanh).
 
 Architecture: shared-trunk PolicyNetwork (SB3-style shared feature extractor) with
 transformer trunk. Orthogonal initialization on MLP heads (gain sqrt(2)
@@ -87,31 +87,36 @@ class Config:
     n_layers: int = 3
     head_hidden_dim: int = 128
     position_dim: int = 16
-    dropout: float = 0.1
-    market_dropout: float = 0.4
+    dropout: float = 0.0
+    market_dropout: float = 0.5
+    log_std_init: float = -0.5
+    log_std_min: float = -5.0
+    log_std_max: float = 2.0
 
-    # PPO
+    # RL algorithm
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    policy_clip: float = 0.2
-    grad_clip: float = 0.5
-    value_coeff: float = 0.01
-    entropy_coeff: float = 0.1
-    ppo_epochs: int = 2
+    reward_ema_decay: float = 0.99
+
+    # PPO
+    ppo_epochs: int = 4
     batch_size: int = 4096
+    policy_clip: float = 0.2
+
+    # Loss
+    value_coeff: float = 0.5
+    entropy_coeff: float = 0.01
 
     # Optimizer
     lr: float = 1e-4
     adam_eps: float = 1e-5
     weight_decay: float = 0.02
     xattn_weight_decay: float = 0.05
-    warmup_epochs: int = 5
+    grad_clip: float = 0.5
 
-    # Reward
-    reward_ema_decay: float = 0.99
-
-    # Training
+    # Training schedule
     n_epochs: int = 200
+    warmup_epochs: int = 5
     patience: int = 20
     patience_smoothing: int = 10
     seed: int = 42
@@ -168,6 +173,13 @@ class VecEnv:
     rows from the episode's stock_features. The market slice is ``lookback``
     consecutive rows from the global market array, ending at the market row
     whose date matches the stock window's last date.
+
+    Execution model (open-to-open):
+        - Agent observes features through day d's close.
+        - Position executes at day d+1's open.
+        - Reward = log(open[d+2]/open[d+1]), decomposed as
+          log(close[d+1]/open[d+1]) + log(open[d+2]/close[d+1]),
+          where the overnight gap is clamped per A-share price limits.
     """
 
     def __init__(self, episodes, lookback, transaction_cost, global_market_features):
@@ -199,7 +211,7 @@ class VecEnv:
         new_position = np.clip(actions.astype(np.float64), -1.0, 1.0)
         reward = (
             self.position * self.log_returns[:, self.current_step]
-            - self.transaction_cost * np.abs(new_position - self.position)
+            + np.log1p(-self.transaction_cost * np.abs(new_position - self.position))
         ).astype(np.float32)
         self.position = new_position
         self.current_step += 1
@@ -448,6 +460,8 @@ class PolicyNetwork(nn.Module):
     def __init__(self, stock_groups, market_groups, stock_feature_indices,
                  market_feature_indices, cfg):
         super().__init__()
+        self.log_std_min = cfg.log_std_min
+        self.log_std_max = cfg.log_std_max
         self.trunk = Trunk(
             stock_groups, market_groups,
             stock_feature_indices, market_feature_indices, cfg,
@@ -456,8 +470,9 @@ class PolicyNetwork(nn.Module):
         self.policy_head = nn.Sequential(
             nn.Linear(head_input_dim, cfg.head_hidden_dim),
             nn.ReLU(),
-            nn.Linear(cfg.head_hidden_dim, 2),
+            nn.Linear(cfg.head_hidden_dim, 1),
         )
+        self.log_std = nn.Parameter(torch.full((), cfg.log_std_init))
         self.value_head = nn.Sequential(
             nn.Linear(head_input_dim, cfg.head_hidden_dim),
             nn.ReLU(),
@@ -466,11 +481,10 @@ class PolicyNetwork(nn.Module):
 
     def forward(self, x, position):
         pooled = self.trunk(x, position)
-        ab = self.policy_head(pooled)  # (batch, 2)
-        alpha = F.softplus(ab[:, 0]) + 1.0
-        beta = F.softplus(ab[:, 1]) + 1.0
+        mu = self.policy_head(pooled).squeeze(-1)
+        log_std = self.log_std.clamp(self.log_std_min, self.log_std_max)
         values = self.value_head(pooled).squeeze(-1)
-        return alpha, beta, values
+        return mu, log_std.expand_as(mu), values
 
 
 def _ortho_init(module):
@@ -500,50 +514,57 @@ def _ortho_init(module):
             nn.init.constant_(layer.bias, 0.0)
 
 
-def _make_beta(alpha, beta):
-    """Create Beta distribution in float32 for numerical safety under AMP.
+def _squashed_gaussian_log_prob(u, mu, log_std):
+    """Log-prob of a tanh-squashed Gaussian, numerically stable.
 
-    Beta.log_prob and Beta.entropy use lgamma internally, which overflows
-    in float16 once parameters grow beyond ~10. Promoting to float32 here
-    ensures all downstream distribution ops (sample, log_prob, entropy)
-    inherit float32 regardless of autocast context.
+    u:       pre-tanh sample (the raw Gaussian draw)
+    mu:      mean of the Gaussian
+    log_std: log standard deviation
+
+    Gaussian log-prob is computed entirely in log-space to avoid
+    exponentiating log_std (cfg.log_std_min guarantees std >= exp(-5)).
+    Uses the identity log(1 - tanh²(u)) = 2(log(2) - u - softplus(-2u))
+    to avoid the catastrophic cancellation in 1 - tanh²(u) when |u| > 5.
     """
-    return torch.distributions.Beta(
-        alpha.float().clamp(min=1.001), beta.float().clamp(min=1.001),
+    # Gaussian log-prob in log-space: -0.5*(u-mu)²/σ² = -0.5*(u-mu)²*exp(-2*log_std)
+    gauss_log_prob = (
+        -0.5 * (u - mu) ** 2 * torch.exp(-2.0 * log_std)
+        - log_std
+        - 0.5 * math.log(2 * math.pi)
     )
+    # Stable squash correction: log(1 - tanh²(u)) = 2(log(2) - u - softplus(-2u))
+    squash_correction = 2.0 * (math.log(2.0) - u - F.softplus(-2.0 * u))
+    return gauss_log_prob + squash_correction
 
 
 def sample_stochastic(model, states, position):
-    alpha, beta, values = model(states, position)
-    dist_obj = _make_beta(alpha, beta)
-    action_01 = dist_obj.sample()  # in [0, 1]
-    log_prob = dist_obj.log_prob(action_01)
-    action = 2.0 * action_01 - 1.0  # rescale to [-1, 1]
-    return action, action_01, log_prob, values
+    mu, log_std, values = model(states, position)
+    std = log_std.exp()
+    u = mu + std * torch.randn_like(std)        # reparameterized sample
+    log_prob = _squashed_gaussian_log_prob(u.float(), mu.float(), log_std.float())
+    action = u.tanh()                            # squashed into (-1, 1)
+    return action, u, log_prob, values           # store u (pre-tanh) as raw
 
 
 def select_greedy(model, states, position):
-    alpha, beta, values = model(states, position)
-    mean_01 = alpha / (alpha + beta)
-    action = 2.0 * mean_01 - 1.0
-    return action, values
-
-
-def select_greedy_actor_only(model, states, position):
-    """Greedy action from model (value output discarded)."""
-    alpha, beta, _ = model(states, position)
-    mean_01 = alpha / (alpha + beta)
-    return 2.0 * mean_01 - 1.0
+    """Greedy action with mu for diagnostics."""
+    mu, log_std, values = model(states, position)
+    action = mu.tanh()
+    return action, values, mu
 
 
 def evaluate_actions(model, states, raw_actions, position):
-    """raw_actions stores the [0, 1] sample from the Beta distribution."""
-    alpha, beta, values = model(states, position)
-    dist_obj = _make_beta(alpha, beta)
-    # Clamp stored samples away from boundaries for numerical stability
-    action_01 = raw_actions.clamp(1e-6, 1.0 - 1e-6)
-    log_prob = dist_obj.log_prob(action_01)
-    entropy = dist_obj.entropy()
+    """raw_actions stores the pre-tanh Gaussian sample u."""
+    mu, log_std, values = model(states, position)
+    mu, log_std = mu.float(), log_std.float()
+    u = raw_actions.float()
+
+    log_prob = _squashed_gaussian_log_prob(u, mu, log_std)
+
+    # No closed-form entropy for squashed Gaussian (matching SB3).
+    # Use sample-based estimate: H ≈ -E[log π(a)]
+    entropy = -log_prob
+
     return log_prob, entropy, values
 
 
@@ -576,30 +597,18 @@ def _batched_greedy(model, obs, pos, cfg):
     n = obs.shape[0]
     actions = np.empty(n, dtype=np.float32)
     vals = np.empty(n, dtype=np.float32)
+    mus = np.empty(n, dtype=np.float32)
     amp_enabled = cfg.use_amp and cfg.device.startswith("cuda")
     with torch.no_grad(), torch.amp.autocast("cuda", enabled=amp_enabled):
         for i in range(0, n, cfg.inference_batch):
             j = min(i + cfg.inference_batch, n)
             s = torch.from_numpy(obs[i:j]).to(cfg.device)
             p = torch.from_numpy(pos[i:j]).to(cfg.device)
-            a, v = select_greedy(model, s, p)
+            a, v, mu = select_greedy(model, s, p)
             actions[i:j] = a.cpu().numpy()
             vals[i:j] = v.cpu().numpy()
-    return actions, vals
-
-
-def _batched_greedy_actor_only(model, obs, pos, cfg):
-    """Greedy actions (value output discarded)."""
-    n = obs.shape[0]
-    actions = np.empty(n, dtype=np.float32)
-    amp_enabled = cfg.use_amp and cfg.device.startswith("cuda")
-    with torch.no_grad(), torch.amp.autocast("cuda", enabled=amp_enabled):
-        for i in range(0, n, cfg.inference_batch):
-            j = min(i + cfg.inference_batch, n)
-            s = torch.from_numpy(obs[i:j]).to(cfg.device)
-            p = torch.from_numpy(pos[i:j]).to(cfg.device)
-            actions[i:j] = select_greedy_actor_only(model, s, p).cpu().numpy()
-    return actions
+            mus[i:j] = mu.cpu().numpy()
+    return actions, vals, mus
 
 
 # Rollout buffer
@@ -738,18 +747,18 @@ def load_stock_data(path, market_date_to_idx):
     df = _read_csv(path, dtype={"symbol": str})
     df.sort_values(["symbol", "date"], inplace=True)
     df.reset_index(drop=True, inplace=True)
-    feature_cols = [c for c in df.columns if c not in ("symbol", "date", "price")]
+    feature_cols = [c for c in df.columns if c not in ("symbol", "date", "open", "close")]
     symbols = df["symbol"].values
-    prices = df["price"].values.astype(np.float64)
+    opens = df["open"].values.astype(np.float64)
+    closes = df["close"].values.astype(np.float64)
     features = df[feature_cols].values.astype(np.float32)
     dates = df["date"].values
 
     symbol_breaks = np.flatnonzero(symbols[1:] != symbols[:-1]) + 1
 
-    ratio = np.ones(len(prices), dtype=np.float64)
-    ratio[1:] = prices[1:] / prices[:-1]
-    ratio[symbol_breaks] = 1.0
-
+    # Price limit bands (Chinese A-share rules).
+    # STAR (68xxxx) and ChiNext (300xxx post 2020-08-24): ±20%.
+    # Mainboard: ±10%. Strict limits applied to overnight gap.
     sym_str = symbols.astype(str)
     starts_with_68 = np.char.startswith(sym_str, "68")
     starts_with_30 = np.char.startswith(sym_str, "30")
@@ -757,9 +766,25 @@ def load_stock_data(path, market_date_to_idx):
     after_cutoff = dates >= _dt.date(2020, 8, 24)
     wide = starts_with_68 | (starts_with_30 & after_cutoff)
 
-    lo = np.where(wide, 0.79, 0.89)
-    hi = np.where(wide, 1.21, 1.11)
-    ratio = np.clip(ratio, lo, hi)
+    lo = np.where(wide, 0.80, 0.90)
+    hi = np.where(wide, 1.20, 1.10)
+
+    # Open-to-open return decomposition:
+    #   ratio[t] = open[t] / open[t-1]
+    #            = (close[t-1] / open[t-1]) * (open[t] / close[t-1])
+    #            = intraday[t-1]             * overnight[t]
+    #
+    # Intraday (same-day close/open): unclamped — both prices lie within
+    # the same limit band relative to the previous close.
+    # Overnight gap (next open / this close): clamped using next day's
+    # price limit band, since open[t] is constrained by close[t-1] per
+    # day t's rules.
+    intraday_prev = closes[:-1] / opens[:-1]       # close[t-1]/open[t-1]
+    overnight_gap = opens[1:] / closes[:-1]         # open[t]/close[t-1]
+    overnight_gap = np.clip(overnight_gap, lo[1:], hi[1:])  # day t's limits
+
+    ratio = np.ones(len(opens), dtype=np.float64)
+    ratio[1:] = intraday_prev * overnight_gap
     ratio[symbol_breaks] = 1.0
     ratio[0] = 1.0
     log_returns = np.log(ratio).astype(np.float32)
@@ -782,7 +807,8 @@ def load_stock_data(path, market_date_to_idx):
             "features": features[start_row:end_row],
             "log_returns": log_returns[start_row:end_row],
             "dates": symbol_dates.tolist(),
-            "prices": prices[start_row:end_row],
+            "opens": opens[start_row:end_row],
+            "closes": closes[start_row:end_row],
             "market_indices": market_indices,
         }
     return data, feature_cols
@@ -832,7 +858,8 @@ def generate_episodes(stock_data, cfg, epoch_rng):
                     "market_indices": market_slice,
                     "log_returns": symbol_data["log_returns"][start : start + chunk_size],
                     "dates": symbol_data["dates"][start : start + chunk_size],
-                    "prices": symbol_data["prices"][start : start + chunk_size],
+                    "opens": symbol_data["opens"][start : start + chunk_size],
+                    "closes": symbol_data["closes"][start : start + chunk_size],
                 })
             start += cfg.episode_length
 
@@ -858,11 +885,11 @@ def compute_max_drawdown(reward_matrix):
 # Baseline
 
 def compute_baseline_rewards(episodes, cfg):
-    """Buy-and-hold baseline: enter long at step 0, hold for remaining steps."""
+    """Buy-and-hold baseline: enter long at open of day lookback, hold."""
     log_returns = np.stack([ep["log_returns"] for ep in episodes])
     trading_returns = log_returns[:, cfg.lookback :]
     rewards = np.empty_like(trading_returns)
-    rewards[:, 0] = -cfg.transaction_cost
+    rewards[:, 0] = np.log1p(-cfg.transaction_cost)
     rewards[:, 1:] = trading_returns[:, 1:]
     return rewards
 
@@ -909,7 +936,7 @@ def collect_training_rollout(model, episodes, cfg, global_market_features,
         rollout.rewards[:, step] = rewards
 
     terminal_obs = env.terminal_observation()
-    _, terminal_values = _batched_greedy(model, terminal_obs, pos, cfg)
+    _, terminal_values, _ = _batched_greedy(model, terminal_obs, pos, cfg)
     rollout.final_values[:] = terminal_values
     env.close()
 
@@ -934,6 +961,7 @@ def evaluate_deterministic(model, episodes, cfg, global_market_features):
     episode_length = cfg.episode_length
     all_rewards = np.empty((n_episodes, episode_length), dtype=np.float32)
     all_positions = np.empty((n_episodes, episode_length), dtype=np.float32)
+    all_mus = np.empty((n_episodes, episode_length), dtype=np.float32)
 
     env = ParallelVecEnv(
         episodes, cfg.lookback, cfg.transaction_cost,
@@ -942,13 +970,14 @@ def evaluate_deterministic(model, episodes, cfg, global_market_features):
     obs, pos = env.reset()
     model.eval()
     for step in range(episode_length):
-        actions = _batched_greedy_actor_only(model, obs, pos, cfg)
+        actions, _, mus = _batched_greedy(model, obs, pos, cfg)
         obs, rewards, _, pos = env.step(actions)
         all_rewards[:, step] = rewards
         all_positions[:, step] = actions
+        all_mus[:, step] = mus
     env.close()
 
-    return all_rewards, all_positions
+    return all_rewards, all_positions, all_mus
 
 
 @timed
@@ -958,12 +987,16 @@ def evaluate_episodes(model, episodes, cfg, global_market_features):
             "model_return": 0.0, "baseline_return": 0.0, "beat_rate": 0.0,
             "max_drawdown": 0.0, "mean_turnover": 0.0,
             "position_histogram": np.zeros(_POSITION_BINS, dtype=np.float64),
+            "mu_histogram": np.zeros(_MU_BINS, dtype=np.float64),
+            "pos_sum": 0.0, "pos_sum_sq": 0.0, "n_actions": 0,
+            "mu_sum": 0.0, "mu_sum_sq": 0.0,
             "model_rewards": np.empty((0, cfg.episode_length)),
             "baseline_rewards": np.empty((0, cfg.episode_length)),
             "model_positions": np.empty((0, cfg.episode_length), dtype=np.float32),
+            "model_mus": np.empty((0, cfg.episode_length)),
         }
 
-    model_rewards, model_positions = evaluate_deterministic(
+    model_rewards, model_positions, model_mus = evaluate_deterministic(
         model, episodes, cfg, global_market_features,
     )
     baseline_rewards = compute_baseline_rewards(episodes, cfg)
@@ -971,13 +1004,23 @@ def evaluate_episodes(model, episodes, cfg, global_market_features):
     baseline_returns = compute_episode_returns(baseline_rewards)
 
     # Position histogram
+    pos_flat = model_positions.ravel().astype(np.float64)
     pos_hist, _ = np.histogram(
-        model_positions.ravel(), bins=_POSITION_BINS, range=(-1.0, 1.0),
+        pos_flat, bins=_POSITION_BINS, range=(-1.0, 1.0),
     )
     pos_hist = pos_hist.astype(np.float64)
 
-    # Mean absolute turnover
-    turnover = float(np.abs(np.diff(model_positions, axis=1)).mean())
+    # Mu histogram
+    mu_flat = model_mus.ravel().astype(np.float64)
+    mu_hist, _ = np.histogram(
+        mu_flat, bins=_MU_BINS, range=_MU_RANGE,
+    )
+    mu_hist = mu_hist.astype(np.float64)
+
+    n_actions = int(model_positions.size)
+
+    # Per-episode total turnover, averaged across episodes
+    turnover = float(np.abs(np.diff(model_positions, axis=1)).sum(axis=1).mean())
 
     return {
         "model_return": float(model_returns.mean()),
@@ -986,9 +1029,16 @@ def evaluate_episodes(model, episodes, cfg, global_market_features):
         "max_drawdown": compute_max_drawdown(model_rewards),
         "mean_turnover": turnover,
         "position_histogram": pos_hist,
+        "mu_histogram": mu_hist,
+        "pos_sum": float(pos_flat.sum()),
+        "pos_sum_sq": float((pos_flat ** 2).sum()),
+        "n_actions": n_actions,
+        "mu_sum": float(mu_flat.sum()),
+        "mu_sum_sq": float((mu_flat ** 2).sum()),
         "model_rewards": model_rewards,
         "baseline_rewards": baseline_rewards,
         "model_positions": model_positions,
+        "model_mus": model_mus,
     }
 
 
@@ -999,7 +1049,7 @@ def evaluate_ablated(model, episodes, cfg, global_market_features):
         return {"no_market": 0.0, "no_stock": 0.0}
 
     zero_market = np.zeros_like(global_market_features)
-    no_market_rewards, _ = evaluate_deterministic(
+    no_market_rewards, _, _ = evaluate_deterministic(
         model, episodes, cfg, zero_market,
     )
 
@@ -1007,7 +1057,7 @@ def evaluate_ablated(model, episodes, cfg, global_market_features):
         {**ep, "stock_features": np.zeros_like(ep["stock_features"])}
         for ep in episodes
     ]
-    no_stock_rewards, _ = evaluate_deterministic(
+    no_stock_rewards, _, _ = evaluate_deterministic(
         model, zero_episodes, cfg, global_market_features,
     )
 
@@ -1049,24 +1099,32 @@ def diagnose_gradient_contributions(model, batch, cfg):
         value_loss = cfg.value_coeff * F.mse_loss(new_values, returns)
 
     norms = {}
+    all_params = list(base_model.parameters())
 
     # Policy gradient norm
     base_model.zero_grad()
     policy_loss.backward(retain_graph=True)
-    total = 0.0
-    for p in base_model.parameters():
-        if p.grad is not None:
-            total += p.grad.data.norm(2).item() ** 2
-    norms["policy"] = total ** 0.5
+    policy_grads = torch.cat([
+        p.grad.data.flatten() if p.grad is not None
+        else torch.zeros_like(p.data.flatten())
+        for p in all_params
+    ])
+    norms["policy"] = policy_grads.norm(2).item()
 
     # Value gradient norm
     base_model.zero_grad()
     value_loss.backward()
-    total = 0.0
-    for p in base_model.parameters():
-        if p.grad is not None:
-            total += p.grad.data.norm(2).item() ** 2
-    norms["value"] = total ** 0.5
+    value_grads = torch.cat([
+        p.grad.data.flatten() if p.grad is not None
+        else torch.zeros_like(p.data.flatten())
+        for p in all_params
+    ])
+    norms["value"] = value_grads.norm(2).item()
+
+    # Cosine similarity between policy and value gradients
+    norms["cosine_sim"] = F.cosine_similarity(
+        policy_grads.unsqueeze(0), value_grads.unsqueeze(0),
+    ).item()
 
     base_model.zero_grad()
     return norms
@@ -1074,9 +1132,11 @@ def diagnose_gradient_contributions(model, batch, cfg):
 
 # PPO update
 
-_VALUE_ERROR_BINS = 50
-_VALUE_ERROR_RANGE = (-3.0, 3.0)
+_VALUE_PRED_BINS = 50
+_VALUE_PRED_RANGE = (-10.0, 10.0)
 _POSITION_BINS = 50
+_MU_BINS = 50
+_MU_RANGE = (-3.0, 3.0)
 
 
 def run_ppo_update(model, optimizer, scaler,
@@ -1096,11 +1156,13 @@ def run_ppo_update(model, optimizer, scaler,
     grad_norm_sum = 0.0
     grad_norm_count = 0
     skipped_batches = 0
-    all_ratios = []
-    value_error_hist = np.zeros(_VALUE_ERROR_BINS, dtype=np.float64)
-    ve_sum = 0.0
-    ve_sum_sq = 0.0
-    ve_count = 0
+    value_pred_hist = np.zeros(_VALUE_PRED_BINS, dtype=np.float64)
+    value_target_hist = np.zeros(_VALUE_PRED_BINS, dtype=np.float64)
+    vp_sum = 0.0
+    vp_sum_sq = 0.0
+    vt_sum = 0.0
+    vt_sum_sq = 0.0
+    v_count = 0
     n_batches = 0
     amp_enabled = cfg.use_amp and cfg.device.startswith("cuda")
 
@@ -1123,15 +1185,6 @@ def run_ppo_update(model, optimizer, scaler,
             log_ratio = new_log_probs - batch["log_probs"]
             ratio = torch.exp(log_ratio)
             advantages = batch["advantages"]
-
-            with torch.no_grad():
-                if valid_mask is not None:
-                    bw = valid_mask[batch_start:batch_end]
-                    valid_ratios = ratio[bw]
-                    if valid_ratios.numel() > 0:
-                        all_ratios.append(valid_ratios.cpu())
-                else:
-                    all_ratios.append(ratio.cpu())
 
             surrogate = torch.min(
                 ratio * advantages,
@@ -1168,32 +1221,42 @@ def run_ppo_update(model, optimizer, scaler,
             base_model.parameters(), cfg.grad_clip,
         ).item()
 
-        if math.isinf(combined_norm):
+        if not math.isfinite(combined_norm):
             skipped_batches += 1
 
         scaler.step(optimizer)
         scaler.update()
 
-        # Value error histogram (in normalized reward space)
+        # Value prediction and value target histograms
         with torch.no_grad():
-            residual = (new_values - batch["returns"]).float().cpu().numpy()
+            values_np = new_values.float().cpu().numpy()
+            targets_np = batch["returns"].float().cpu().numpy()
             if valid_mask is not None:
                 bw_np = valid_mask[batch_start:batch_end].cpu().numpy().astype(bool)
-                residual = residual[bw_np]
-            hist, _ = np.histogram(
-                residual, bins=_VALUE_ERROR_BINS, range=_VALUE_ERROR_RANGE,
+                values_np = values_np[bw_np]
+                targets_np = targets_np[bw_np]
+            vp_hist, _ = np.histogram(
+                np.clip(values_np, *_VALUE_PRED_RANGE),
+                bins=_VALUE_PRED_BINS, range=_VALUE_PRED_RANGE,
             )
-            value_error_hist += hist.astype(np.float64)
-            ve_sum += residual.sum()
-            ve_sum_sq += (residual ** 2).sum()
-            ve_count += len(residual)
+            value_pred_hist += vp_hist.astype(np.float64)
+            vt_hist, _ = np.histogram(
+                np.clip(targets_np, *_VALUE_PRED_RANGE),
+                bins=_VALUE_PRED_BINS, range=_VALUE_PRED_RANGE,
+            )
+            value_target_hist += vt_hist.astype(np.float64)
+            vp_sum += values_np.sum()
+            vp_sum_sq += (values_np ** 2).sum()
+            vt_sum += targets_np.sum()
+            vt_sum_sq += (targets_np ** 2).sum()
+            v_count += len(values_np)
 
         policy_loss_sum += policy_loss.item()
         value_loss_sum += value_loss.item()
         entropy_sum += entropy_term.item()
         clip_fraction_sum += clip_frac.item()
         approx_kl_sum += approx_kl_batch.item()
-        if not math.isinf(combined_norm):
+        if math.isfinite(combined_norm):
             grad_norm_sum += combined_norm
             grad_norm_count += 1
         n_batches += 1
@@ -1203,7 +1266,8 @@ def run_ppo_update(model, optimizer, scaler,
             [policy_loss_sum, value_loss_sum, entropy_sum,
              clip_fraction_sum, approx_kl_sum, grad_norm_sum,
              float(n_batches), float(skipped_batches),
-             float(grad_norm_count), ve_sum, ve_sum_sq, float(ve_count)],
+             float(grad_norm_count),
+             vp_sum, vp_sum_sq, vt_sum, vt_sum_sq, float(v_count)],
             device=cfg.device,
         )
         dist.all_reduce(sync_tensor)
@@ -1216,35 +1280,21 @@ def run_ppo_update(model, optimizer, scaler,
         n_batches = int(sync_tensor[6].item())
         skipped_batches = int(sync_tensor[7].item())
         grad_norm_count = int(sync_tensor[8].item())
-        ve_sum = sync_tensor[9].item()
-        ve_sum_sq = sync_tensor[10].item()
-        ve_count = int(sync_tensor[11].item())
+        vp_sum = sync_tensor[9].item()
+        vp_sum_sq = sync_tensor[10].item()
+        vt_sum = sync_tensor[11].item()
+        vt_sum_sq = sync_tensor[12].item()
+        v_count = int(sync_tensor[13].item())
 
-        # All-reduce value error histogram
-        hist_tensor = torch.tensor(value_error_hist, device=cfg.device, dtype=torch.float64)
-        dist.all_reduce(hist_tensor)
-        value_error_hist = hist_tensor.cpu().numpy()
+        # All-reduce value prediction histogram
+        vp_tensor = torch.tensor(value_pred_hist, device=cfg.device, dtype=torch.float64)
+        dist.all_reduce(vp_tensor)
+        value_pred_hist = vp_tensor.cpu().numpy()
 
-    # Compute p99 ratio from collected ratios
-    if all_ratios:
-        all_ratios = torch.cat(all_ratios)
-        if _world > 1:
-            local_size = torch.tensor([all_ratios.numel()], device=cfg.device)
-            all_sizes = [torch.zeros(1, device=cfg.device, dtype=torch.long) for _ in range(_world)]
-            dist.all_gather(all_sizes, local_size.long())
-            max_size = max(s.item() for s in all_sizes)
-            padded = torch.zeros(max_size, device=cfg.device)
-            padded[:all_ratios.numel()] = all_ratios.to(cfg.device)
-            gathered = [torch.zeros(max_size, device=cfg.device) for _ in range(_world)]
-            dist.all_gather(gathered, padded)
-            global_ratios = torch.cat([
-                gathered[i][:all_sizes[i].item()] for i in range(_world)
-            ])
-            p99_ratio = torch.quantile(global_ratios, 0.99).item()
-        else:
-            p99_ratio = torch.quantile(all_ratios, 0.99).item()
-    else:
-        p99_ratio = 0.0
+        # All-reduce value target histogram
+        vt_tensor = torch.tensor(value_target_hist, device=cfg.device, dtype=torch.float64)
+        dist.all_reduce(vt_tensor)
+        value_target_hist = vt_tensor.cpu().numpy()
 
     n_batches = max(n_batches, 1)
     return {
@@ -1254,13 +1304,15 @@ def run_ppo_update(model, optimizer, scaler,
         "clip_fraction": clip_fraction_sum / n_batches,
         "approx_kl": approx_kl_sum / n_batches,
         "grad_norm": grad_norm_sum / max(grad_norm_count, 1),
-        "p99_ratio": p99_ratio,
-        "value_error_histogram": value_error_hist,
+        "value_pred_histogram": value_pred_hist,
+        "value_target_histogram": value_target_hist,
         "skipped_batches": skipped_batches,
         "total_batches": n_batches,
-        "ve_sum": ve_sum,
-        "ve_sum_sq": ve_sum_sq,
-        "ve_count": ve_count,
+        "vp_sum": vp_sum,
+        "vp_sum_sq": vp_sum_sq,
+        "vt_sum": vt_sum,
+        "vt_sum_sq": vt_sum_sq,
+        "v_count": v_count,
     }
 
 
@@ -1270,13 +1322,17 @@ def build_test_results(episodes, eval_result, cfg):
     rows = []
     for episode_idx, episode in enumerate(episodes):
         dates = episode["dates"][cfg.lookback :]
-        prices = episode["prices"][cfg.lookback :]
+        opens = episode["opens"][cfg.lookback :]
+        closes = episode["closes"][cfg.lookback :]
         for step in range(cfg.episode_length):
+            mu = float(eval_result["model_mus"][episode_idx, step])
             rows.append({
                 "symbol": episode["symbol"],
                 "date": dates[step],
-                "price": prices[step],
+                "open": opens[step],
+                "close": closes[step],
                 "position": float(eval_result["model_positions"][episode_idx, step]),
+                "mu": mu,
                 "model_reward": float(
                     eval_result["model_rewards"][episode_idx, step],
                 ),
@@ -1309,18 +1365,29 @@ def _allreduce_eval(result, local_count, device):
         result["max_drawdown"] * local_count,
         result["mean_turnover"] * local_count,
         float(local_count),
+        result["pos_sum"],
+        result["pos_sum_sq"],
+        float(result["n_actions"]),
+        result["mu_sum"],
+        result["mu_sum_sq"],
     ]
     tensor = torch.tensor(scalar_fields, device=device, dtype=torch.float64)
     dist.all_reduce(tensor)
-    total = tensor[-1].item()
+    total = tensor[5].item()
     if total < 1:
         return result
 
-    # All-reduce histogram
+    # All-reduce position histogram
     hist_tensor = torch.tensor(
         result["position_histogram"], device=device, dtype=torch.float64,
     )
     dist.all_reduce(hist_tensor)
+
+    # All-reduce mu histogram
+    mu_hist_tensor = torch.tensor(
+        result["mu_histogram"], device=device, dtype=torch.float64,
+    )
+    dist.all_reduce(mu_hist_tensor)
 
     return {
         "model_return": float(tensor[0].item() / total),
@@ -1329,6 +1396,12 @@ def _allreduce_eval(result, local_count, device):
         "max_drawdown": float(tensor[3].item() / total),
         "mean_turnover": float(tensor[4].item() / total),
         "position_histogram": hist_tensor.cpu().numpy(),
+        "mu_histogram": mu_hist_tensor.cpu().numpy(),
+        "pos_sum": tensor[6].item(),
+        "pos_sum_sq": tensor[7].item(),
+        "n_actions": int(tensor[8].item()),
+        "mu_sum": tensor[9].item(),
+        "mu_sum_sq": tensor[10].item(),
     }
 
 
@@ -1356,15 +1429,16 @@ def _allreduce_max_int(value, device):
 
 def _gather_test_arrays(test_result, n_local, n_total, episode_length, device):
     """Gather numeric test result arrays to rank 0 via tensor all_gather."""
-    local = torch.zeros(n_local, episode_length, 3, device=device)
+    local = torch.zeros(n_local, episode_length, 4, device=device)
     local[..., 0] = torch.from_numpy(test_result["model_rewards"]).to(device)
     local[..., 1] = torch.from_numpy(test_result["baseline_rewards"]).to(device)
     local[..., 2] = torch.from_numpy(
         test_result["model_positions"],
     ).to(device)
+    local[..., 3] = torch.from_numpy(test_result["model_mus"]).to(device)
 
     max_local = (n_total + _world - 1) // _world
-    padded = torch.zeros(max_local, episode_length, 3, device=device)
+    padded = torch.zeros(max_local, episode_length, 4, device=device)
     padded[:n_local] = local
 
     gathered = [torch.zeros_like(padded) for _ in range(_world)]
@@ -1373,7 +1447,7 @@ def _gather_test_arrays(test_result, n_local, n_total, episode_length, device):
     if _rank != 0:
         return None
 
-    result = torch.zeros(n_total, episode_length, 3, device=device)
+    result = torch.zeros(n_total, episode_length, 4, device=device)
     for rank_idx in range(_world):
         rank_episodes = list(range(rank_idx, n_total, _world))
         result[rank_episodes] = gathered[rank_idx][:len(rank_episodes)]
@@ -1383,6 +1457,7 @@ def _gather_test_arrays(test_result, n_local, n_total, episode_length, device):
         "model_rewards": result_np[..., 0],
         "baseline_rewards": result_np[..., 1],
         "model_positions": result_np[..., 2],
+        "model_mus": result_np[..., 3],
     }
 
 
@@ -1411,180 +1486,162 @@ def _plot_heatmap(ax, fig, hist_list, n_bins, y_range, xlabel, ylabel, title, cm
     ax.set_title(title)
 
 
-def _hist_mean_sd(hist, bin_range):
-    """Compute mean and standard deviation from a histogram."""
-    n_bins = len(hist)
-    edges = np.linspace(bin_range[0], bin_range[1], n_bins + 1)
-    centers = (edges[:-1] + edges[1:]) / 2
-    total = hist.sum()
-    if total <= 0:
-        return 0.0, 0.0
-    probs = hist / total
-    mean = float((probs * centers).sum())
-    sd = float(np.sqrt((probs * (centers - mean) ** 2).sum()))
-    return mean, sd
-
-
-def _plot_ppo_heatmap(ax, fig, hist_list, n_ppo_epochs, xlabel, ylabel, title, cmap="RdBu_r"):
-    """Plot a heatmap of per-PPO-epoch metrics over training epochs."""
-    if not hist_list:
-        ax.set_visible(False)
-        return
-    data = np.array(hist_list).T  # (n_ppo_epochs, n_outer_epochs)
-    im = ax.imshow(
-        data,
-        aspect="auto",
-        origin="lower",
-        extent=[1, len(hist_list), 0.5, n_ppo_epochs + 0.5],
-        cmap=cmap,
-        interpolation="nearest",
-    )
-    fig.colorbar(im, ax=ax, label="Value")
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    ax.set_title(title)
-    ax.set_yticks(range(1, n_ppo_epochs + 1))
-
-
+@timed
 def plot_training(history, path, cfg):
-    """Plot training curves on a 3x5 grid.
+    """Plot training curves on a 5x4 grid.
 
-    Row 1 (returns + behavior): episode return, beat rate, max drawdown, turnover, position heatmap
-    Row 2 (loss + PPO stability): policy loss, value loss, entropy, clip fraction heatmap, approx KL heatmap
-    Row 3 (gradient health): p99 ratio heatmap, value error heatmap, gradient norms, loss scale, skip rate
+    Row 1 (returns + behavior): episode return, val beat rate, val max drawdown, val turnover
+    Row 2 (distributions): val position, val mu, log std, entropy
+    Row 3 (losses + PPO stability): policy loss, value loss, clip fraction, approx KL
+    Row 4 (value diagnostics + AMP): value target, value pred, loss scale, skip rate
+    Row 5 (gradient health): grad norm, per-term grad norm, grad cosine sim, empty
     """
     from matplotlib.ticker import MaxNLocator
 
-    C_TRAIN = "b"
-    C_VAL = "r"
-    C_NO_MARKET = "darkorange"
-    C_NO_STOCK = "purple"
-    C_POLICY = "#2196F3"
-    C_VALUE = "#F44336"
-
     epochs = range(1, len(history["policy_loss"]) + 1)
-    fig, axes = plt.subplots(3, 5, figsize=(30, 15))
+    fig, axes = plt.subplots(5, 4, figsize=(24, 25))
 
     # Row 1 — Returns + Behavior
     ablation_epochs = history.get("ablation_epochs", [])
-    axes[0, 0].plot(epochs, history["train_return"], color=C_TRAIN, label="Train return", alpha=0.8)
-    axes[0, 0].plot(epochs, history["train_baseline"], color=C_TRAIN, linestyle="--", label="Train baseline", alpha=0.5)
-    axes[0, 0].plot(epochs, history["val_return"], color=C_VAL, label="Val return", alpha=0.8)
-    axes[0, 0].plot(epochs, history["val_baseline"], color=C_VAL, linestyle="--", label="Val baseline", alpha=0.5)
+    axes[0, 0].plot(epochs, history["train_return"], color="b", label="Train return")
+    axes[0, 0].plot(epochs, history["train_baseline"], color="b", linestyle="--", label="Train baseline")
+    axes[0, 0].plot(epochs, history["val_return"], color="r", label="Val return")
+    axes[0, 0].plot(epochs, history["val_baseline"], color="r", linestyle="--", label="Val baseline")
     if ablation_epochs:
         axes[0, 0].plot(
-            ablation_epochs, history["val_no_market"], color=C_NO_MARKET,
-            label="No-market", alpha=0.8,
+            ablation_epochs, history["val_no_market"], color="orange",
+            label="Val no-market",
         )
         axes[0, 0].plot(
-            ablation_epochs, history["val_no_stock"], color=C_NO_STOCK,
-            label="No-stock", alpha=0.8,
+            ablation_epochs, history["val_no_stock"], color="purple",
+            label="Val no-stock",
         )
     axes[0, 0].set_ylabel("Return")
     axes[0, 0].set_title("Episode Return")
     axes[0, 0].legend(fontsize=7)
     axes[0, 0].grid(True, alpha=0.3)
 
-    axes[0, 1].plot(epochs, history["val_beat_rate"], color=C_VAL, alpha=0.8)
+    axes[0, 1].plot(epochs, history["val_beat_rate"])
     axes[0, 1].set_ylabel("Beat Rate")
     axes[0, 1].set_title("Val Beat Rate")
     axes[0, 1].set_ylim(0, 1)
     axes[0, 1].grid(True, alpha=0.3)
 
-    axes[0, 2].plot(epochs, history["val_max_drawdown"], color=C_VAL, alpha=0.8)
+    axes[0, 2].plot(epochs, history["val_max_drawdown"])
     axes[0, 2].set_ylabel("Max Drawdown")
     axes[0, 2].set_title("Val Max Drawdown")
-    axes[0, 2].set_ylim(0, 1)
     axes[0, 2].grid(True, alpha=0.3)
 
-    axes[0, 3].plot(epochs, history["val_turnover"], color=C_VAL, alpha=0.8)
+    axes[0, 3].plot(epochs, history["val_turnover"])
     axes[0, 3].set_ylabel("Turnover")
     axes[0, 3].set_title("Val Turnover")
     axes[0, 3].grid(True, alpha=0.3)
 
+    # Row 2 — Distributions
     _plot_heatmap(
-        axes[0, 4], fig,
+        axes[1, 0], fig,
         history.get("position_histogram", []),
         _POSITION_BINS, (-1.0, 1.0),
-        "Epoch", "Position", "Position Distribution",
-    )
-
-    # Row 2 — Loss + PPO stability
-    axes[1, 0].plot(epochs, history["policy_loss"], color=C_TRAIN, alpha=0.8)
-    axes[1, 0].set_ylabel("Loss")
-    axes[1, 0].set_title("Policy Loss")
-    axes[1, 0].grid(True, alpha=0.3)
-
-    axes[1, 1].plot(epochs, history["value_loss"], color=C_TRAIN, alpha=0.8)
-    axes[1, 1].set_ylabel("Loss")
-    axes[1, 1].set_title("Value Loss")
-    axes[1, 1].grid(True, alpha=0.3)
-
-    axes[1, 2].plot(epochs, history["entropy"], color=C_TRAIN, alpha=0.8)
-    axes[1, 2].set_ylabel("Entropy")
-    axes[1, 2].set_title("Entropy")
-    axes[1, 2].grid(True, alpha=0.3)
-
-    _plot_ppo_heatmap(
-        axes[1, 3], fig,
-        history.get("clip_fraction_per_ppo", []),
-        cfg.ppo_epochs,
-        "Epoch", "PPO Epoch", "Clip Fraction",
-    )
-
-    _plot_ppo_heatmap(
-        axes[1, 4], fig,
-        history.get("approx_kl_per_ppo", []),
-        cfg.ppo_epochs,
-        "Epoch", "PPO Epoch", "Approx KL",
-    )
-
-    # Row 3 — Gradient health
-    _plot_ppo_heatmap(
-        axes[2, 0], fig,
-        history.get("p99_ratio_per_ppo", []),
-        cfg.ppo_epochs,
-        "Epoch", "PPO Epoch", "P99 Ratio",
+        "Epoch", "Position", "Val Position",
     )
 
     _plot_heatmap(
-        axes[2, 1], fig,
-        history.get("value_error_histogram", []),
-        _VALUE_ERROR_BINS, _VALUE_ERROR_RANGE,
-        "Epoch", "Pred − Target", "Value Error Distribution",
-        cmap="RdBu_r",
+        axes[1, 1], fig,
+        history.get("mu_histogram", []),
+        _MU_BINS, _MU_RANGE,
+        "Epoch", "\u03bc", "Val Mu",
     )
 
-    # Gradient norms (total + per-term combined)
-    axes[2, 2].plot(epochs, history["grad_norm"], color=C_TRAIN, label="Total", alpha=0.8)
+    axes[1, 2].plot(epochs, history["log_std"])
+    axes[1, 2].set_ylabel("log \u03c3")
+    axes[1, 2].set_title("Policy Log Std")
+    axes[1, 2].grid(True, alpha=0.3)
+
+    axes[1, 3].plot(epochs, history["entropy"])
+    axes[1, 3].set_ylabel("Entropy")
+    axes[1, 3].set_title("Entropy")
+    axes[1, 3].grid(True, alpha=0.3)
+
+    # Row 3 — Losses + PPO stability
+    axes[2, 0].plot(epochs, history["policy_loss"])
+    axes[2, 0].set_ylabel("Loss")
+    axes[2, 0].set_title("Policy Loss")
+    axes[2, 0].grid(True, alpha=0.3)
+
+    axes[2, 1].plot(epochs, history["value_loss"])
+    axes[2, 1].set_ylabel("Loss")
+    axes[2, 1].set_title("Value Loss")
+    axes[2, 1].grid(True, alpha=0.3)
+
+    axes[2, 2].plot(epochs, history["clip_fraction"])
+    axes[2, 2].set_ylabel("Clip Fraction")
+    axes[2, 2].set_title("Clip Fraction")
+    axes[2, 2].grid(True, alpha=0.3)
+
+    axes[2, 3].plot(epochs, history["approx_kl"])
+    axes[2, 3].set_ylabel("Approx KL")
+    axes[2, 3].set_title("Approx KL")
+    axes[2, 3].grid(True, alpha=0.3)
+
+    # Row 4 — Value diagnostics + AMP
+    _plot_heatmap(
+        axes[3, 0], fig,
+        history.get("value_target_histogram", []),
+        _VALUE_PRED_BINS, _VALUE_PRED_RANGE,
+        "Epoch", "Value", "Value Target",
+    )
+
+    _plot_heatmap(
+        axes[3, 1], fig,
+        history.get("value_pred_histogram", []),
+        _VALUE_PRED_BINS, _VALUE_PRED_RANGE,
+        "Epoch", "Value", "Value Pred",
+    )
+
+    axes[3, 2].plot(epochs, history["loss_scale"])
+    axes[3, 2].set_xlabel("Epoch")
+    axes[3, 2].set_ylabel("Loss Scale")
+    axes[3, 2].set_title("Loss Scale")
+    axes[3, 2].set_yscale("log")
+    axes[3, 2].grid(True, alpha=0.3)
+
+    axes[3, 3].bar(list(epochs), history["skip_rate"], width=0.8)
+    axes[3, 3].set_xlabel("Epoch")
+    axes[3, 3].set_ylabel("Skip Rate")
+    axes[3, 3].set_title("Skip Rate")
+    axes[3, 3].grid(True, alpha=0.3)
+
+    # Row 5 — Gradient health
+    axes[4, 0].plot(epochs, history["grad_norm"])
+    axes[4, 0].set_xlabel("Epoch")
+    axes[4, 0].set_ylabel("Grad Norm")
+    axes[4, 0].set_title("Grad Norm")
+    axes[4, 0].set_yscale("log")
+    axes[4, 0].grid(True, alpha=0.3)
+
     has_grad_diag = (
         len(history.get("grad_norm_policy", [])) > 0
         and len(history["grad_norm_policy"]) == len(history["policy_loss"])
     )
     if has_grad_diag:
-        diag_epochs = range(1, len(history["grad_norm_policy"]) + 1)
-        axes[2, 2].plot(diag_epochs, history["grad_norm_policy"], color=C_POLICY, label="Policy", alpha=0.7)
-        axes[2, 2].plot(diag_epochs, history["grad_norm_value"], color=C_VALUE, label="Value", alpha=0.7)
-    axes[2, 2].set_xlabel("Epoch")
-    axes[2, 2].set_ylabel("Gradient Norm")
-    axes[2, 2].set_title("Gradient Norms")
-    axes[2, 2].legend(fontsize=7)
-    axes[2, 2].set_yscale("log")
-    axes[2, 2].grid(True, alpha=0.3)
+        axes[4, 1].plot(epochs, history["grad_norm_policy"], color="r", label="Policy")
+        axes[4, 1].plot(epochs, history["grad_norm_value"], color="b", label="Value")
+        axes[4, 1].legend(fontsize=7)
+    axes[4, 1].set_xlabel("Epoch")
+    axes[4, 1].set_ylabel("Grad Norm")
+    axes[4, 1].set_title("Per-Term Grad Norm")
+    axes[4, 1].set_yscale("log")
+    axes[4, 1].grid(True, alpha=0.3)
 
-    axes[2, 3].plot(epochs, history["loss_scale"], color=C_TRAIN, alpha=0.8)
-    axes[2, 3].set_xlabel("Epoch")
-    axes[2, 3].set_ylabel("Loss Scale")
-    axes[2, 3].set_title("Loss Scale")
-    axes[2, 3].set_yscale("log")
-    axes[2, 3].grid(True, alpha=0.3)
+    if has_grad_diag and len(history.get("grad_cosine_sim", [])) == len(history["grad_norm_policy"]):
+        axes[4, 2].plot(epochs, history["grad_cosine_sim"])
+        axes[4, 2].axhline(0, linestyle=":")
+    axes[4, 2].set_xlabel("Epoch")
+    axes[4, 2].set_ylabel("Cosine Sim")
+    axes[4, 2].set_title("Grad Cosine Sim")
+    axes[4, 2].grid(True, alpha=0.3)
 
-    axes[2, 4].bar(list(epochs), history["skip_rate"], color=C_VAL, alpha=0.6, width=0.8)
-    axes[2, 4].set_xlabel("Epoch")
-    axes[2, 4].set_ylabel("Skip Rate")
-    axes[2, 4].set_title("Skip Rate")
-    axes[2, 4].set_ylim(bottom=0)
-    axes[2, 4].grid(True, alpha=0.3)
+    axes[4, 3].set_visible(False)
 
     for ax in axes.flat:
         if ax.get_visible():
@@ -1622,8 +1679,8 @@ def train(cfg, trial=None, data=None, sweep_mode=False):
     _log()
     if not sweep_mode:
         _log("[Configuration]")
-        for name in Config.__annotations__:
-            _log(f"    {name:<20s}: {getattr(cfg, name)}")
+        for key, value in cfg.to_dict().items():
+            _log(f"    {key:<20s}: {value}")
 
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
@@ -1682,29 +1739,26 @@ def train(cfg, trial=None, data=None, sweep_mode=False):
 
     effective_lr = cfg.lr * math.sqrt(_world)
 
-    def _build_optimizer(*nets):
-        decay_params, xattn_decay_params, no_decay_params = [], [], []
-        for net in nets:
-            for name, param in net.named_parameters():
-                if not param.requires_grad:
-                    continue
-                is_norm_or_bias = param.dim() < 2 or "norm" in name
-                if is_norm_or_bias:
-                    no_decay_params.append(param)
-                elif "xattn." in name:
-                    xattn_decay_params.append(param)
-                else:
-                    decay_params.append(param)
-        return torch.optim.AdamW(
-            [
-                {"params": decay_params, "weight_decay": cfg.weight_decay},
-                {"params": xattn_decay_params, "weight_decay": cfg.xattn_weight_decay},
-                {"params": no_decay_params, "weight_decay": 0.0},
-            ],
-            lr=effective_lr, eps=cfg.adam_eps,
-        )
+    decay_params, xattn_decay_params, no_decay_params = [], [], []
+    for name, param in base_model.named_parameters():
+        if not param.requires_grad:
+            continue
+        is_norm_or_bias = param.dim() < 2 or "norm" in name
+        if is_norm_or_bias:
+            no_decay_params.append(param)
+        elif "xattn." in name:
+            xattn_decay_params.append(param)
+        else:
+            decay_params.append(param)
 
-    optimizer = _build_optimizer(base_model)
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": decay_params, "weight_decay": cfg.weight_decay},
+            {"params": xattn_decay_params, "weight_decay": cfg.xattn_weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ],
+        lr=effective_lr, eps=cfg.adam_eps,
+    )
     reward_normalizer = RewardNormalizer(cfg.pytorch_eps, cfg.reward_ema_decay)
     amp_enabled = cfg.use_amp and cfg.device.startswith("cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
@@ -1724,17 +1778,12 @@ def train(cfg, trial=None, data=None, sweep_mode=False):
     if os.path.exists(latest_path):
         ckpt = torch.load(latest_path, map_location=cfg.device, weights_only=False)
         # Support loading from either old split-model or new shared checkpoints
-        if "model_state_dict" in ckpt:
-            base_model.load_state_dict(ckpt["model_state_dict"])
-            saved_groups = ckpt.get("optimizer_state_dict", {}).get("param_groups", [])
-            if len(saved_groups) == len(optimizer.param_groups):
-                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            else:
-                _log("    Optimizer param groups changed, resetting optimizer state")
-        elif "actor_state_dict" in ckpt:
-            _log("    Legacy split-model checkpoint, skipping model load")
+        base_model.load_state_dict(ckpt["model_state_dict"])
+        saved_groups = ckpt["optimizer_state_dict"].get("param_groups", [])
+        if len(saved_groups) == len(optimizer.param_groups):
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         else:
-            _log("    Unknown checkpoint format, skipping model load")
+            _log("    Optimizer param groups changed, resetting optimizer state")
         start_epoch = ckpt["epoch"] + 1
         patience_counter = ckpt.get("patience_counter", 0)
         if "reward_normalizer" in ckpt:
@@ -1846,16 +1895,16 @@ def train(cfg, trial=None, data=None, sweep_mode=False):
             "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0,
             "clip_fraction": 0.0, "approx_kl": 0.0, "grad_norm": 0.0,
         }
-        epoch_value_error_hist = np.zeros(_VALUE_ERROR_BINS, dtype=np.float64)
-        epoch_ve_sum = 0.0
-        epoch_ve_sum_sq = 0.0
-        epoch_ve_count = 0
+        epoch_value_pred_hist = np.zeros(_VALUE_PRED_BINS, dtype=np.float64)
+        epoch_value_target_hist = np.zeros(_VALUE_PRED_BINS, dtype=np.float64)
+        epoch_vp_sum = 0.0
+        epoch_vp_sum_sq = 0.0
+        epoch_vt_sum = 0.0
+        epoch_vt_sum_sq = 0.0
+        epoch_v_count = 0
         epoch_skipped = 0
         epoch_total = 0
-        per_ppo_clip_fraction = []
-        per_ppo_approx_kl = []
-        per_ppo_p99_ratio = []
-        ppo_start = time.perf_counter()
+        _ppo_t = time.perf_counter()
         for _ in range(cfg.ppo_epochs):
             losses = run_ppo_update(
                 model, optimizer, scaler,
@@ -1866,20 +1915,22 @@ def train(cfg, trial=None, data=None, sweep_mode=False):
             for k in epoch_losses:
                 epoch_losses[k] += losses[k]
             # Accumulate across PPO epochs for consistency with scalar value_loss
-            epoch_value_error_hist += losses["value_error_histogram"]
-            epoch_ve_sum += losses["ve_sum"]
-            epoch_ve_sum_sq += losses["ve_sum_sq"]
-            epoch_ve_count += losses["ve_count"]
+            epoch_value_pred_hist += losses["value_pred_histogram"]
+            epoch_value_target_hist += losses["value_target_histogram"]
+            epoch_vp_sum += losses["vp_sum"]
+            epoch_vp_sum_sq += losses["vp_sum_sq"]
+            epoch_vt_sum += losses["vt_sum"]
+            epoch_vt_sum_sq += losses["vt_sum_sq"]
+            epoch_v_count += losses["v_count"]
             epoch_skipped += losses["skipped_batches"]
             epoch_total += losses["total_batches"]
-            per_ppo_clip_fraction.append(losses["clip_fraction"])
-            per_ppo_approx_kl.append(losses["approx_kl"])
-            per_ppo_p99_ratio.append(losses["p99_ratio"])
-        _log(f"    run_ppo_update ({time.perf_counter() - ppo_start:.1f}s)")
+        _log(f"    ppo_update ({time.perf_counter() - _ppo_t:.1f}s)")
         for k in epoch_losses:
             epoch_losses[k] /= cfg.ppo_epochs
         skip_rate = epoch_skipped / max(epoch_total, 1)
         loss_scale = scaler.get_scale()
+        bm = model.module if hasattr(model, "module") else model
+        current_log_std = bm.log_std.item()
 
         del rollout
         if cfg.device.startswith("cuda"):
@@ -1923,15 +1974,16 @@ def train(cfg, trial=None, data=None, sweep_mode=False):
             ("clip_fraction", epoch_losses["clip_fraction"]),
             ("approx_kl", epoch_losses["approx_kl"]),
             ("grad_norm", epoch_losses["grad_norm"]),
-            ("p99_ratio", sum(per_ppo_p99_ratio) / cfg.ppo_epochs),
             ("loss_scale", loss_scale),
             ("skip_rate", skip_rate),
+            ("log_std", current_log_std),
         ]:
             history[key].append(value)
 
         if grad_contrib is not None:
             history["grad_norm_policy"].append(grad_contrib["policy"])
             history["grad_norm_value"].append(grad_contrib["value"])
+            history["grad_cosine_sim"].append(grad_contrib["cosine_sim"])
 
         # Histograms
         pos_hist = (
@@ -1940,20 +1992,35 @@ def train(cfg, trial=None, data=None, sweep_mode=False):
             else np.zeros(_POSITION_BINS, dtype=np.float64)
         )
         history["position_histogram"].append(pos_hist)
-        history["value_error_histogram"].append(epoch_value_error_hist)
+        history["value_pred_histogram"].append(epoch_value_pred_hist)
+        history["value_target_histogram"].append(epoch_value_target_hist)
 
-        # Per-PPO-epoch heatmap data
-        history["clip_fraction_per_ppo"].append(per_ppo_clip_fraction)
-        history["approx_kl_per_ppo"].append(per_ppo_approx_kl)
-        history["p99_ratio_per_ppo"].append(per_ppo_p99_ratio)
+        # Mu histogram
+        mu_hist = (
+            val_aggregated["mu_histogram"]
+            if "mu_histogram" in val_aggregated
+            else np.zeros(_MU_BINS, dtype=np.float64)
+        )
+        history["mu_histogram"].append(mu_hist)
 
-        # Histogram summary stats
-        pos_mean, pos_sd = _hist_mean_sd(pos_hist, (-1.0, 1.0))
-        if epoch_ve_count > 0:
-            ve_mean = epoch_ve_sum / epoch_ve_count
-            ve_sd = math.sqrt(epoch_ve_sum_sq / epoch_ve_count - ve_mean ** 2)
+        # Exact summary stats from running sums
+        n_actions = val_aggregated.get("n_actions", 0)
+        if n_actions > 0:
+            pos_mean = val_aggregated["pos_sum"] / n_actions
+            pos_std = math.sqrt(val_aggregated["pos_sum_sq"] / n_actions - pos_mean ** 2)
+            mu_mean = val_aggregated["mu_sum"] / n_actions
+            mu_std = math.sqrt(val_aggregated["mu_sum_sq"] / n_actions - mu_mean ** 2)
         else:
-            ve_mean, ve_sd = 0.0, 0.0
+            pos_mean, pos_std = 0.0, 0.0
+            mu_mean, mu_std = 0.0, 0.0
+        if epoch_v_count > 0:
+            vp_mean = epoch_vp_sum / epoch_v_count
+            vp_std = math.sqrt(epoch_vp_sum_sq / epoch_v_count - vp_mean ** 2)
+            vt_mean = epoch_vt_sum / epoch_v_count
+            vt_std = math.sqrt(epoch_vt_sum_sq / epoch_v_count - vt_mean ** 2)
+        else:
+            vp_mean, vp_std = 0.0, 0.0
+            vt_mean, vt_std = 0.0, 0.0
 
         window = cfg.patience_smoothing
         recent_returns = history["val_return"][-window:]
@@ -1966,6 +2033,19 @@ def train(cfg, trial=None, data=None, sweep_mode=False):
         elif epoch > cfg.warmup_epochs:
             patience_counter += 1
 
+        if is_main:
+            ckpt = _build_checkpoint()
+            if improved:
+                torch.save(ckpt, os.path.join(cfg.save_dir, "model_best.pt"))
+            torch.save(ckpt, os.path.join(cfg.save_dir, "model_latest.pt"))
+            plot_training(
+                dict(history),
+                os.path.join(cfg.save_dir, "training_plots.png"),
+                cfg,
+            )
+
+        # Metrics (ordered to match plot rows)
+        # Row 1 — Returns + behavior
         _log(f"    {'Train episodes':<20s}: {len(train_episodes)}")
         _log(f"    {'Val episodes':<20s}: {len(val_episodes)}")
         _log(f"    {'Train return':<20s}: {model_return:.4f}")
@@ -1975,39 +2055,38 @@ def train(cfg, trial=None, data=None, sweep_mode=False):
         if cfg.ablation:
             _log(f"    {'Val no-market':<20s}: {ablation_aggregated['no_market']:.4f}")
             _log(f"    {'Val no-stock':<20s}: {ablation_aggregated['no_stock']:.4f}")
-        _log(f"    {'Val beat rate':<20s}: {val_aggregated['beat_rate']:.1%}")
-        _log(f"    {'Val max drawdown':<20s}: {val_aggregated['max_drawdown']:.1%}")
+        _log(f"    {'Val beat rate':<20s}: {val_aggregated['beat_rate']:.4f}")
+        _log(f"    {'Val max drawdown':<20s}: {val_aggregated['max_drawdown']:.4f}")
         _log(f"    {'Val turnover':<20s}: {val_aggregated['mean_turnover']:.4f}")
-        _log(f"    {'Val position':<20s}: {pos_mean:.4f}")
-        _log(f"    {'Val position SD':<20s}: {pos_sd:.4f}")
+        # Row 2 — Distributions
+        _log(f"    {'Val position mean':<20s}: {pos_mean:.4f}")
+        _log(f"    {'Val position std':<20s}: {pos_std:.4f}")
+        _log(f"    {'Val mu mean':<20s}: {mu_mean:.4f}")
+        _log(f"    {'Val mu std':<20s}: {mu_std:.4f}")
+        _log(f"    {'Log std':<20s}: {current_log_std:.4f}")
+        _log(f"    {'Entropy':<20s}: {epoch_losses['entropy']:.4f}")
+        # Row 3 — Losses + PPO stability
         _log(f"    {'Policy loss':<20s}: {epoch_losses['policy_loss']:.4f}")
         _log(f"    {'Value loss':<20s}: {epoch_losses['value_loss']:.4f}")
-        _log(f"    {'Entropy':<20s}: {epoch_losses['entropy']:.4f}")
         _log(f"    {'Clip fraction':<20s}: {epoch_losses['clip_fraction']:.4f}")
         _log(f"    {'Approx KL':<20s}: {epoch_losses['approx_kl']:.4f}")
-        _log(f"    {'P99 ratio':<20s}: {sum(per_ppo_p99_ratio) / cfg.ppo_epochs:.4f}")
-        _log(f"    {'Value error':<20s}: {ve_mean:.4f}")
-        _log(f"    {'Value error SD':<20s}: {ve_sd:.4f}")
-        _log(f"    {'Gradient norm':<20s}: {epoch_losses['grad_norm']:.4f}")
+        # Row 4 — Value diagnostics + AMP
+        _log(f"    {'Value target mean':<20s}: {vt_mean:.4f}")
+        _log(f"    {'Value target std':<20s}: {vt_std:.4f}")
+        _log(f"    {'Value pred mean':<20s}: {vp_mean:.4f}")
+        _log(f"    {'Value pred std':<20s}: {vp_std:.4f}")
+        _log(f"    {'Loss scale':<20s}: {loss_scale:.1f}")
+        _log(f"    {'Skip rate':<20s}: {skip_rate:.4f} ({epoch_skipped}/{epoch_total})")
+        # Row 5 — Gradient health
+        _log(f"    {'Grad norm':<20s}: {epoch_losses['grad_norm']:.4f}")
         if grad_contrib is not None:
             _log(f"    {'Policy grad norm':<20s}: {grad_contrib['policy']:.4f}")
             _log(f"    {'Value grad norm':<20s}: {grad_contrib['value']:.4f}")
-        _log(f"    {'Loss scale':<20s}: {loss_scale:.1f}")
-        _log(f"    {'Skip rate':<20s}: {skip_rate:.1%} ({epoch_skipped}/{epoch_total})")
+            _log(f"    {'Grad cosine sim':<20s}: {grad_contrib['cosine_sim']:.4f}")
+        # Score + patience
         _log(f"    {'Current score':<20s}: {current_score:.4f}")
         _log(f"    {'Best score':<20s}: {best_score:.4f}")
         _log(f"    {'Patience':<20s}: {patience_counter}/{cfg.patience}")
-
-        if is_main:
-            ckpt = _build_checkpoint()
-            if improved:
-                torch.save(ckpt, os.path.join(cfg.save_dir, "model_best.pt"))
-            torch.save(ckpt, os.path.join(cfg.save_dir, "model_latest.pt"))
-            plot_training(
-                dict(history),
-                os.path.join(cfg.save_dir, "training_curves.png"),
-                cfg,
-            )
 
         if patience_counter >= cfg.patience:
             _log(f"    Early stopping at epoch {epoch} (patience {cfg.patience})")
@@ -2029,8 +2108,7 @@ def train(cfg, trial=None, data=None, sweep_mode=False):
     best_path = os.path.join(cfg.save_dir, "model_best.pt")
     if os.path.exists(best_path):
         ckpt = torch.load(best_path, map_location=cfg.device, weights_only=False)
-        if "model_state_dict" in ckpt:
-            base_model.load_state_dict(ckpt["model_state_dict"])
+        base_model.load_state_dict(ckpt["model_state_dict"])
 
     test_episode_rng = np.random.default_rng(cfg.seed + 1000)
     test_episodes = generate_episodes(test_data, cfg, test_episode_rng)
@@ -2051,8 +2129,8 @@ def train(cfg, trial=None, data=None, sweep_mode=False):
     _log(f"    {'Test episodes':<20s}: {len(test_episodes)}")
     _log(f"    {'Test return':<20s}: {test_aggregated['model_return']:.4f}")
     _log(f"    {'Test baseline':<20s}: {test_aggregated['baseline_return']:.4f}")
-    _log(f"    {'Test beat rate':<20s}: {test_aggregated['beat_rate']:.1%}")
-    _log(f"    {'Test max drawdown':<20s}: {test_aggregated['max_drawdown']:.1%}")
+    _log(f"    {'Test beat rate':<20s}: {test_aggregated['beat_rate']:.4f}")
+    _log(f"    {'Test max drawdown':<20s}: {test_aggregated['max_drawdown']:.4f}")
     _log(f"    {'Test turnover':<20s}: {test_aggregated['mean_turnover']:.4f}")
 
     if distributed:
@@ -2106,8 +2184,8 @@ def sweep(cfg):
     if is_main:
         _log()
         _log("[Configuration]")
-        for name in Config.__annotations__:
-            _log(f"    {name:<20s}: {getattr(cfg, name)}")
+        for key, value in cfg.to_dict().items():
+            _log(f"    {key:<20s}: {value}")
 
     # Load data once for all trials (each rank loads independently)
     if is_main:
@@ -2202,9 +2280,9 @@ def sweep(cfg):
         trials_x = range(1, len(scores) + 1)
 
         fig, ax = plt.subplots(figsize=(10, 5))
-        ax.scatter(trials_x, scores, alpha=0.4, s=15, color="b", label="Trial score")
-        ax.plot(trials_x, best_so_far, color="r", linewidth=2, label="Best so far")
-        ax.set_xlabel("Completed trial")
+        ax.scatter(trials_x, scores, color="b", s=15, label="Trial score")
+        ax.plot(trials_x, best_so_far, color="r", linewidth=2, label="Best score")
+        ax.set_xlabel("Trial")
         ax.set_ylabel("Score")
         ax.set_title("Sweep Progress")
         ax.legend()
@@ -2228,12 +2306,10 @@ def sweep(cfg):
             else:
                 trial = study.ask()
                 trial.suggest_float("dropout", 0.0, 0.2)
-                trial.suggest_float("market_dropout", 0.3, 0.7)
+                trial.suggest_float("market_dropout", 0.2, 0.6)
                 trial.suggest_float("value_coeff", 0.01, 1.0, log=True)
-                trial.suggest_float("entropy_coeff", 0.001, 0.1, log=True)
-                trial.suggest_float("lr", 3e-5, 3e-4, log=True)
-                trial.suggest_float("weight_decay", 0.001, 0.1, log=True)
-                trial.suggest_float("xattn_weight_decay", 0.01, 0.1, log=True)
+                trial.suggest_float("entropy_coeff", 0.0001, 0.01, log=True)
+                trial.suggest_float("lr", 1e-5, 1e-3, log=True)
                 params = trial.params
                 trial_number = trial.number
 
