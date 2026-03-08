@@ -5,12 +5,12 @@
 # Ehlers Apr 2024 shows US replacing SS in the roofing filter lowpass, but every
 # subsequent indicator (incl. Cybernetic Osc Jun 2025) still explicitly uses SS.
 #
-# All outputs bounded: native indicators [-1, +1], sigma-normalized via clamp [-2.5, +2.5].
+# All outputs bounded: native indicators [-1, +1], sigma-normalized via clamp [-5, +5].
 #
 # Normalization naming convention:
 #   run_*    — rolling statistical primitives (run_rms, run_cor, run_pctrank)
 #   agc_*    — Ehlers AGC producing sigma-units, unbounded (agc_ema, agc_rolling)
-#   norm_*   — final bounded output for RL (norm_ema, norm_rolling: [-2.5, +2.5]; norm_pctrank: [-1, +1])
+#   norm_*   — final bounded output for RL (norm_ema, norm_rolling: [-5, +5]; norm_pctrank: [-1, +1])
 
 HP_PERIOD <- 125
 LP_PERIOD <- 20
@@ -165,14 +165,14 @@ agc_rolling <- function(x, window = 100) {
   ifelse(!is.na(rms_val) & rms_val > 0, x / rms_val, 0)
 }
 
-# Bounded EMA AGC: sigma-units / 2 -> clamp -> [-2.5, +2.5].
+# Bounded EMA AGC: sigma-units -> clamp -> [-5, +5].
 norm_ema <- function(x, alpha = 0.0242) {
-  clamp(agc_ema(x, alpha) / 2, 2.5)
+  clamp(agc_ema(x, alpha), 5)
 }
 
-# Bounded rolling AGC: sigma-units / 2 -> clamp -> [-2.5, +2.5].
+# Bounded rolling AGC: sigma-units -> clamp -> [-5, +5].
 norm_rolling <- function(x, window = 100) {
-  clamp(agc_rolling(x, window) / 2, 2.5)
+  clamp(agc_rolling(x, window), 5)
 }
 
 # Expanding percentile rank rescaled to [-1, +1].
@@ -350,7 +350,7 @@ mama_fama <- function(x, fast_limit = 0.5, slow_limit = 0.05) {
 # Ehlers Feature Generators ----------------------------------------------------
 
 # Cybernetic Oscillator (TASC Jun 2025) at grid periods.
-# Octave bandpass: HP(2p) -> SS(p) -> rolling AGC -> clamp. Output [-2.5, +2.5].
+# Octave bandpass: HP(2p) -> SS(p) -> rolling AGC -> clamp. Output [-5, +5].
 feat_roofing <- function(x, periods = GRID) {
   out <- lapply(periods, function(p) {
     norm_rolling(roofing_filter(x, 2 * p, p), 100)
@@ -377,7 +377,7 @@ feat_sinewave <- function(x, periods = GRID) {
 }
 
 # Elegant Oscillator (TASC Feb 2022). Single period per Ehlers' BandEdge = 20.
-# Deriv(2-bar) -> SS(20) -> rolling AGC -> clamp. Output [-2.5, +2.5].
+# Deriv(2-bar) -> SS(20) -> rolling AGC -> clamp. Output [-5, +5].
 feat_elegant <- function(x, period = 20, rms_window = 50) {
   n <- length(x)
   if (n < 3) return(blank_warmup(data.frame(eleg = rep(NA_real_, n)), n))
@@ -396,7 +396,7 @@ feat_trend <- function(x, periods = GRID) {
 
 # Laguerre Oscillator (TASC Jul 2025) at multiple gammas.
 # US(L0) internally per Ehlers. Period = 30 per Ehlers default.
-# Rolling AGC -> clamp. Output [-2.5, +2.5].
+# Rolling AGC -> clamp. Output [-5, +5].
 feat_laguerre <- function(x, gammas = c(0.3, 0.6, 0.8), period = 30) {
   out <- lapply(gammas, function(g) {
     lag <- laguerre_stages(x, g, period)
@@ -408,7 +408,7 @@ feat_laguerre <- function(x, gammas = c(0.3, 0.6, 0.8), period = 30) {
 
 # MAMA spread and crossover (Rocket Science 2001, Ch. 8).
 # Input: (H+L)/2. Self-adaptive — no period grid.
-# EMA AGC -> clamp. Output [-2.5, +2.5].
+# EMA AGC -> clamp. Output [-5, +5].
 feat_mama <- function(hl2, fast_limit = 0.5, slow_limit = 0.05) {
   mf <- mama_fama(hl2, fast_limit, slow_limit)
   blank_warmup(data.frame(
@@ -455,7 +455,7 @@ feat_dominant_cycle <- function(x, min_period = 10, max_period = 48) {
 # Derived Feature Generators ---------------------------------------------------
 
 # Ultimate Smoother spread/slope/cross-scale at grid periods.
-# EMA AGC -> clamp. Output [-2.5, +2.5].
+# EMA AGC -> clamp. Output [-5, +5].
 feat_smoother <- function(x, periods = GRID) {
   all_periods <- sort(unique(c(periods, 2 * periods)))
   smoothed <- setNames(lapply(all_periods, function(p) ultimate_smoother(x, p)), all_periods)
@@ -470,7 +470,7 @@ feat_smoother <- function(x, periods = GRID) {
   blank_warmup(as.data.frame(out), max(2 * periods))
 }
 
-# Volume: octave bandpass EMA AGC -> clamp [-2.5, +2.5]; price-volume correlation [-1, +1].
+# Volume: octave bandpass EMA AGC -> clamp [-5, +5]; price-volume correlation [-1, +1].
 feat_volume <- function(close, volume, periods = GRID) {
   out <- list()
   for (p in periods) {
@@ -513,7 +513,7 @@ avg_cost_basis <- function(close, turnover, amount = NULL, volume = NULL) {
 }
 
 # Cost basis spread/slope at single scale, cross-scale at grid periods.
-# EMA AGC -> clamp. Output [-2.5, +2.5].
+# EMA AGC -> clamp. Output [-5, +5].
 feat_cost <- function(close, avg_cost, periods = GRID) {
   out <- list(
     cost_spread = norm_ema(close - avg_cost),
@@ -595,61 +595,76 @@ ehlers_features <- function(
 
 # Validation -------------------------------------------------------------------
 
-validate_features <- function(feats, sample_n = 10000, plot = FALSE) {
-  feats <- as.data.frame(feats)
-
-  if (nrow(feats) > sample_n) {
-    cat("Sampling", sample_n, "rows for validation...\n")
-    feats <- feats[sample.int(nrow(feats), sample_n), ]
-  }
-
-  feat_cols <- feats[, grep("^[a-z_]+\\.", names(feats)), drop = FALSE]
-  if (ncol(feat_cols) == 0) {
+validate_features <- function(feats, plot = FALSE) {
+  feat_names <- grep("^[a-z_]+\\.", names(feats), value = TRUE)
+  if (length(feat_names) == 0) {
     cat("No feature columns found (expected group.name pattern).\n")
     return(invisible(NULL))
   }
 
-  mat <- as.matrix(feat_cols)
-  n_complete <- sum(complete.cases(mat))
-  cat("Rows:", nrow(mat), " Complete:", n_complete,
-      " Warmup NAs:", sum(is.na(mat)), "\n")
+  n <- nrow(feats)
 
-  bounded_cols <- grep("_dn$", names(feat_cols), invert = TRUE)
-  if (length(bounded_cols) > 0) {
-    bmat <- mat[, bounded_cols, drop = FALSE]
-    bmat <- bmat[complete.cases(bmat), , drop = FALSE]
-    cat("Bounded range: [", round(min(bmat), 4), ",", round(max(bmat), 4), "]\n")
+  # Complete-row count: column-by-column to avoid materializing full matrix
+  has_na <- rep(FALSE, n)
+  total_nas <- 0L
+  for (col in feat_names) {
+    col_na <- is.na(feats[[col]])
+    has_na <- has_na | col_na
+    total_nas <- total_nas + sum(col_na)
   }
+  n_complete <- sum(!has_na)
+  rm(has_na)
 
-  cat(sprintf("\n%-35s %8s %8s %8s %8s %8s\n", "Feature", "NAs", "Min", "Mean", "Max", "SD"))
+  cat("Rows:", n, " Complete:", n_complete, " Warmup NAs:", total_nas, "\n")
+
+  # Per-column stats, tracking bounded range incrementally
+  bounded_names <- grep("_dn$", feat_names, invert = TRUE, value = TRUE)
+  global_min <- Inf
+  global_max <- -Inf
+
+  cat(sprintf("\n%-35s %8s %8s %8s %8s %8s\n",
+              "Feature", "NAs", "Min", "Mean", "Max", "SD"))
   cat(strrep("-", 80), "\n")
 
-  for (col in names(feat_cols)) {
-    v <- feat_cols[[col]]
+  for (col in feat_names) {
+    v <- feats[[col]]
     na_count <- sum(is.na(v))
-    v_clean <- v[!is.na(v)]
-    if (length(v_clean) == 0) {
-      cat(sprintf("%-35s %8d %8s %8s %8s %8s\n", col, na_count, "NA", "NA", "NA", "NA"))
+    if (na_count == length(v)) {
+      cat(sprintf("%-35s %8d %8s %8s %8s %8s\n",
+                  col, na_count, "NA", "NA", "NA", "NA"))
       next
     }
-    vmin <- min(v_clean)
-    vmean <- mean(v_clean)
-    vmax <- max(v_clean)
-    vsd <- sd(v_clean)
-    cat(sprintf("%-35s %8d %8.3f %8.3f %8.3f %8.3f", col, na_count, vmin, vmean, vmax, vsd))
-    cat("\n")
+    vmin <- min(v, na.rm = TRUE)
+    vmean <- mean(v, na.rm = TRUE)
+    vmax <- max(v, na.rm = TRUE)
+    vsd <- sd(v, na.rm = TRUE)
+
+    if (col %in% bounded_names) {
+      global_min <- min(global_min, vmin)
+      global_max <- max(global_max, vmax)
+    }
+
+    cat(sprintf("%-35s %8d %8.3f %8.3f %8.3f %8.3f\n",
+                col, na_count, vmin, vmean, vmax, vsd))
   }
 
-  groups <- sub("\\.[^.]+$", "", names(feat_cols))
+  if (is.finite(global_min)) {
+    cat("Bounded range: [", round(global_min, 4), ",", round(global_max, 4), "]\n")
+  }
+
+  # Group summary
+  groups <- sub("\\.[^.]+$", "", feat_names)
   cat("\nGroups:\n")
   for (g in unique(groups)) {
     cat(sprintf("  %-25s %3d\n", g, sum(groups == g)))
   }
-  cat(sprintf("  %-25s %3d\n", "TOTAL", ncol(feat_cols)))
+  cat(sprintf("  %-25s %3d\n", "TOTAL", length(feat_names)))
 
+  # Histograms: sample to keep plot rendering fast
   if (plot) {
-    for (col in names(feat_cols)) {
-      v <- feat_cols[[col]]
+    idx <- if (n > 50000) sample.int(n, 50000) else seq_len(n)
+    for (col in feat_names) {
+      v <- feats[[col]][idx]
       v <- v[!is.na(v)]
       if (length(v) > 0) hist(v, breaks = 30, main = col, xlab = col)
     }

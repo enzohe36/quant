@@ -17,13 +17,9 @@ val_dir <- paste0(data_dir, "val/")
 spot_combined_path <- paste0(data_dir, "spot_combined.csv")
 
 data_combined_path <- paste0(data_dir, "data_combined.rds")
-train_path <- paste0(data_dir, "train.csv")
-val_path <- paste0(data_dir, "val.csv")
-test_path <- paste0(data_dir, "test.csv")
-example_path <- paste0(data_dir, "example.csv")
-
 mkt_data_path <- paste0(data_dir, "mkt_data.rds")
-mkt_feats_path <- paste0(data_dir, "mkt_feats.csv")
+feats_path <- paste0(data_dir, "feats.csv")
+example_path <- paste0(data_dir, "example.csv")
 
 batch_dir <- paste0(data_dir, "feat_batches/")
 dir.create(batch_dir)
@@ -127,6 +123,20 @@ data_combined <- foreach(
     ) %>%
     fill(np, np_deduct, equity, revenue, ocf) %>%
     filter(date %in% pull(hist, date)) %>%
+    mutate(
+      wide = str_starts(symbol, "68") | (str_starts(symbol, "30") & date >= "2020-08-24"),
+      lo = if_else(wide, 0.795, 0.895),
+      hi = if_else(wide, 1.205, 1.105),
+      overnight = close / lag(close),
+      fix = case_when(
+        !is.na(overnight) & overnight < lo ~ lo / overnight,
+        !is.na(overnight) & overnight > hi ~ hi / overnight,
+        TRUE ~ 1.0
+      ),
+      anomaly_adjust = cumprod(fix) / prod(fix),
+      across(c(open, high, low, close), ~ .x * anomaly_adjust),
+      volume = volume / anomaly_adjust
+    ) %>%
     select(names(hist), mc, np, np_deduct, equity, revenue, ocf)
 
   my_list <- list()
@@ -198,40 +208,6 @@ plan(sequential)
 saveRDS(mkt_data, mkt_data_path)
 tsprint(str_glue("Generated market data from {min(mkt_data$date)} to {max(mkt_data$date)}."))
 
-# MARKET FEATURES ==============================================================
-
-# mkt_data <- readRDS(mkt_data_path)
-
-t0 <- proc.time()
-
-mkt_feats <- ehlers_features(
-  close     = mkt_data$close,
-  volume    = mkt_data$to,
-  to        = mkt_data$to,
-  mc        = mkt_data$mc,
-  np        = mkt_data$np,
-  np_deduct = mkt_data$np_deduct,
-  equity    = mkt_data$equity,
-  revenue   = mkt_data$revenue,
-  ocf       = mkt_data$ocf
-) %>%
-  rename_with(~ paste0("mkt_", .x)) %>%
-  mutate(
-    date = mkt_data$date, .before = 1,
-    across(matches("_dn$"), ~ NULL)
-  ) %>%
-  filter(date >= train_start) %>%
-  na.omit() %>%
-  as_tibble()
-
-elapsed <- (proc.time() - t0)[3]
-cat(nrow(mkt_feats), "x", ncol(mkt_feats), "in", round(elapsed, 3), "s\n")
-
-validate_features(mkt_feats)
-
-write_csv(mkt_feats, mkt_feats_path)
-tsprint(str_glue("nrow(mkt_feats) = {nrow(mkt_feats)}"))
-
 # STOCK FEATURES ===============================================================
 
 # data_combined <- readRDS(data_combined_path)
@@ -248,7 +224,8 @@ for (b in seq_along(batches)) {
     .combine = "c"
   ) %dofuture% {
     data %>%
-      select(symbol, date, open, close) %>%
+      mutate(price = lead(open)) %>%
+      select(symbol, date, price) %>%
       bind_cols(
         ehlers_features(
           close     = data$close,
@@ -294,18 +271,9 @@ cat(nrow(feats), "x", ncol(feats), "in", round(elapsed, 3), "s\n")
 
 validate_features(feats, plot = TRUE)
 
-train <- filter(feats, date < val_start)
-write_csv(train, train_path)
-tsprint(str_glue("nrow(train) = {nrow(train)}"))
+write_csv(feats, feats_path)
+tsprint(str_glue("nrow(feats) = {nrow(feats)}"))
 
-val <- filter(feats, date >= val_start & date < test_start)
-write_csv(val, val_path)
-tsprint(str_glue("nrow(val) = {nrow(val)}"))
-
-test <- filter(feats, date >= test_start)
-write_csv(test, test_path)
-tsprint(str_glue("nrow(test) = {nrow(test)}"))
-
-example <- filter(train, symbol == "002384")
+example <- filter(feats, symbol == "002384")
 write_csv(example, example_path)
 tsprint(str_glue("nrow(example) = {nrow(example)}"))
