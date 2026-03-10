@@ -1,6 +1,6 @@
 # conda activate quant; pip install aktools --upgrade -i https://pypi.org/simple; pip install akshare --upgrade -i https://pypi.org/simple; python -m aktools
 
-# PRESET =======================================================================
+# Config =======================================================================
 
 library(RCurl)
 library(jsonlite)
@@ -34,7 +34,7 @@ dir.create(logs_dir)
 
 log_path <- paste0(logs_dir, format(now(), "%Y%m%d_%H%M%S"), ".log")
 
-# SPOT DATA ====================================================================
+# Spot Data ====================================================================
 
 if (!file.exists(spot_combined_path)) {
   spot_combined <- combine_spot()
@@ -49,7 +49,7 @@ if (!file.exists(spot_combined_path)) {
 }
 tsprint(str_glue("Retrieved spot data for {nrow(spot_combined)} stocks."))
 
-# HISTORICAL DATA ==============================================================
+# Hist Data ====================================================================
 
 success_count <- foreach(
   symbol = spot_combined$symbol,

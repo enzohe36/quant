@@ -1,11 +1,11 @@
-# PRESET =======================================================================
+# Config =======================================================================
 
 library(foreach)
 library(doFuture)
 library(data.table)
 library(tidyverse)
 
-source("scripts/ehlers.r")
+source("scripts/feat_log_ratios.r")
 source("scripts/misc.r")
 
 data_dir <- "data/"
@@ -19,7 +19,10 @@ spot_combined_path <- paste0(data_dir, "spot_combined.csv")
 data_combined_path <- paste0(data_dir, "data_combined.rds")
 mkt_data_path <- paste0(data_dir, "mkt_data.rds")
 feats_path <- paste0(data_dir, "feats.csv")
-example_path <- paste0(data_dir, "example.csv")
+feats_new_path <- paste0(data_dir, "feats_new.csv")
+feats_example_path <- paste0(data_dir, "feats_example.csv")
+
+lookback <- 60
 
 batch_dir <- paste0(data_dir, "feat_batches/")
 dir.create(batch_dir)
@@ -36,12 +39,10 @@ log_path <- paste0(logs_dir, format(now(), "%Y%m%d_%H%M%S"), ".log")
 
 last_td <- as_date("2026-01-23")
 train_start <- last_td %m-% years(10)
-val_start <- last_td %m-% years(2)
-test_start <- last_td %m-% years(1)
 
 set.seed(42)
 
-# STOCK PREPROCESSING ==========================================================
+# Stock Preprocessing ==========================================================
 
 spot_combined <- read_csv(spot_combined_path, show_col_types = FALSE)
 
@@ -139,6 +140,26 @@ data_combined <- foreach(
     ) %>%
     select(names(hist), mc, np, np_deduct, equity, revenue, ocf)
 
+  # Fill suspended dates with all trading dates
+  sym_delist <- filter(spot_combined, symbol == !!symbol)$delist
+  hist_start <- min(data$date)
+  hist_end <- if (sym_delist) max(data$date) else last_td
+
+  data <- data %>%
+    right_join(tibble(date = all_td), by = "date") %>%
+    filter(date >= hist_start, date <= hist_end) %>%
+    arrange(date) %>%
+    mutate(
+      susp = is.na(close),
+      symbol = !!symbol
+    ) %>%
+    fill(close) %>%
+    mutate(
+      across(c(open, high, low), ~ if_else(susp, close, .x)),
+      across(c(volume, amount, to), ~ if_else(susp, 0, .x))
+    ) %>%
+    fill(mc, np, np_deduct, equity, revenue, ocf)
+
   my_list <- list()
   my_list[[symbol]] <- data
   return(my_list)
@@ -148,7 +169,7 @@ plan(sequential)
 saveRDS(data_combined, data_combined_path)
 tsprint(str_glue("Combined {length(data_combined)} stocks."))
 
-# MARKET PREPROCESSING =========================================================
+# Market Preprocessing =========================================================
 
 # spot_combined <- read_csv(spot_combined_path, show_col_types = FALSE)
 # data_combined <- readRDS(data_combined_path)
@@ -161,20 +182,8 @@ mkt_data <- foreach(
 ) %dofuture% {
   if (nrow(data) == 0) return(NULL)
   data %>%
-    right_join(tibble(date = all_td), by = "date") %>%
-    filter(
-      date >= min(data$date),
-      date <= if_else(
-        filter(spot_combined, symbol == data$symbol[1])$delist,
-        max(data$date),
-        last_td
-      )
-    ) %>%
-    arrange(date) %>%
-    fill(close, mc, np, np_deduct, equity, revenue, ocf) %>%
     mutate(
       close_r = close / lag(close),
-      across(c(volume, amount, to), ~ replace_na(.x, 0)),
       mc_traded = volume * close,
       mc_float = (mc_traded / to) %>%
         replace(is.na(.) | is.infinite(.), NA_real_)
@@ -208,8 +217,9 @@ plan(sequential)
 saveRDS(mkt_data, mkt_data_path)
 tsprint(str_glue("Generated market data from {min(mkt_data$date)} to {max(mkt_data$date)}."))
 
-# STOCK FEATURES ===============================================================
+# Feature Generation ===========================================================
 
+# spot_combined <- read_csv(spot_combined_path, show_col_types = FALSE)
 # data_combined <- readRDS(data_combined_path)
 # mkt_data <- readRDS(mkt_data_path)
 
@@ -225,9 +235,9 @@ for (b in seq_along(batches)) {
   ) %dofuture% {
     data %>%
       mutate(price = lead(open)) %>%
-      select(symbol, date, price) %>%
+      select(symbol, date, price, susp) %>%
       bind_cols(
-        ehlers_features(
+        make_features(
           close     = data$close,
           open      = data$open,
           high      = data$high,
@@ -245,7 +255,7 @@ for (b in seq_along(batches)) {
         )
       ) %>%
       filter(date >= train_start) %>%
-      na.omit() %>%
+      drop_leading_na() %>%
       list()
   } %>%
     rbindlist()
@@ -262,18 +272,31 @@ feats <- rbindlist(lapply(list.files(batch_dir, full.names = TRUE), fread, colCl
 unlink(batch_dir, recursive = TRUE)
 
 setDT(feats)
-dn_cols <- grep("_dn$", names(feats), value = TRUE)
-feats[, (dn_cols) := lapply(.SD, cross_pctrank), by = date, .SDcols = dn_cols]
+cn_cols <- grep("_cn$", names(feats), value = TRUE)
+feats[, (cn_cols) := lapply(.SD, cross_pctrank), by = date, .SDcols = cn_cols]
 tsprint(str_glue("Generated features for {length(unique(feats$symbol))} stocks."))
+
+delist_map <- as.data.table(spot_combined)[, .(symbol, delist)]
+setDT(delist_map)
+delist_map[, symbol := as.character(symbol)]
+feats <- merge(feats, delist_map, by = "symbol", all.x = TRUE)
+feats[is.na(delist), delist := FALSE]
+tsprint(str_glue("Delisted stocks in feats: {sum(feats$delist[!duplicated(feats$symbol)])}"))
 
 elapsed <- (proc.time() - t0)[3]
 cat(nrow(feats), "x", ncol(feats), "in", round(elapsed, 3), "s\n")
 
 validate_features(feats, plot = TRUE)
 
+new_dates <- tail(sort(unique(feats$date)), lookback)
+feats_new <- feats[date %in% new_dates]
+write_csv(feats_new, feats_new_path)
+tsprint(str_glue("nrow(feats_new) = {nrow(feats_new)}"))
+
+feats <- na.omit(feats)
 write_csv(feats, feats_path)
 tsprint(str_glue("nrow(feats) = {nrow(feats)}"))
 
-example <- filter(feats, symbol == "002384")
-write_csv(example, example_path)
-tsprint(str_glue("nrow(example) = {nrow(example)}"))
+feats_example <- filter(feats, symbol == "002384")
+write_csv(feats_example, feats_example_path)
+tsprint(str_glue("nrow(feats_example) = {nrow(feats_example)}"))

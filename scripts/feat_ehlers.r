@@ -1,12 +1,14 @@
+# Config =======================================================================
+
 # ehlers_ensemble.r — Ehlers DSP feature ensemble for RL training.
-#
+
 # SuperSmoother where Ehlers specifies (EBSW, Elegant, Cybernetic, Roofing Filter).
 # Ultimate Smoother where Ehlers specifies (USI, Laguerre L0, derived smoothers).
 # Ehlers Apr 2024 shows US replacing SS in the roofing filter lowpass, but every
 # subsequent indicator (incl. Cybernetic Osc Jun 2025) still explicitly uses SS.
-#
+
 # All outputs bounded: native indicators [-1, +1], sigma-normalized via clamp [-5, +5].
-#
+
 # Normalization naming convention:
 #   run_*    — rolling statistical primitives (run_rms, run_cor, run_pctrank)
 #   agc_*    — Ehlers AGC producing sigma-units, unbounded (agc_ema, agc_rolling)
@@ -16,7 +18,7 @@ HP_PERIOD <- 125
 LP_PERIOD <- 20
 GRID <- c(30, 60, 120)
 
-# Helpers ----------------------------------------------------------------------
+# Helpers ======================================================================
 
 safe_div <- function(a, b) {
   ifelse(b != 0, a / b, 0)
@@ -26,12 +28,14 @@ clamp <- function(x, limit) {
   pmax(-limit, pmin(limit, x))
 }
 
+has_all <- function(...) !any(vapply(list(...), is.null, logical(1)))
+
 blank_warmup <- function(df, n_warmup) {
   df[seq_len(min(n_warmup, nrow(df))), ] <- NA_real_
   df
 }
 
-# Rolling Primitives -----------------------------------------------------------
+# Normalization ================================================================
 
 # Expanding percentile rank. Output [0, 1]. O(n^2).
 run_pctrank <- function(x) {
@@ -82,7 +86,35 @@ run_cor <- function(a, b, period) {
   c(rep(NA_real_, period - 1), r)
 }
 
-# IIR Filters ------------------------------------------------------------------
+
+# EMA-based AGC (Ehlers, alpha ~ 82-bar EMA). Output in sigma-units, unbounded.
+agc_ema <- function(x, alpha = 0.0242) {
+  ms <- as.numeric(stats::filter(alpha * x^2, 1 - alpha, method = "recursive", init = 0))
+  ifelse(ms > 0, x / sqrt(ms), 0)
+}
+
+# Rolling-window AGC. Output in sigma-units, unbounded.
+agc_rolling <- function(x, window = 100) {
+  rms_val <- run_rms(x, window)
+  ifelse(!is.na(rms_val) & rms_val > 0, x / rms_val, 0)
+}
+
+# Bounded EMA AGC: sigma-units -> clamp -> [-5, +5].
+norm_ema <- function(x, alpha = 0.0242) {
+  clamp(agc_ema(x, alpha), 5)
+}
+
+# Bounded rolling AGC: sigma-units -> clamp -> [-5, +5].
+norm_rolling <- function(x, window = 100) {
+  clamp(agc_rolling(x, window), 5)
+}
+
+# Expanding percentile rank rescaled to [-1, +1].
+norm_pctrank <- function(x) {
+  2 * run_pctrank(x) - 1
+}
+
+# IIR Filters ==================================================================
 
 butterworth_coefs <- function(period) {
   alpha <- sqrt(2) * pi / period
@@ -151,36 +183,7 @@ laguerre_stages <- function(x, gamma, period) {
   )
 }
 
-# Normalization ----------------------------------------------------------------
-
-# EMA-based AGC (Ehlers, alpha ~ 82-bar EMA). Output in sigma-units, unbounded.
-agc_ema <- function(x, alpha = 0.0242) {
-  ms <- as.numeric(stats::filter(alpha * x^2, 1 - alpha, method = "recursive", init = 0))
-  ifelse(ms > 0, x / sqrt(ms), 0)
-}
-
-# Rolling-window AGC. Output in sigma-units, unbounded.
-agc_rolling <- function(x, window = 100) {
-  rms_val <- run_rms(x, window)
-  ifelse(!is.na(rms_val) & rms_val > 0, x / rms_val, 0)
-}
-
-# Bounded EMA AGC: sigma-units -> clamp -> [-5, +5].
-norm_ema <- function(x, alpha = 0.0242) {
-  clamp(agc_ema(x, alpha), 5)
-}
-
-# Bounded rolling AGC: sigma-units -> clamp -> [-5, +5].
-norm_rolling <- function(x, window = 100) {
-  clamp(agc_rolling(x, window), 5)
-}
-
-# Expanding percentile rank rescaled to [-1, +1].
-norm_pctrank <- function(x) {
-  2 * run_pctrank(x) - 1
-}
-
-# Ehlers Indicators ------------------------------------------------------------
+# Ehlers Indicators ============================================================
 
 # Correlation Trend Indicator (TASC May 2020). Inherently [-1, +1].
 correlation_trend <- function(x, period) {
@@ -347,7 +350,7 @@ mama_fama <- function(x, fast_limit = 0.5, slow_limit = 0.05) {
   list(mama = mama, fama = fama)
 }
 
-# Ehlers Feature Generators ----------------------------------------------------
+# Feature Generators ===========================================================
 
 # Cybernetic Oscillator (TASC Jun 2025) at grid periods.
 # Octave bandpass: HP(2p) -> SS(p) -> rolling AGC -> clamp. Output [-5, +5].
@@ -452,8 +455,6 @@ feat_dominant_cycle <- function(x, min_period = 10, max_period = 48) {
   blank_warmup(data.frame(dc_period = dc_norm), 2 * max_period)
 }
 
-# Derived Feature Generators ---------------------------------------------------
-
 # Ultimate Smoother spread/slope/cross-scale at grid periods.
 # EMA AGC -> clamp. Output [-5, +5].
 feat_smoother <- function(x, periods = GRID) {
@@ -481,8 +482,6 @@ feat_volume <- function(close, volume, periods = GRID) {
   }
   blank_warmup(as.data.frame(out), max(2 * periods))
 }
-
-# Non-Ehlers Feature Generators ------------------------------------------------
 
 # OHLC microstructure. All outputs [-1, +1].
 # OHLC microstructure. TR-normalized, all outputs [-1, +1].
@@ -525,36 +524,36 @@ feat_cost <- function(close, avg_cost, periods = GRID) {
   blank_warmup(as.data.frame(out), max(periods))
 }
 
-# Fundamentals: _dn raw for cross-sectional norm; _rn pctrank [-1, +1].
+# Fundamentals: _cn raw for cross-sectional norm; _rn pctrank [-1, +1].
 # mkt_mc is optional — when NULL, market share columns are omitted.
 feat_fundamental <- function(mc, np, np_deduct, equity, revenue, ocf, mkt_mc = NULL) {
   raw <- data.frame(
-    fund_ey_dn = safe_div(np, mc),
-    fund_eyd_dn = safe_div(np_deduct, mc),
-    fund_by_dn = safe_div(equity, mc),
-    fund_sy_dn = safe_div(revenue, mc),
-    fund_cfy_dn = safe_div(ocf, mc),
-    fund_roe_dn = safe_div(np, equity),
-    fund_accrual_dn = safe_div(np - ocf, mc)
+    ey_cn = safe_div(np, mc),
+    eyd_cn = safe_div(np_deduct, mc),
+    by_cn = safe_div(equity, mc),
+    sy_cn = safe_div(revenue, mc),
+    cfy_cn = safe_div(ocf, mc),
+    roe_cn = safe_div(np, equity),
+    accrual_cn = safe_div(np - ocf, mc)
   )
   if (!is.null(mkt_mc)) {
-    raw <- cbind(data.frame(fund_ms_dn = safe_div(mc, mkt_mc)), raw)
+    raw <- cbind(data.frame(ms_cn = safe_div(mc, mkt_mc)), raw)
   }
   ranked <- as.data.frame(lapply(raw, norm_pctrank))
-  names(ranked) <- sub("_dn$", "_rn", names(ranked))
+  names(ranked) <- sub("_cn$", "_rn", names(ranked))
   cbind(raw, ranked)
 }
 
-# Ensemble ---------------------------------------------------------------------
+# Ensemble =====================================================================
 
-ehlers_features <- function(
+make_features <- function(
     close, open = NULL, high = NULL, low = NULL,
     volume = NULL, amount = NULL, to = NULL,
     mc = NULL, mkt_mc = NULL,
-    np = NULL, np_deduct = NULL, equity = NULL, revenue = NULL, ocf = NULL) {
+    np = NULL, np_deduct = NULL,
+    equity = NULL, revenue = NULL, ocf = NULL) {
 
   hl2 <- if (!is.null(high) && !is.null(low)) (high + low) / 2 else close
-  has_all <- function(...) !any(vapply(list(...), is.null, logical(1)))
 
   feats <- list(
     roofing = feat_roofing(close),
@@ -593,7 +592,7 @@ ehlers_features <- function(
   result
 }
 
-# Validation -------------------------------------------------------------------
+# Validation ===================================================================
 
 validate_features <- function(feats, plot = FALSE) {
   feat_names <- grep("^[a-z_]+\\.", names(feats), value = TRUE)
@@ -615,13 +614,9 @@ validate_features <- function(feats, plot = FALSE) {
   n_complete <- sum(!has_na)
   rm(has_na)
 
-  cat("Rows:", n, " Complete:", n_complete, " Warmup NAs:", total_nas, "\n")
+  cat("Rows:", n, " Complete:", n_complete, " Total NAs:", total_nas, "\n")
 
-  # Per-column stats, tracking bounded range incrementally
-  bounded_names <- grep("_dn$", feat_names, invert = TRUE, value = TRUE)
-  global_min <- Inf
-  global_max <- -Inf
-
+  # Per-column stats
   cat(sprintf("\n%-35s %8s %8s %8s %8s %8s\n",
               "Feature", "NAs", "Min", "Mean", "Max", "SD"))
   cat(strrep("-", 80), "\n")
@@ -639,17 +634,8 @@ validate_features <- function(feats, plot = FALSE) {
     vmax <- max(v, na.rm = TRUE)
     vsd <- sd(v, na.rm = TRUE)
 
-    if (col %in% bounded_names) {
-      global_min <- min(global_min, vmin)
-      global_max <- max(global_max, vmax)
-    }
-
     cat(sprintf("%-35s %8d %8.3f %8.3f %8.3f %8.3f\n",
                 col, na_count, vmin, vmean, vmax, vsd))
-  }
-
-  if (is.finite(global_min)) {
-    cat("Bounded range: [", round(global_min, 4), ",", round(global_max, 4), "]\n")
   }
 
   # Group summary

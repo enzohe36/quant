@@ -3,6 +3,8 @@
 analysis/
 data/
 models/
+__pycache__/
+.claude/
 
 temp*
 *.log*

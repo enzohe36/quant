@@ -1,6 +1,6 @@
 # conda activate quant; pip install aktools --upgrade -i https://pypi.org/simple; pip install akshare --upgrade -i https://pypi.org/simple; python -m aktools
 
-# PRESET =======================================================================
+# Config =======================================================================
 
 library(RCurl)
 library(jsonlite)
@@ -18,7 +18,7 @@ dir.create(resources_dir)
 indices_path <- paste0(resources_dir, "indices.csv")
 index_comp_path <- paste0(resources_dir, "index_comp.csv")
 
-# MAIN SCRIPT ==================================================================
+# Main =========================================================================
 
 indices <- combine_indices()
 write_csv(indices, indices_path)

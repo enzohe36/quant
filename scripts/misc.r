@@ -1,4 +1,4 @@
-# PRESET =======================================================================
+# Config =======================================================================
 
 # library(foreach)
 # library(doFuture)
@@ -11,7 +11,7 @@ holidays_path <- paste0(resources_dir, "holidays.txt")
 last_td_expr <- expr(as_tradeday(now() - hours(17)))
 curr_td_expr <- expr(as_tradeday(now() - hours(9)))
 
-# MISCELLANEOUS ================================================================
+# Helpers ======================================================================
 
 holidays <- as_date(readLines(holidays_path))
 
@@ -56,17 +56,6 @@ curr_td <- eval(curr_td_expr)
 all_td <- seq(first_td, last_td, "1 day") %>%
   .[!wday(.) %in% c(1, 7)] %>%
   .[!.%in% holidays]
-
-write_title <- function(string = "", total_length = 80) {
-  string <- toupper(string)
-  if (string == "") {
-    output <- paste0("# ", strrep("=", total_length - 2))
-  } else {
-    n_equals <- total_length - nchar(string) - 3
-    output <- paste0("# ", string, " ", strrep("=", max(0, n_equals)))
-  }
-  cat(output, "\n", sep = "")
-}
 
 plot_dual_y <- function(x, y1, y2,
                         xlab = "x",
@@ -117,11 +106,6 @@ plot_dual_y <- function(x, y1, y2,
   invisible(p)
 }
 
-# Data Utilities ---------------------------------------------------------------
-
-# Trailing sum over `period` rows. Returns NA for incomplete windows.
-# Partial sums (some NAs in window) are computed — leading NAs get filtered
-# downstream by trim_leading_na.
 run_sum <- function(x, period) {
   n <- length(x)
   if (n < period) return(rep(NA_real_, n))
@@ -131,13 +115,16 @@ run_sum <- function(x, period) {
   c(rep(NA_real_, period - 1), sums)
 }
 
-# Cross-sectional percentile rank. Output [-1, +1].
-# Designed for data.table by-group usage:
-#   feats[, (cols) := lapply(.SD, cross_pctrank), by = date, .SDcols = cols]
 cross_pctrank <- function(x) {
   out <- rep(NA_real_, length(x))
   valid <- !is.na(x)
   if (sum(valid) <= 1) return(out)
   out[valid] <- 2 * rank(x[valid], ties.method = "average") / sum(valid) - 1
   out
+}
+
+drop_leading_na <- function(df) {
+  first <- which(complete.cases(df))[1]
+  if (is.na(first)) return(df[0, ])
+  df[first:nrow(df), ]
 }

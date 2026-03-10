@@ -1,4 +1,4 @@
-# PRESET =======================================================================
+# Config =======================================================================
 
 # library(RCurl)
 # library(jsonlite)
@@ -6,7 +6,7 @@
 resources_dir <- "resources/"
 indices_path <- paste0(resources_dir, "indices.csv")
 
-# HELPER FUNCTIONS =============================================================
+# Helpers ======================================================================
 
 indices <- if (file.exists(indices_path)) {
   read_csv(indices_path, show_col_types = FALSE)
@@ -55,7 +55,7 @@ loop_function <- function(func_name, ..., fail_max = 10, wait = 60) {
   stop("Maximum retries exceeded.")
 }
 
-# SPOT DATA ====================================================================
+# Spot Data ====================================================================
 
 get_indices <- function() {
   curr_td <- eval(curr_td_expr)
@@ -361,7 +361,7 @@ combine_spot <- function() {
     arrange(symbol)
 }
 
-# HISTORICAL DATA ==============================================================
+# Hist Data ====================================================================
 
 # https://quote.eastmoney.com/center/hszs.html
 get_index_hist <- function(index, start_date, end_date) {
