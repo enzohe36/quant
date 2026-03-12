@@ -16,25 +16,37 @@ import os
 import optuna
 from train_model import Config, Pruned, _log, _preprocess_data, train
 
-_SWEEP_KEYS = [
-    "dropout", "peer_dropout", "value_coeff", "entropy_coeff", "lr",
-]
+
+class SweepConfig:
+    n_trials: int = 100
+    db: str = "sqlite:///sweep.db"
+    save_dir: str = "sweep_runs"
+    study_name: str = "ppo_stock_sweep"
+    sampler_startup_trials: int = 10
+    pruner_startup_trials: int = 5
+    pruner_warmup_steps: int = 20
+
+
+SEARCH_SPACE = {
+    "dropout":       (0.0, 0.2, False),
+    "train_peers":   (1, 10, False),
+    "value_coeff":   (0.01, 1.0, True),
+    "entropy_coeff": (0.001, 0.1, True),
+    "lr":            (1e-5, 1e-3, True),
+}
 
 
 def _param_hash(params):
-    serialized = json.dumps({k: params[k] for k in sorted(_SWEEP_KEYS)}).encode()
+    keys = sorted(SEARCH_SPACE.keys())
+    serialized = json.dumps({k: params[k] for k in keys}).encode()
     return hashlib.md5(serialized).hexdigest()[:12]
 
 
 def objective(trial, preprocess_path, base_save_dir):
     cfg = Config()
 
-    # Search space
-    cfg.dropout = trial.suggest_float("dropout", 0.0, 0.2)
-    cfg.peer_dropout = trial.suggest_float("peer_dropout", 0.0, 0.8)
-    cfg.value_coeff = trial.suggest_float("value_coeff", 0.01, 1.0, log=True)
-    cfg.entropy_coeff = trial.suggest_float("entropy_coeff", 0.001, 0.1, log=True)
-    cfg.lr = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
+    for name, (low, high, log) in SEARCH_SPACE.items():
+        setattr(cfg, name, trial.suggest_float(name, low, high, log=log))
 
     cfg.save_dir = os.path.join(base_save_dir, _param_hash(trial.params))
     cfg.ablation = False
@@ -61,26 +73,34 @@ def objective(trial, preprocess_path, base_save_dir):
 
 
 def main():
+    scfg = SweepConfig()
     parser = argparse.ArgumentParser(description="Optuna sweep for train_model")
-    parser.add_argument("--n_trials", type=int, default=100)
-    parser.add_argument("--db", type=str, default="sqlite:///sweep.db")
-    parser.add_argument("--save_dir", type=str, default="sweep_runs")
-    args = parser.parse_args()
 
-    os.makedirs(args.save_dir, exist_ok=True)
+    for name, ann_type in SweepConfig.__annotations__.items():
+        default = getattr(scfg, name)
+        flag = f"--{name}"
+        parser.add_argument(flag, type=ann_type, default=default,
+                            help=f"(default: {default})")
+
+    args = parser.parse_args()
+    for name in SweepConfig.__annotations__:
+        setattr(scfg, name, getattr(args, name))
+
+    os.makedirs(scfg.save_dir, exist_ok=True)
 
     cfg = Config()
-    cfg.save_dir = args.save_dir
+    cfg.save_dir = scfg.save_dir
     preprocess_path = _preprocess_data(cfg)
 
     study = optuna.create_study(
-        study_name="ppo_stock_sweep",
+        study_name=scfg.study_name,
         direction="maximize",
-        sampler=optuna.samplers.TPESampler(n_startup_trials=10),
+        sampler=optuna.samplers.TPESampler(n_startup_trials=scfg.sampler_startup_trials),
         pruner=optuna.pruners.MedianPruner(
-            n_startup_trials=5, n_warmup_steps=20,
+            n_startup_trials=scfg.pruner_startup_trials,
+            n_warmup_steps=scfg.pruner_warmup_steps,
         ),
-        storage=args.db,
+        storage=scfg.db,
         load_if_exists=True,
     )
 
@@ -89,14 +109,14 @@ def main():
     for t in study.trials:
         if t.state in retryable and t.params:
             h = _param_hash(t.params)
-            if os.path.exists(os.path.join(args.save_dir, h, "model_latest.pt")):
+            if os.path.exists(os.path.join(scfg.save_dir, h, "model_latest.pt")):
                 study.enqueue_trial(t.params)
                 _log()
                 _log(f"Re-enqueued trial {t.number} ({h})")
 
     study.optimize(
-        lambda trial: objective(trial, preprocess_path, args.save_dir),
-        n_trials=args.n_trials,
+        lambda trial: objective(trial, preprocess_path, scfg.save_dir),
+        n_trials=scfg.n_trials,
     )
 
     _log()

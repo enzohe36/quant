@@ -1,7 +1,11 @@
 #!/bin/bash
 
-# nohup bash train_model.sh >> "training_$(date +%Y%m%d%H%M%S).log" 2>&1 & echo "kill -- -$(ps -o pgid= -p $! | tr -d ' ')" | at 07:00 2026-03-02
-#
+# nohup bash train_model.sh >> "training_$(date +%Y%m%d%H%M%S).log" 2>&1 & echo "kill -- -$(ps -o pgid= -p $! | tr -d ' ')" | at 07:00 2026-03-13
+
+# Usage examples:
+#   TRAIN_CMD="python train_model.py --data_path feats_v2.csv"
+#   TRAIN_CMD="python sweep.py --n_trials 200"
+
 # Monitor sweep progress:
 #   optuna-dashboard sqlite:///sweep.db --port 8080
 

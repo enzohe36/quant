@@ -1,158 +1,160 @@
 #!/usr/bin/env python3
-"""Visualize peer_info.pt: correlation distributions, adjacency matrix, rank decay."""
+"""Visualize peer_info.pt: similarity distributions, adjacency matrix, rank decay."""
 
 import argparse
 import os
+import sys
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 import numpy as np
-import torch
 from scipy.cluster.hierarchy import dendrogram, linkage
+import torch
+
+
+class Config:
+    peer_info: str = "checkpoints/peer_info.pt"
 
 
 def load_peer_info(path):
     return torch.load(path, map_location="cpu", weights_only=False)
 
 
-def find_nearest_checkpoint(peer_info, date_str):
-    """Return the checkpoint index closest to the given date string."""
-    date_to_col = peer_info["date_to_col"]
-    checkpoint_cols = peer_info["checkpoint_cols"]
+def plot_adjacency(adj, date_label, out_dir):
+    """Plot a single adjacency matrix with dendrograms (view_peers_ref style)."""
+    old_limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(max(old_limit, adj.shape[0] * 10))
 
-    # Match date key type (could be str or datetime-like)
-    sample_key = next(iter(date_to_col))
-    if isinstance(sample_key, str):
-        target = date_str
-    else:
-        import datetime
-        target = datetime.date.fromisoformat(date_str)
+    N = adj.shape[0]
+    adj = adj.copy()
+    np.fill_diagonal(adj, 0.0)
 
-    if target not in date_to_col:
-        # Find the closest date that exists
-        all_dates = sorted(date_to_col.keys())
-        closest = min(all_dates, key=lambda d: abs(
-            (d if isinstance(d, int) else
-             (d.toordinal() if hasattr(d, "toordinal") else 0))
-            - (target if isinstance(target, int) else
-               (target.toordinal() if hasattr(target, "toordinal") else 0))
-        ))
-        print(f"Date {date_str} not found; using closest: {closest}")
-        target = closest
-
-    col = date_to_col[target]
-    cp_idx = int(np.searchsorted(checkpoint_cols, col))
-    cp_idx = min(cp_idx, len(checkpoint_cols) - 1)
-    # Check if the previous checkpoint is actually closer
-    if cp_idx > 0:
-        if abs(checkpoint_cols[cp_idx - 1] - col) < abs(checkpoint_cols[cp_idx] - col):
-            cp_idx -= 1
-    return cp_idx
-
-
-def plot_corr_distributions(peer_info, out_dir):
-    """Plot #1: correlation distribution at first / middle / last checkpoint."""
-    corr = peer_info["all_top_k_corr"]  # (n_cp, N, K)
-    n_cp = corr.shape[0]
-    indices = [0, n_cp // 2, n_cp - 1]
-    checkpoint_cols = peer_info["checkpoint_cols"]
-    all_dates = peer_info["all_dates"]
-
-    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
-    for ax, cp_idx in zip(axes, indices):
-        vals = corr[cp_idx].ravel()
-        ax.hist(vals, bins=50, edgecolor="black", linewidth=0.3)
-        col = checkpoint_cols[cp_idx]
-        date_label = all_dates[col] if col < len(all_dates) else col
-        ax.set_title(f"Checkpoint {cp_idx}\n{date_label}")
-        ax.set_xlabel("Correlation")
-        ax.set_ylabel("Count")
-    fig.suptitle("Top-K Peer Correlation Distribution", fontweight="bold")
-    plt.tight_layout()
-    path = os.path.join(out_dir, "peer_corr_dist.png")
-    fig.savefig(path, dpi=150)
-    print(f"Saved {path}")
-    return fig
-
-
-def plot_adjacency(peer_info, cp_idx, out_dir):
-    """Plot #3: adjacency matrix at a given checkpoint, clustered."""
-    N = len(peer_info["symbols"])
-    K = peer_info["n_peers"]
-    idx = peer_info["all_top_k_idx"][cp_idx]    # (N, K)
-    corr = peer_info["all_top_k_corr"][cp_idx]  # (N, K)
-
-    # Build symmetric adjacency: average of (i->j) and (j->i) weights
-    adj = np.zeros((N, N), dtype=np.float32)
-    for i in range(N):
-        for k in range(K):
-            j = idx[i, k]
-            adj[i, j] = max(adj[i, j], corr[i, k])
-    adj = np.maximum(adj, adj.T)
-
-    # Hierarchical clustering for row/col reordering
-    dist = 1.0 - adj
-    np.fill_diagonal(dist, 0.0)
-    condensed = dist[np.triu_indices(N, k=1)]
+    dist_mat = np.maximum(1.0 - adj, 0.0)
+    np.fill_diagonal(dist_mat, 0.0)
+    condensed = dist_mat[np.triu_indices(N, k=1)]
     Z = linkage(condensed, method="average")
     order = dendrogram(Z, no_plot=True)["leaves"]
-
     adj_sorted = adj[np.ix_(order, order)]
 
-    col = peer_info["checkpoint_cols"][cp_idx]
+    fig = plt.figure(figsize=(8, 7))
+    gs = fig.add_gridspec(2, 3, width_ratios=[1, 5, 0.2],
+                          height_ratios=[1, 5],
+                          wspace=0.01, hspace=0.01)
+
+    ax_top = fig.add_subplot(gs[0, 1])
+    dendrogram(Z, ax=ax_top, no_labels=True, color_threshold=0,
+               above_threshold_color="steelblue")
+    for coll in ax_top.collections:
+        coll.set_linewidths(0.1)
+    ax_top.axis("off")
+    ax_top.set_title(f"Peer Adjacency — {date_label}")
+
+    ax_left = fig.add_subplot(gs[1, 0])
+    dendrogram(Z, ax=ax_left, no_labels=True, color_threshold=0,
+               above_threshold_color="steelblue", orientation="left")
+    for coll in ax_left.collections:
+        coll.set_linewidths(0.1)
+    ax_left.axis("off")
+
+    ax_adj = fig.add_subplot(gs[1, 1])
+    im = ax_adj.imshow(adj_sorted, cmap="RdBu_r", aspect="auto",
+                       interpolation="nearest", vmin=-1, vmax=1)
+    ax_adj.set_xticks([])
+    ax_adj.set_yticks([])
+
+    ax_cb = fig.add_subplot(gs[1, 2])
+    fig.colorbar(im, cax=ax_cb, label="Correlation")
+
+    date_str = str(date_label).replace("-", "")
+    adj_path = os.path.join(out_dir, f"adjacency_{date_str}.png")
+    fig.savefig(adj_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    sys.setrecursionlimit(old_limit)
+    print(f"Saved {adj_path}")
+
+
+def plot_all(peer_info, cfg):
+    sim = peer_info["all_top_k_sim"]       # (n_cp, N, K)
+    snapshot_cols = peer_info["snapshot_cols"]
     all_dates = peer_info["all_dates"]
-    date_label = all_dates[col] if col < len(all_dates) else col
+    _, _, K = sim.shape
+    out_dir = os.path.dirname(os.path.abspath(cfg.peer_info))
 
-    fig, ax = plt.subplots(figsize=(8, 7))
-    im = ax.imshow(adj_sorted, cmap="hot", aspect="auto", interpolation="nearest")
-    fig.colorbar(im, ax=ax, label="Correlation", shrink=0.8)
-    ax.set_title(f"Peer Adjacency Matrix (clustered)\n{date_label}", fontweight="bold")
-    ax.set_xlabel("Stock (clustered order)")
-    ax.set_ylabel("Stock (clustered order)")
+    dates = [all_dates[c] if c < len(all_dates) else c for c in snapshot_cols]
+
+    # Adjacency heatmaps — separate file per diagnostic snapshot
+    sim_diagnostics = peer_info["sim_diagnostics"]       # list of 3 (N, N) arrays
+    sim_diagnostic_cols = peer_info["sim_diagnostic_cols"]  # list of 3 snapshot indices
+    for snap, cp in zip(sim_diagnostics, sim_diagnostic_cols):
+        col = snapshot_cols[cp]
+        date_label = all_dates[col] if col < len(all_dates) else col
+        plot_adjacency(snap, date_label, out_dir)
+
+    # Similarity diagnostics — single figure (train_model style)
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+    # Mean similarity over time (valid stocks only)
+    first_col = peer_info["global_first_col"]   # (N,)
+    last_col = peer_info["global_last_col"]      # (N,)
+    cp_cols = snapshot_cols                     # (n_cp,)
+    valid = (first_col[None, :] <= cp_cols[:, None]) & \
+            (cp_cols[:, None] <= last_col[None, :])   # (n_cp, N)
+    valid_sim = np.where(valid[:, :, None], sim, np.nan)
+    mean_sim = np.nanmean(valid_sim, axis=(1, 2))  # (n_cp,)
+    has_positive = (sim > 0).any(axis=2)       # (n_cp, N)
+    axes[0].plot(dates, mean_sim, linewidth=1.0)
+    axes[0].set_title("Top-K Similarity")
+    axes[0].grid(True, alpha=0.3)
+
+    # Zero-peer stocks over time (only stocks valid at each snapshot)
+    zero_count = (valid & ~has_positive).sum(axis=1)   # (n_cp,)
+    axes[1].plot(dates, zero_count, linewidth=1.0)
+    axes[1].set_title("Stocks Without Peers")
+    axes[1].grid(True, alpha=0.3)
+
+    # Rank decay
+    mean_by_rank = np.nanmean(valid_sim, axis=(0, 1))  # (K,)
+    axes[2].plot(range(K), mean_by_rank, marker="o", color="steelblue")
+    axes[2].set_title("Similarity by Peer Rank")
+    axes[2].set_xticks(range(K))
+    axes[2].grid(True, alpha=0.3)
+
+    for ax in axes:
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+
+    for ax in axes[:2]:
+        plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
     plt.tight_layout()
-    path = os.path.join(out_dir, "peer_adjacency.png")
-    fig.savefig(path, dpi=150)
-    print(f"Saved {path}")
-    return fig
-
-
-def plot_rank_decay(peer_info, out_dir):
-    """Plot #4: mean correlation by peer rank."""
-    corr = peer_info["all_top_k_corr"]  # (n_cp, N, K)
-    mean_by_rank = corr.mean(axis=(0, 1))  # (K,)
-    K = len(mean_by_rank)
-
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.bar(range(K), mean_by_rank, color="steelblue", edgecolor="black", linewidth=0.3)
-    ax.set_xlabel("Peer rank")
-    ax.set_ylabel("Mean correlation")
-    ax.set_title("Average Correlation by Peer Rank", fontweight="bold")
-    ax.set_xticks(range(0, K, max(1, K // 10)))
-    plt.tight_layout()
-    path = os.path.join(out_dir, "peer_rank_decay.png")
-    fig.savefig(path, dpi=150)
-    print(f"Saved {path}")
-    return fig
+    diag_path = os.path.join(out_dir, "peer_plots.png")
+    fig.savefig(diag_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved {diag_path}")
 
 
 def main():
+    cfg = Config()
     parser = argparse.ArgumentParser(description="Visualize peer_info.pt")
-    parser.add_argument("--peer-info", required=True, help="Path to peer_info.pt")
-    parser.add_argument("--date", required=True, help="Snapshot date for adjacency matrix (YYYY-MM-DD)")
+
+    for name, ann_type in Config.__annotations__.items():
+        default = getattr(cfg, name)
+        flag = f"--{name}"
+        parser.add_argument(flag, type=ann_type, default=default,
+                            help=f"(default: {default})")
+
     args = parser.parse_args()
+    for name in Config.__annotations__:
+        setattr(cfg, name, getattr(args, name))
 
-    peer_info = load_peer_info(args.peer_info)
-    out_dir = os.path.dirname(os.path.abspath(args.peer_info))
+    peer_info = load_peer_info(cfg.peer_info)
 
-    cp_idx = find_nearest_checkpoint(peer_info, args.date)
-    col = peer_info["checkpoint_cols"][cp_idx]
+    last_col = peer_info["snapshot_cols"][-1]
     all_dates = peer_info["all_dates"]
-    date_label = all_dates[col] if col < len(all_dates) else col
-    print(f"Using checkpoint {cp_idx} (col {col}, date {date_label})")
+    date_label = all_dates[last_col] if last_col < len(all_dates) else last_col
+    print(f"Using last snapshot (col {last_col}, date {date_label})")
 
-    plot_corr_distributions(peer_info, out_dir)
-    plot_adjacency(peer_info, cp_idx, out_dir)
-    plot_rank_decay(peer_info, out_dir)
-    plt.show()
+    plot_all(peer_info, cfg)
 
 
 if __name__ == "__main__":

@@ -2,13 +2,13 @@
 PPO + Transformer RL for stock trading with peer attention.
 
 Data CSV (feats.csv): symbol, date, price, <group>.<feature>, ...
-Peers identified by running EWM correlation on 60-day price log ratio.
+Peers identified by PCA factor-space cosine similarity on price log ratios.
 
 Continuous position sizing in [-1, 1] with squashed Gaussian policy (tanh).
 
 Architecture:
   - Linear input projection → temporal transformer (shared across stocks)
-  - Cross-sectional peer attention with correlation bias
+  - Cross-sectional peer attention with similarity bias
   - Separate MLP heads for policy (mu) and value
 
 Launch:
@@ -22,10 +22,9 @@ import os
 import math
 import time
 import socket
-import threading
 import functools
+import tempfile
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -74,9 +73,12 @@ class Config:
     transaction_cost: float = 0.001
     train_ratio: float = 0.8
     val_ratio: float = 0.1
-    n_peers: int = 16
-    corr_halflife: int = 60
-    corr_column: str = "close.lr_1"
+    n_peers: int = 30
+    train_peers: int = 3
+    peer_decay: float = 0.95
+    peer_n_factors: int = 10
+    peer_batch: int = 4096
+    peer_column: str = "close.lr_1"
 
     # Model
     d_model: int = 128
@@ -86,12 +88,11 @@ class Config:
     d_head_hidden: int = 64
     position_dim: int = 16
     dropout: float = 0.1
-    peer_dropout: float = 0.5
 
     # PPO
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    reward_ema_decay: float = 0.99
+
     policy_clip: float = 0.2
     value_coeff: float = 0.5
     entropy_coeff: float = 0.01
@@ -104,8 +105,8 @@ class Config:
 
     # Training loop
     n_ppo_epochs: int = 2
-    batch_size: int = 2048
-    inference_batch_size: int = 4096
+    ppo_batch: int = 4096
+    inference_batch: int = 16384
     n_epochs: int = 200
     warmup_epochs: int = 5
     patience: int = 20
@@ -153,8 +154,8 @@ class VecEnv:
         self.step_peer_map = np.stack(
             [ep["step_peer_map"] for ep in episodes],
         )
-        self.corr_scores = np.stack(
-            [ep["corr_scores"] for ep in episodes],
+        self.sim_scores = np.stack(
+            [ep["sim_scores"] for ep in episodes],
         ).astype(np.float32)
         self.peer_mask = np.stack(
             [ep["peer_mask"] for ep in episodes],
@@ -183,7 +184,7 @@ class VecEnv:
         obs = np.concatenate(
             [self_window, peer_windows], axis=1,
         ).astype(np.float32)
-        corr = self.corr_scores[:, t, :]
+        corr = self.sim_scores[:, t, :]
         mask = self.peer_mask[:, t, :]
         return obs, corr, mask
 
@@ -217,49 +218,53 @@ class VecEnv:
 # Reward Normalizer ============================================================
 
 class RewardNormalizer:
-    """EMA reward normalizer. Divides by EMA std without mean-shifting."""
+    """Welford reward normalizer. Divides by running std without mean-shifting."""
 
-    def __init__(self, eps, decay):
+    def __init__(self, eps):
         self.eps = eps
-        self.decay = decay
-        self.mean_sq = 1.0
-        self.initialized = False
+        self.count = 0
+        self.mean = 0.0
+        self.m2 = 0.0
 
-    def _apply_ema(self, batch_mean_sq):
-        if not self.initialized:
-            self.mean_sq = batch_mean_sq
-            self.initialized = True
-        else:
-            self.mean_sq = self.decay * self.mean_sq + (1 - self.decay) * batch_mean_sq
+    def _update_stats(self, batch_sum, batch_sum_sq, batch_count):
+        if batch_count == 0:
+            return
+        batch_mean = batch_sum / batch_count
+        batch_var = batch_sum_sq / batch_count - batch_mean ** 2
+        delta = batch_mean - self.mean
+        new_count = self.count + batch_count
+        self.mean = self.mean + delta * batch_count / new_count
+        self.m2 = self.m2 + batch_var * batch_count + delta ** 2 * self.count * batch_count / new_count
+        self.count = new_count
 
     def update(self, rewards):
         flat = rewards.ravel().astype(np.float64)
         if len(flat) > 0:
-            self._apply_ema(float((flat ** 2).mean()))
+            self._update_stats(float(flat.sum()), float((flat ** 2).sum()), len(flat))
 
     def update_distributed(self, rewards, device):
         flat = rewards.ravel().astype(np.float64)
         local = torch.tensor(
-            [float((flat ** 2).sum()), float(len(flat))],
+            [float(flat.sum()), float((flat ** 2).sum()), float(len(flat))],
             device=device, dtype=torch.float64,
         )
         dist.all_reduce(local)
-        total_sq, total_n = local[0].item(), local[1].item()
-        if total_n > 0:
-            self._apply_ema(total_sq / total_n)
+        self._update_stats(local[0].item(), local[1].item(), int(local[2].item()))
 
     def normalize(self, rewards):
-        if not self.initialized:
+        if self.count < 2:
             return rewards
-        std = np.sqrt(self.mean_sq + self.eps)
+        var = self.m2 / self.count
+        std = np.sqrt(var + self.eps)
         return (rewards / std).astype(np.float32)
 
     def state_dict(self):
-        return {"mean_sq": self.mean_sq, "initialized": self.initialized}
+        return {"count": self.count, "mean": self.mean, "m2": self.m2}
 
     def load_state_dict(self, state):
-        self.mean_sq = state.get("mean_sq", 1.0)
-        self.initialized = state.get("initialized", False)
+        self.count = state.get("count", 0)
+        self.mean = state.get("mean", 0.0)
+        self.m2 = state.get("m2", 0.0)
 
 
 # Feature Normalization ========================================================
@@ -316,7 +321,7 @@ def compute_feature_stats(train_data):
 class PeerAttention(nn.Module):
     """Cross-sectional attention across peer stocks.
 
-    Uses correlation scores as additive attention bias so that the
+    Uses similarity scores as additive attention bias so that the
     attention weights shift continuously as peer sets evolve.
     """
 
@@ -327,16 +332,16 @@ class PeerAttention(nn.Module):
             d_model, n_heads, dropout=dropout, batch_first=True,
         )
         self.norm = nn.LayerNorm(d_model)
-        self.bias_scale = nn.Parameter(torch.tensor(1.0))
+        self.bias_scale = 1.0
 
-    def forward(self, x, corr_scores, peer_mask, need_weights=False):
+    def forward(self, x, sim_scores, peer_mask, need_weights=False):
         """
         x:           (B, K+1, d_model)
-        corr_scores: (B, K+1)  — correlation of each slot with query stock
+        sim_scores: (B, K+1)  — similarity of each slot with query stock
         peer_mask:   (B, K+1)  bool — True for padded/invalid positions
         """
         K1 = x.shape[1]
-        bias = self.bias_scale * corr_scores.unsqueeze(1).expand(-1, K1, -1)
+        bias = self.bias_scale * sim_scores.unsqueeze(1).expand(-1, K1, -1)
         bias = bias.repeat_interleave(self.n_heads, dim=0)
 
         if peer_mask is not None and peer_mask.any():
@@ -408,11 +413,11 @@ class PolicyNetwork(nn.Module):
             nn.Linear(cfg.d_head_hidden, 1),
         )
 
-    def forward(self, obs, positions, corr_scores, peer_mask):
+    def forward(self, obs, positions, sim_scores, peer_mask):
         """
         obs:         (B, K+1, lookback, F)
         positions:   (B,)
-        corr_scores: (B, K+1)
+        sim_scores: (B, K+1)
         peer_mask:   (B, K+1)
         """
         B, K1, T, F = obs.shape
@@ -435,17 +440,8 @@ class PolicyNetwork(nn.Module):
             pooled = torch.cat(parts, dim=0)
         pooled = pooled.view(B, K1, -1)                # (B, K+1, d_model)
 
-        # Stage 2: peer cross-attention with dropout
-        if self.training and self.cfg.peer_dropout > 0:
-            keep = torch.bernoulli(torch.full(
-                (B, 1), 1 - self.cfg.peer_dropout,
-                device=obs.device, dtype=obs.dtype,
-            ))
-            drop_mask = peer_mask.clone()
-            drop_mask[:, 1:] = drop_mask[:, 1:] | (keep == 0)
-            pooled = self.peer_attn(pooled, corr_scores, drop_mask)
-        else:
-            pooled = self.peer_attn(pooled, corr_scores, peer_mask)
+        # Stage 2: peer cross-attention
+        pooled = self.peer_attn(pooled, sim_scores, peer_mask)
 
         # Extract traded stock representation (index 0)
         self_repr = pooled[:, 0, :]  # (B, d_model)
@@ -475,8 +471,8 @@ def _squashed_gaussian_log_prob(u, mu, log_std):
     return gauss_log_prob - squash_correction
 
 
-def select_stochastic(model, obs, positions, corr_scores, peer_mask):
-    mu, log_std, values = model(obs, positions, corr_scores, peer_mask)
+def select_stochastic(model, obs, positions, sim_scores, peer_mask):
+    mu, log_std, values = model(obs, positions, sim_scores, peer_mask)
     std = log_std.exp()
     u = mu + std * torch.randn_like(std)
     log_probs = _squashed_gaussian_log_prob(u.float(), mu.float(), log_std.float())
@@ -484,13 +480,13 @@ def select_stochastic(model, obs, positions, corr_scores, peer_mask):
     return actions, u, log_probs, values
 
 
-def select_greedy(model, obs, positions, corr_scores, peer_mask):
-    mu, _, values = model(obs, positions, corr_scores, peer_mask)
+def select_greedy(model, obs, positions, sim_scores, peer_mask):
+    mu, _, values = model(obs, positions, sim_scores, peer_mask)
     return mu.tanh(), values
 
 
-def evaluate_actions(model, obs, raw_actions, positions, corr_scores, peer_mask):
-    mu, log_std, values = model(obs, positions, corr_scores, peer_mask)
+def evaluate_actions(model, obs, raw_actions, positions, sim_scores, peer_mask):
+    mu, log_std, values = model(obs, positions, sim_scores, peer_mask)
     mu, log_std = mu.float(), log_std.float()
     u = raw_actions.float()
     log_probs = _squashed_gaussian_log_prob(u, mu, log_std)
@@ -500,7 +496,7 @@ def evaluate_actions(model, obs, raw_actions, positions, corr_scores, peer_mask)
 
 # Batched GPU Inference ========================================================
 
-def _batched_stochastic(model, obs, pos, corr_scores, peer_mask, cfg):
+def _batched_stochastic(model, obs, pos, sim_scores, peer_mask, cfg):
     n = obs.shape[0]
     actions = np.empty(n, dtype=np.float32)
     raw = np.empty(n, dtype=np.float32)
@@ -508,11 +504,11 @@ def _batched_stochastic(model, obs, pos, corr_scores, peer_mask, cfg):
     vals = np.empty(n, dtype=np.float32)
     amp_enabled = cfg.use_amp and cfg.device.startswith("cuda")
     with torch.no_grad(), torch.amp.autocast("cuda", enabled=amp_enabled):
-        for i in range(0, n, cfg.inference_batch_size):
-            j = min(i + cfg.inference_batch_size, n)
+        for i in range(0, n, cfg.inference_batch):
+            j = min(i + cfg.inference_batch, n)
             s = torch.from_numpy(obs[i:j]).to(cfg.device)
             p = torch.from_numpy(pos[i:j]).to(cfg.device)
-            c = torch.from_numpy(corr_scores[i:j]).to(cfg.device)
+            c = torch.from_numpy(sim_scores[i:j]).to(cfg.device)
             m = torch.from_numpy(peer_mask[i:j]).to(cfg.device)
             a, r, lp, v = select_stochastic(model, s, p, c, m)
             actions[i:j] = a.cpu().numpy()
@@ -522,17 +518,17 @@ def _batched_stochastic(model, obs, pos, corr_scores, peer_mask, cfg):
     return actions, raw, logp, vals
 
 
-def _batched_greedy(model, obs, pos, corr_scores, peer_mask, cfg):
+def _batched_greedy(model, obs, pos, sim_scores, peer_mask, cfg):
     n = obs.shape[0]
     actions = np.empty(n, dtype=np.float32)
     vals = np.empty(n, dtype=np.float32)
     amp_enabled = cfg.use_amp and cfg.device.startswith("cuda")
     with torch.no_grad(), torch.amp.autocast("cuda", enabled=amp_enabled):
-        for i in range(0, n, cfg.inference_batch_size):
-            j = min(i + cfg.inference_batch_size, n)
+        for i in range(0, n, cfg.inference_batch):
+            j = min(i + cfg.inference_batch, n)
             s = torch.from_numpy(obs[i:j]).to(cfg.device)
             p = torch.from_numpy(pos[i:j]).to(cfg.device)
-            c = torch.from_numpy(corr_scores[i:j]).to(cfg.device)
+            c = torch.from_numpy(sim_scores[i:j]).to(cfg.device)
             m = torch.from_numpy(peer_mask[i:j]).to(cfg.device)
             a, v = select_greedy(model, s, p, c, m)
             actions[i:j] = a.cpu().numpy()
@@ -561,7 +557,7 @@ class RolloutBuffer:
         self.all_date_cols = None
         self.global_features = None
         self.all_step_peer_map = None
-        self.all_corr_scores = None
+        self.all_sim_scores = None
         self.all_peer_masks = None
 
     def register_episodes(self, episodes, global_features):
@@ -575,8 +571,8 @@ class RolloutBuffer:
         self.all_step_peer_map = np.stack(
             [ep["step_peer_map"] for ep in episodes],
         )
-        self.all_corr_scores = np.stack(
-            [ep["corr_scores"] for ep in episodes],
+        self.all_sim_scores = np.stack(
+            [ep["sim_scores"] for ep in episodes],
         ).astype(np.float32)
         self.all_peer_masks = np.stack(
             [ep["peer_mask"] for ep in episodes],
@@ -661,8 +657,8 @@ class RolloutBuffer:
             "states": torch.from_numpy(observation_batch).to(
                 device, non_blocking=True,
             ),
-            "corr_scores": torch.from_numpy(
-                self.all_corr_scores[episode_ids, step_offsets],
+            "sim_scores": torch.from_numpy(
+                self.all_sim_scores[episode_ids, step_offsets],
             ).to(device, non_blocking=True),
             "peer_mask": torch.from_numpy(
                 self.all_peer_masks[episode_ids, step_offsets],
@@ -807,35 +803,16 @@ def build_global_features(all_data, symbols, symbol_to_idx, date_to_col, T):
 
 # Peer Map =====================================================================
 
-def _extract_top_k(corr, N, K):
-    """Extract top-K peer indices and clipped correlation scores per stock."""
-    np.fill_diagonal(corr, -2.0)
-    np.nan_to_num(corr, nan=-2.0, copy=False)
-    if K >= N - 1:
-        top_k_idx = np.argsort(-corr, axis=1)[:, :K].astype(np.int32)
-    else:
-        top_k_idx = np.argpartition(corr, -K, axis=1)[:, -K:]
-        row_idx = np.arange(N)[:, None]
-        top_k_corr_vals = corr[row_idx, top_k_idx]
-        sort_order = np.argsort(-top_k_corr_vals, axis=1)
-        top_k_idx = np.take_along_axis(
-            top_k_idx, sort_order, axis=1,
-        ).astype(np.int32)
-    top_k_corr = np.clip(
-        corr[np.arange(N)[:, None], top_k_idx], 0.0, 1.0,
-    ).astype(np.float32)
-    return top_k_idx, top_k_corr
-
-
 @timed
 def compute_peer_maps(all_data, feature_cols, cfg):
-    """Precompute daily top-K peer indices using incremental EMA correlation
-    on the close.lr_1 feature column.
+    """Precompute daily top-K peer indices using PCA factor-space similarity
+    with exponentially weighted sliding windows on the GPU.
 
-    Phase 1: Sequential EMA accumulation (inherently sequential).
-    Phase 2: Parallel correlation -> top-K extraction via thread pool.
+    For each date, a window of W past observations (W derived from decay)
+    is weighted, SVD-decomposed to extract the top F factors, and the
+    factor-space similarity is used to identify the K most correlated peers.
     """
-    corr_col_name = cfg.corr_column
+    corr_col_name = cfg.peer_column
     if corr_col_name not in feature_cols:
         raise ValueError(
             f"Correlation column '{corr_col_name}' not found in features. "
@@ -859,114 +836,112 @@ def compute_peer_maps(all_data, feature_cols, cfg):
             col = date_to_col[d]
             returns[i, col] = float(sd["stock_features"][d_idx, corr_col_idx])
 
-    halflife = cfg.corr_halflife
-    alpha = 1.0 - np.exp(-np.log(2.0) / halflife)
-    decay = 1.0 - alpha
-    min_history = 2 * halflife
+    decay = cfg.peer_decay
     K = min(cfg.n_peers, N - 1)
 
-    # Running EMA accumulators
-    mu = np.zeros(N, dtype=np.float64)       # EMA of returns
-    S = np.zeros((N, N), dtype=np.float64)   # EMA of return outer products
+    # Window width: include weights down to 1% of the newest weight
+    W = int(np.ceil(np.log(0.01) / np.log(decay)))
+    _log(f"    {'PCA window':<20s}: {W}")
 
-    try:
-        n_cores = len(os.sched_getaffinity(0))
-    except AttributeError:
-        n_cores = os.cpu_count() or 1
+    # Precompute exponential weights (oldest to newest)
+    weights_np = decay ** np.arange(W - 1, -1, -1, dtype=np.float64)
+    weights_np /= weights_np.sum()
 
-    n_workers = max(1, n_cores)
+    device = torch.device(cfg.device)
+    ret = torch.tensor(returns, dtype=torch.float32, device=device)
+    weights_t = torch.tensor(weights_np, dtype=torch.float32, device=device)
+    sqrt_w = weights_t.sqrt()
 
-    def _corr_top_k_worker(t, mu_t, S_t):
-        # Lazily allocate one reusable buffer per thread
-        tname = threading.current_thread().name
-        if tname not in _thread_bufs:
-            _thread_bufs[tname] = np.empty((N, N), dtype=np.float64)
-        outer_buf = _thread_bufs[tname]
-        np.outer(mu_t, mu_t, out=outer_buf)
-        S_t -= outer_buf
+    # Snapshots: one per date from t=W-1 onward
+    C = T - W + 1
+    snapshot_cols = np.arange(W - 1, T, dtype=np.int64)
 
-        var = np.diag(S_t).copy()
-        dead = var < 1e-8
-        S_t[dead, :] = 0.0
-        S_t[:, dead] = 0.0
-        std = np.sqrt(np.maximum(var, 1e-8))
-        np.divide(S_t, std[:, None], out=S_t)
-        np.divide(S_t, std[None, :], out=S_t)
+    all_top_k_idx = np.empty((C, N, K), dtype=np.int32)
+    all_top_k_sim = np.empty((C, N, K), dtype=np.float32)
 
-        top_k_idx, top_k_corr = _extract_top_k(S_t, N, K)
-        return t, (top_k_idx, top_k_corr)
+    batch = cfg.peer_batch
+    n_factors = min(cfg.peer_n_factors, W)
 
-    _thread_bufs = {}
+    _log(f"    {'PCA factors':<20s}: {n_factors}")
+    _log(f"    {'Snapshots':<20s}: {C}")
 
-    snapshots = {}
-    pending = []
+    # Diagnostic snapshots: first, middle, last
+    diagnostic_snapshots = sorted(set([0, C // 2, C - 1]))
+    diagnostic_set = set(diagnostic_snapshots)
+    sim_diagnostics = {}
 
-    # Pre-allocate buffer for EMA outer product
-    ema_outer_buf = np.empty((N, N), dtype=np.float64)
+    # Compute peer maps
+    for b0 in range(0, C, batch):
+        b1 = min(b0 + batch, C)
+        B = b1 - b0
 
-    with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        for t in range(T):
-            x = returns[:, t]
-            mu *= decay
-            mu += alpha * x
-            S *= decay
-            np.outer(x, x, out=ema_outer_buf)
-            ema_outer_buf *= alpha
-            S += ema_outer_buf
+        # Extract windows: (B, N, W)
+        col_idx = (
+            torch.arange(b0, b1, device=device)[:, None]
+            + torch.arange(W, device=device)
+        )
+        windows = ret[:, col_idx].permute(1, 0, 2)  # (B, N, W)
 
-            if t < min_history:
-                continue
+        # Weighted mean and centering
+        means = (windows * weights_t).sum(dim=2, keepdim=True)
+        centered = (windows - means) * sqrt_w  # (B, N, W)
 
-            # Collect completed futures to free memory
-            still_pending = []
-            for f in pending:
-                if f.done():
-                    t_idx, result = f.result()
-                    snapshots[t_idx] = result
-                else:
-                    still_pending.append(f)
-            pending = still_pending
+        # Batch SVD
+        U, S, _ = torch.linalg.svd(centered, full_matrices=False)
 
-            mu_copy, S_copy = mu.copy(), S.copy()
-            pending.append(
-                pool.submit(_corr_top_k_worker, t, mu_copy, S_copy),
-            )
+        # Scaled loadings: (B, N, F)
+        BL = U[:, :, :n_factors] * S[:, None, :n_factors]
+        del centered, U, S, windows, means, col_idx
 
-        # Drain remaining futures
-        for f in pending:
-            t_idx, result = f.result()
-            snapshots[t_idx] = result
+        # Top-K per snapshot (sim is N×N, process one at a time)
+        for i in range(B):
+            bl = BL[i]  # (N, F)
+            norms = bl.norm(dim=1, keepdim=True).clamp(min=1e-8)
+            bl_norm = bl / norms
+            sim = bl_norm @ bl_norm.T  # (N, N)
+            sim.fill_diagonal_(-2.0)
 
-    checkpoint_arr = np.array(sorted(snapshots.keys()), dtype=np.int64)
+            vals, idx_k = sim.topk(K, dim=1)
 
-    # Pack snapshots into dense arrays for vectorized episode generation
-    n_cp = len(checkpoint_arr)
-    all_top_k_idx = np.empty((n_cp, N, K), dtype=np.int32)
-    all_top_k_corr = np.empty((n_cp, N, K), dtype=np.float32)
-    for i, cp in enumerate(checkpoint_arr):
-        all_top_k_idx[i], all_top_k_corr[i] = snapshots[cp]
-    del snapshots
+            cp = b0 + i
+            all_top_k_idx[cp] = idx_k.cpu().numpy()
+            all_top_k_sim[cp] = vals.clamp(0.0, 1.0).cpu().numpy()
+
+            if cp in diagnostic_set:
+                sim_diagnostics[cp] = sim.fill_diagonal_(1.0).cpu().numpy()
+
+    del ret, weights_t, sqrt_w
+    torch.cuda.empty_cache()
 
     return {
         "all_top_k_idx": all_top_k_idx,
-        "all_top_k_corr": all_top_k_corr,
-        "checkpoint_cols": checkpoint_arr,
+        "all_top_k_sim": all_top_k_sim,
+        "snapshot_cols": snapshot_cols,
         "symbols": symbols,
         "symbol_to_idx": symbol_to_idx,
         "all_dates": all_dates,
         "date_to_col": date_to_col,
         "n_peers": K,
+        "sim_diagnostics": [sim_diagnostics[c] for c in diagnostic_snapshots],
+        "sim_diagnostic_cols": diagnostic_snapshots,
     }
+
+
+def _peer_map_worker(all_data, feature_cols, cfg, result_path):
+    """Subprocess target: compute peer maps and save to disk."""
+    result = compute_peer_maps(all_data, feature_cols, cfg)
+    torch.save(result, result_path)
 
 
 # Episode Generation ===========================================================
 
-def _generate_symbol_episodes(symbol, symbol_data, peer_info, cfg, anchor):
+def _generate_symbol_episodes(symbol, symbol_data, peer_info, cfg, anchor,
+                              subsample_k=None, rng=None):
     chunk_size = cfg.lookback + cfg.episode_length
     K = peer_info["n_peers"]
-    checkpoint_cols = peer_info["checkpoint_cols"]
+    snapshot_cols = peer_info["snapshot_cols"]
     all_top_k_idx = peer_info["all_top_k_idx"]
-    all_top_k_corr = peer_info["all_top_k_corr"]
+    all_top_k_sim = peer_info["all_top_k_sim"]
     global_first_col = peer_info["global_first_col"]
     global_last_col = peer_info["global_last_col"]
     global_delist = peer_info["global_delist"]
@@ -997,7 +972,7 @@ def _generate_symbol_episodes(symbol, symbol_data, peer_info, cfg, anchor):
         # Observation columns for all steps (vectorized)
         obs_cols = date_cols[lookback - 1 : lookback - 1 + ep_len]
         cp_indices = np.searchsorted(
-            checkpoint_cols, obs_cols, side="right",
+            snapshot_cols, obs_cols, side="right",
         ).astype(np.intp) - 1
 
         if np.any(cp_indices < 0):
@@ -1006,7 +981,7 @@ def _generate_symbol_episodes(symbol, symbol_data, peer_info, cfg, anchor):
 
         # Direct array indexing — no dict lookups or Python loops
         step_peer_idx = all_top_k_idx[cp_indices, sym_idx]    # (ep_len, K)
-        step_peer_corr = all_top_k_corr[cp_indices, sym_idx]  # (ep_len, K)
+        step_peer_sim = all_top_k_sim[cp_indices, sym_idx]  # (ep_len, K)
 
         # --- Vectorized peer validity (ep_len, K) ---
         peer_first = global_first_col[step_peer_idx]
@@ -1015,7 +990,7 @@ def _generate_symbol_episodes(symbol, symbol_data, peer_info, cfg, anchor):
         obs_2d = obs_cols[:, None]  # (ep_len, 1) for broadcast
 
         valid = (
-            (step_peer_corr > 0)
+            (step_peer_sim > 0)
             & (peer_first >= 0)
             & (peer_first <= episode_first_col)
             & ~(peer_del & (peer_last < obs_2d))
@@ -1023,11 +998,22 @@ def _generate_symbol_episodes(symbol, symbol_data, peer_info, cfg, anchor):
                 & ((obs_2d - peer_last) > lookback))
         )
 
-        step_corr_scores = np.zeros((ep_len, K + 1), dtype=np.float32)
-        step_corr_scores[:, 0] = 1.0
-        step_corr_scores[:, 1:] = np.where(valid, step_peer_corr, 0.0)
+        # Subsample peers for training
+        if subsample_k is not None and subsample_k < K:
+            perm = np.argsort(rng.random((ep_len, K)), axis=1)[:, :subsample_k]
+            row_idx = np.arange(ep_len)[:, None]
+            step_peer_idx = step_peer_idx[row_idx, perm]
+            step_peer_sim = step_peer_sim[row_idx, perm]
+            valid = valid[row_idx, perm]
+            K_eff = subsample_k
+        else:
+            K_eff = K
 
-        step_peer_mask = np.ones((ep_len, K + 1), dtype=bool)
+        step_sim_scores = np.zeros((ep_len, K_eff + 1), dtype=np.float32)
+        step_sim_scores[:, 0] = 1.0
+        step_sim_scores[:, 1:] = np.where(valid, step_peer_sim, 0.0)
+
+        step_peer_mask = np.ones((ep_len, K_eff + 1), dtype=bool)
         step_peer_mask[:, 0] = False
         step_peer_mask[:, 1:] = ~valid
 
@@ -1040,7 +1026,7 @@ def _generate_symbol_episodes(symbol, symbol_data, peer_info, cfg, anchor):
             "susp": symbol_data["susp"][start : start + chunk_size],
             "date_cols": date_cols,
             "step_peer_map": step_peer_idx,
-            "corr_scores": step_corr_scores,
+            "sim_scores": step_sim_scores,
             "peer_mask": step_peer_mask,
         })
         start += ep_len
@@ -1049,7 +1035,8 @@ def _generate_symbol_episodes(symbol, symbol_data, peer_info, cfg, anchor):
 
 
 @timed
-def generate_episodes(stock_data, peer_info, cfg, epoch_rng):
+def generate_episodes(stock_data, peer_info, cfg, epoch_rng,
+                      subsample_k=None):
     """Generate non-overlapping episodes with peer context."""
     chunk_size = cfg.lookback + cfg.episode_length
     episodes = []
@@ -1063,7 +1050,8 @@ def generate_episodes(stock_data, peer_info, cfg, epoch_rng):
             epoch_rng.integers(0, min(cfg.episode_length, max_start + 1)),
         )
         episodes.extend(
-            _generate_symbol_episodes(symbol, symbol_data, peer_info, cfg, anchor),
+            _generate_symbol_episodes(symbol, symbol_data, peer_info, cfg,
+                                      anchor, subsample_k, epoch_rng),
         )
 
     epoch_rng.shuffle(episodes)
@@ -1210,13 +1198,13 @@ def evaluate_ablated(model, episodes, cfg, global_features):
 
     no_peer_episodes = []
     for ep in episodes:
-        ablated_corr = np.zeros_like(ep["corr_scores"])
-        ablated_corr[:, 0] = 1.0
+        ablated_sim = np.zeros_like(ep["sim_scores"])
+        ablated_sim[:, 0] = 1.0
         ablated_mask = np.ones_like(ep["peer_mask"])
         ablated_mask[:, 0] = False
         no_peer_episodes.append({
             **ep,
-            "corr_scores": ablated_corr,
+            "sim_scores": ablated_sim,
             "peer_mask": ablated_mask,
         })
     no_peer_rewards, _ = evaluate_deterministic(
@@ -1244,7 +1232,7 @@ def diagnose_peer_attention(model, batch):
 
     with torch.no_grad(), torch.amp.autocast("cuda", enabled=False):
         states = batch["states"].float()
-        corr_scores = batch["corr_scores"]
+        sim_scores = batch["sim_scores"]
         peer_mask = batch["peer_mask"]
 
         B, K1, T, F = states.shape
@@ -1253,7 +1241,7 @@ def diagnose_peer_attention(model, batch):
         pooled = base_model.transformer(hidden).mean(dim=1).view(B, K1, -1)
 
         _, attn_weights = base_model.peer_attn(
-            pooled, corr_scores, peer_mask, need_weights=True,
+            pooled, sim_scores, peer_mask, need_weights=True,
         )
 
         self_weight = float(attn_weights[:, 0, 0].mean().item())
@@ -1287,15 +1275,15 @@ def ppo_update(model, optimizer, scaler, rollout, cfg,
     else:
         valid_mask = None
 
-    for batch_start in range(0, n_padded_transitions, cfg.batch_size):
-        batch_end = min(batch_start + cfg.batch_size, n_padded_transitions)
+    for batch_start in range(0, n_padded_transitions, cfg.ppo_batch):
+        batch_end = min(batch_start + cfg.ppo_batch, n_padded_transitions)
         batch_indices = permutation[batch_start:batch_end]
         batch = rollout.get_batch(batch_indices, cfg.device)
 
         with torch.amp.autocast("cuda", enabled=amp_enabled):
             new_log_probs, entropy, new_values = evaluate_actions(
                 model, batch["states"], batch["raw_actions"], batch["positions"],
-                batch["corr_scores"], batch["peer_mask"],
+                batch["sim_scores"], batch["peer_mask"],
             )
             log_ratio = new_log_probs - batch["log_probs"]
             ratio = torch.exp(log_ratio)
@@ -1586,17 +1574,11 @@ def plot_training(history, path, cfg):
     axes[3, 0].set_title("Log Std")
     axes[3, 0].grid(True, alpha=0.3)
 
-    # (3,1) Bias scale
-    if "bias_scale" in history:
-        axes[3, 1].plot(epochs, history["bias_scale"])
-    axes[3, 1].set_title("Bias Scale")
-    axes[3, 1].grid(True, alpha=0.3)
-
-    # (3,2) Peer attention diagnostics (dual axis)
+    # (3,1) Peer attention diagnostics (dual axis)
     has_peer = len(history.get("self_weight", [])) > 0
     if has_peer:
         peer_epochs = range(1, len(history["self_weight"]) + 1)
-        ax_peer = axes[3, 2]
+        ax_peer = axes[3, 1]
         ax_peer.plot(peer_epochs, history["self_weight"], color="b", label="Self-weight")
         ax_peer.set_ylabel("Self-weight", color="b")
         ax_peer.tick_params(axis="y", labelcolor="b")
@@ -1607,7 +1589,8 @@ def plot_training(history, path, cfg):
         ax_peer.set_title("Peer Attention")
         ax_peer.grid(True, alpha=0.3)
     else:
-        axes[3, 2].set_visible(False)
+        axes[3, 1].set_visible(False)
+    axes[3, 2].set_visible(False)
 
     for ax in axes.flat:
         if ax.get_visible():
@@ -1643,7 +1626,17 @@ def _load_all_data(cfg):
     val_range = _date_range(val_data)
     test_range = _date_range(test_data)
 
-    peer_info = compute_peer_maps(all_data, feature_cols, cfg)
+    tmp = tempfile.NamedTemporaryFile(suffix=".pt", delete=False)
+    tmp.close()
+    ctx = mp.get_context("spawn")
+    p = ctx.Process(target=_peer_map_worker,
+                    args=(all_data, feature_cols, cfg, tmp.name))
+    p.start()
+    p.join()
+    if p.exitcode != 0:
+        raise RuntimeError(f"Peer map subprocess failed (exit code {p.exitcode})")
+    peer_info = torch.load(tmp.name, map_location="cpu", weights_only=False)
+    os.unlink(tmp.name)
 
     # Build global forward-filled feature matrix for peer lookups
     gf, gf_first_col, gf_last_col, gf_delist = build_global_features(
@@ -1664,12 +1657,11 @@ def _load_all_data(cfg):
     _log(f"    {'Train symbols':<20s}: {len(train_data)}")
     _log(f"    {'Val symbols':<20s}: {len(val_data)}")
     _log(f"    {'Test symbols':<20s}: {len(test_data)}")
+    _log(f"    {'Dates':<20s}: {len(peer_info['all_dates'])}")
     _log(f"    {'Train dates':<20s}: {train_range[0]} .. {train_range[1]}")
     _log(f"    {'Val dates':<20s}: {val_range[0]} .. {val_range[1]}")
     _log(f"    {'Test dates':<20s}: {test_range[0]} .. {test_range[1]}")
     _log(f"    {'Stock features':<20s}: {len(feature_cols)}")
-    _log(f"    {'Peer snapshots':<20s}: {len(peer_info['checkpoint_cols'])}")
-    _log(f"    {'Global features':<20s}: {gf.shape}  ({gf.nbytes / 1e9:.2f} GB)")
     _log(f"    {'Train observations':<20s}: {sum(len(d['stock_features']) for d in train_data.values()):,}")
     _log(f"    {'Val observations':<20s}: {sum(len(d['stock_features']) for d in val_data.values()):,}")
     _log(f"    {'Test observations':<20s}: {sum(len(d['stock_features']) for d in test_data.values()):,}")
@@ -1749,11 +1741,11 @@ def train(cfg, preprocess_path=None, epoch_callback=None):
         ],
         lr=effective_lr, eps=1e-5,
     )
-    reward_normalizer = RewardNormalizer(1e-8, cfg.reward_ema_decay)
+    reward_normalizer = RewardNormalizer(1e-8)
     amp_enabled = cfg.use_amp and cfg.device.startswith("cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
-    device_label = f"{_world} GPUs (DDP)" if distributed else cfg.device
+    device_label = f"{_world} GPUs" if distributed else cfg.device
     _log(f"    {'Device':<20s}: {device_label}")
     _log(f"    {'Mixed precision':<20s}: {'float16' if amp_enabled else 'disabled'}")
     if _world > 1:
@@ -1825,7 +1817,8 @@ def train(cfg, preprocess_path=None, epoch_callback=None):
         _log(f"[Epoch {epoch}/{cfg.n_epochs}]")
 
         epoch_rng = np.random.default_rng(cfg.seed + epoch * 7919)
-        train_episodes = generate_episodes(train_data, peer_info, cfg, epoch_rng)
+        train_episodes = generate_episodes(train_data, peer_info, cfg, epoch_rng,
+                                                  subsample_k=cfg.train_peers)
         rank_train_episodes = train_episodes[_rank::_world]
 
         val_rng = np.random.default_rng(cfg.seed + epoch * 7919 + 1)
@@ -1851,12 +1844,12 @@ def train(cfg, preprocess_path=None, epoch_callback=None):
         else:
             max_transitions = n_local_transitions
         n_padded_transitions = (
-            math.ceil(max_transitions / cfg.batch_size) * cfg.batch_size
+            math.ceil(max_transitions / cfg.ppo_batch) * cfg.ppo_batch
         )
 
         # Peer attention diagnostics (cheap, run every epoch)
         peer_diag = None
-        diag_n = min(cfg.batch_size, n_local_transitions)
+        diag_n = min(cfg.ppo_batch, n_local_transitions)
         diag_indices = np.random.choice(n_local_transitions, diag_n, replace=False)
         diag_batch = rollout.get_batch(diag_indices, cfg.device)
         peer_diag = diagnose_peer_attention(model, diag_batch)
@@ -1877,7 +1870,6 @@ def train(cfg, preprocess_path=None, epoch_callback=None):
             epoch_losses[k] /= cfg.n_ppo_epochs
 
         current_log_std = base_model.log_std.item()
-        bias_scale = base_model.peer_attn.bias_scale.item()
 
         del rollout
         if cfg.device.startswith("cuda"):
@@ -1926,7 +1918,6 @@ def train(cfg, preprocess_path=None, epoch_callback=None):
             ("grad_norm", epoch_losses["grad_norm"]),
             ("skip_rate", epoch_losses["skip_rate"]),
             ("log_std", current_log_std),
-            ("bias_scale", bias_scale),
         ]:
             history[key].append(value)
 
@@ -1972,13 +1963,12 @@ def train(cfg, preprocess_path=None, epoch_callback=None):
         _log(f"    {'Grad norm':<20s}: {epoch_losses['grad_norm']:.4f}")
         _log(f"    {'Skip rate':<20s}: {epoch_losses['skip_rate']:.4f}")
         _log(f"    {'Log std':<20s}: {current_log_std:.4f}")
-        _log(f"    {'Bias scale':<20s}: {bias_scale:.4f}")
         if peer_diag is not None:
             _log(f"    {'Self-weight':<20s}: {peer_diag['self_weight']:.4f}")
             _log(f"    {'Attn entropy':<20s}: {peer_diag['attn_entropy']:.4f}")
+        _log(f"    {'LR':<20s}: {current_lr:.2e}")
         _log(f"    {'Current score':<20s}: {current_score:.4f}")
         _log(f"    {'Best score':<20s}: {best_score:.4f}")
-        _log(f"    {'LR':<20s}: {current_lr:.2e}")
         _log(f"    {'Patience':<20s}: {patience_counter}/{cfg.patience}")
 
         if is_main:
@@ -1988,7 +1978,7 @@ def train(cfg, preprocess_path=None, epoch_callback=None):
             torch.save(ckpt, os.path.join(cfg.save_dir, "model_latest.pt"))
             plot_training(
                 dict(history),
-                os.path.join(cfg.save_dir, "training_curves.png"),
+                os.path.join(cfg.save_dir, "training_plots.png"),
                 cfg,
             )
 
