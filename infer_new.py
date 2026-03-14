@@ -77,14 +77,11 @@ def main():
     K = peer_info["n_peers"]
     sym_to_idx = peer_info["symbol_to_idx"]
     peer_symbols = peer_info["symbols"]
+    top_k_idx_all = peer_info["top_k_idx"]    # (N, K)
+    top_k_sim_all = peer_info["top_k_sim"]    # (N, K)
 
-    last_col = int(peer_info["snapshot_cols"][-1])
-    last_date = peer_info["all_dates"][last_col]
-    top_k_idx_all = peer_info["all_top_k_idx"][-1]   # (N, K)
-    top_k_sim_all = peer_info["all_top_k_sim"][-1]  # (N, K)
-
-    _log(f"    {'Snapshots':<20s}: {len(peer_info['snapshot_cols'])}")
-    _log(f"    {'Last snapshot':<20s}: {last_date}")
+    _log(f"    {'Snapshots':<20s}: {peer_info['n_snapshots']}")
+    _log(f"    {'Last snapshot':<20s}: {peer_info['last_date']}")
     _log(f"    {'Symbols in map':<20s}: {len(peer_symbols)}")
     del peer_info
 
@@ -110,11 +107,11 @@ def main():
         current_positions = dict(zip(pos_df["symbol"], pos_df["position"]))
         _log(f"    {'Positions loaded':<20s}: {len(current_positions)}")
 
-    # 5. Build observations
+    # 5. Build observations — self at index 0 + top peers
+    K_sub = cfg.train_peers
     symbols_out = []
     obs_list = []
     sim_list = []
-    mask_list = []
     pos_list = []
 
     for sym, sd in new_data.items():
@@ -123,40 +120,40 @@ def main():
         if sym not in sym_to_idx:
             continue
 
-        stock_feat = sd["stock_features"][-cfg.lookback:]
         si = sym_to_idx[sym]
         peer_idx = top_k_idx_all[si]
         peer_sim = top_k_sim_all[si]
 
+        # Select top K_sub peers by similarity
+        top_order = np.argsort(-peer_sim)[:K_sub]
+        peer_idx = peer_idx[top_order]
+        peer_sim = peer_sim[top_order]
+
+        # Self-stock features (slot 0)
+        stock_feat = sd["stock_features"][-cfg.lookback:]
+        if cfg.pool_self:
+            stock_feat = np.zeros_like(stock_feat)
+
+        # Peer features (slots 1..K_sub)
         peer_features = np.zeros(
-            (K, cfg.lookback, n_features), dtype=np.float32,
+            (K_sub, cfg.lookback, n_features), dtype=np.float32,
         )
-        sim_scores = np.zeros(K + 1, dtype=np.float32)
-        peer_mask = np.ones(K + 1, dtype=bool)
-
+        sim_scores = np.zeros(K_sub + 1, dtype=np.float32)
         sim_scores[0] = 1.0
-        peer_mask[0] = False
 
-        for k in range(K):
+        for k in range(K_sub):
             pidx = int(peer_idx[k])
-            psim = float(peer_sim[k])
-            if psim <= 0:
-                continue
             peer_sym = peer_symbols[pidx]
             p_data = new_data.get(peer_sym)
             if p_data is None or len(p_data["stock_features"]) < cfg.lookback:
                 continue
             peer_features[k] = p_data["stock_features"][-cfg.lookback:]
-            sim_scores[k + 1] = psim
-            peer_mask[k + 1] = False
+            sim_scores[k + 1] = float(peer_sim[k])
 
-        obs = np.concatenate(
-            [stock_feat[None], peer_features], axis=0,
-        )
+        obs = np.concatenate([stock_feat[None], peer_features], axis=0)
         symbols_out.append(sym)
         obs_list.append(obs)
         sim_list.append(sim_scores)
-        mask_list.append(peer_mask)
         pos_list.append(current_positions.get(sym, 0.0))
 
     if not symbols_out:
@@ -171,7 +168,6 @@ def main():
 
     obs_batch = np.stack(obs_list).astype(np.float32)
     sim_batch = np.stack(sim_list).astype(np.float32)
-    mask_batch = np.stack(mask_list)
     pos_batch = np.array(pos_list, dtype=np.float32)
 
     n = len(symbols_out)
@@ -184,8 +180,7 @@ def main():
             s = torch.from_numpy(obs_batch[i:j]).to(cfg.device)
             p = torch.from_numpy(pos_batch[i:j]).to(cfg.device)
             c = torch.from_numpy(sim_batch[i:j]).to(cfg.device)
-            m = torch.from_numpy(mask_batch[i:j]).to(cfg.device)
-            a, _ = select_greedy(model, s, p, c, m)
+            a, _ = select_greedy(model, s, p, c)
             actions[i:j] = a.cpu().numpy()
 
     _log(f"    {'Stocks':<20s}: {n}")
