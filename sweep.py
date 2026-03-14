@@ -50,6 +50,7 @@ def objective(trial, preprocess_path, base_save_dir):
 
     cfg.save_dir = os.path.join(base_save_dir, _param_hash(trial.params))
     cfg.ablation = False
+    cfg.grad_diag_freq = 0.0
 
     _log()
     _log(f"[Trial {trial.number}]")
@@ -118,6 +119,9 @@ def main():
         lambda trial: objective(trial, preprocess_path, scfg.save_dir),
         n_trials=scfg.n_trials,
     )
+
+    if os.path.exists(preprocess_path):
+        os.remove(preprocess_path)
 
     _log()
     _log("[Sweep Summary]")
