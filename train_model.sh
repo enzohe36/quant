@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# nohup bash train_model.sh >> "training_$(date +%Y%m%d%H%M%S).log" 2>&1 & echo "kill -- -$(ps -o pgid= -p $! | tr -d ' ')" | at 07:00 2026-03-16
+# nohup bash train_model.sh 2>&1 & echo "kill -- -$(ps -o pgid= -p $! | tr -d ' ')" | at 07:00 2026-03-18
 
 # optuna-dashboard sqlite:///sweep.db --port 8080
 
@@ -9,10 +9,7 @@ conda activate py311
 
 TRAIN_CMDS=(
   "python train_model.py"
-  "python train_model.py --self_dropout 0.5"
-  "python train_model.py --self_dropout 1.0"
-  "python train_model.py --pool_self true"
-  "python train_model.py --pool_self true --eval_all_peers true"
+  "python train_model.py --eval_all_peers true"
   # "python sweep.py --n_trials 200"
 )
 
@@ -20,6 +17,7 @@ TIMESTAMP=$(date +%Y%m%d%H%M%S)
 
 for TRAIN_CMD in "${TRAIN_CMDS[@]}"; do
   FLAG_SUFFIX=$(echo "$TRAIN_CMD" | grep -oP '\-\-\S+\s+\S+' | sed 's/--//;s/ /_/;s/^/_/' | tr -d '\n')
+  LOG="training_${TIMESTAMP}${FLAG_SUFFIX}.log"
 
   if echo "$TRAIN_CMD" | grep -q 'sweep.py'; then
     ZIP_PATTERN="sweep_*${FLAG_SUFFIX}.zip"
@@ -33,13 +31,13 @@ for TRAIN_CMD in "${TRAIN_CMDS[@]}"; do
     continue
   fi
 
-  $TRAIN_CMD || { echo "Training failed: $TRAIN_CMD"; exit 1; }
+  $TRAIN_CMD > "$LOG" 2>&1 || { echo "Training failed: $TRAIN_CMD"; exit 1; }
 
   if echo "$TRAIN_CMD" | grep -q 'sweep.py'; then
-    zip -r "sweep_${TIMESTAMP}${FLAG_SUFFIX}.zip" sweep_runs/ sweep.db sweep.py train_model.py feats_example.csv training_*.log 2>/dev/null
-    rm -rf sweep_runs sweep.db training_*.log
+    zip -r "sweep_${TIMESTAMP}${FLAG_SUFFIX}.zip" sweep_runs/ sweep.db sweep.py train_model.py feats_example.csv "$LOG" 2>/dev/null
+    rm -rf sweep_runs sweep.db "$LOG"
   else
-    zip -r "checkpoints_${TIMESTAMP}${FLAG_SUFFIX}.zip" checkpoints/ train_model.py feats_example.csv training_*.log 2>/dev/null
-    rm -rf checkpoints training_*.log
+    zip -r "checkpoints_${TIMESTAMP}${FLAG_SUFFIX}.zip" checkpoints/ train_model.py feats_example.csv "$LOG" 2>/dev/null
+    rm -rf checkpoints "$LOG"
   fi
 done

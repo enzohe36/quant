@@ -1,4 +1,7 @@
-# conda activate quant; pip install aktools --upgrade -i https://pypi.org/simple; pip install akshare --upgrade -i https://pypi.org/simple; python -m aktools
+# conda activate quant
+# pip install aktools --upgrade -i https://pypi.org/simple
+# pip install akshare --upgrade -i https://pypi.org/simple
+# python scripts/start_aktools.py
 
 # Config =======================================================================
 

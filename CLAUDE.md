@@ -31,11 +31,12 @@
 - `grid(True, alpha=0.3)`
 - `legend(fontsize=7)`
 - `MaxNLocator(integer=True)` on x-axes
-- Default matplotlib colors unless distinction is needed
-- Each plot starts from C0 unless series must be consistent across plots (e.g., train=C0, val=C1, no_peers=C2, no_stock=C3 shared across row 0)
-- Dual-axis plots: no legends (y-axis labels identify the series)
+- Performance series colors: train=`"tab:blue"`, val=`"tab:red"`, no_peers=`"tab:green"`, no_stock=`"tab:purple"`; baselines use same color with `linestyle="--", alpha=0.7`
+- Single-series plots use default (no color/style specifications)
+- Dual-axis plots: `"tab:blue"` and `"tab:cyan"`; colored y-axis labels and tick marks, no legend
+- Grad cosine sim: default for data, `"tab:blue"` with `linestyle="--", alpha=0.7` for mean; legend for data and mean
 - Legend order matches log output order
 
 ### Config
-- Tunable hyperparameters, feature toggles (e.g., `ablation`, `pool_self`), input paths, and output directories belong in Config
+- Tunable hyperparameters, feature toggles (e.g., `ablation`, `eval_all_peers`), input paths, and output directories belong in Config
 - Numerical stability constants (e.g., `1e-8`), display constants (e.g., histogram bins), and initialization scales stay hardcoded

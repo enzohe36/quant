@@ -76,8 +76,6 @@ class Config:
     val_ratio: float = 0.1
     n_peers: int = 30
     train_peers: int = 3
-    self_dropout: float = 0.0
-    pool_self: bool = False
     eval_all_peers: bool = False
     pca_window: int = 240
     pca_factors: int = 10
@@ -270,7 +268,7 @@ def compute_feature_stats(train_data):
 class PolicyNetwork(nn.Module):
     """Shared-trunk policy network.
 
-    Joint self-attention over self + peer stock tokens → separate heads.
+    Per-stock temporal transformer → cross-attention (self queries peers) → heads.
     """
 
     def __init__(self, n_features, cfg, feat_mean, feat_std):
@@ -291,12 +289,18 @@ class PolicyNetwork(nn.Module):
         # Similarity embedding: scalar sim → d_model
         self.sim_proj = nn.Linear(1, cfg.d_model)
 
-        # Transformer (joint temporal + cross-stock attention)
+        # Temporal transformer (shared across stocks, no cross-stock attention)
         encoder_layer = nn.TransformerEncoderLayer(
             cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.dropout,
             batch_first=True, activation="gelu",
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, cfg.n_layers)
+
+        # Cross-attention: self queries, peer keys/values, no residual
+        self.cross_attn = nn.MultiheadAttention(
+            cfg.d_model, cfg.n_heads, dropout=cfg.dropout, batch_first=True,
+        )
+        self.cross_norm = nn.LayerNorm(cfg.d_model)
 
         # Position embedding
         self.position_proj = nn.Linear(1, cfg.position_dim)
@@ -326,21 +330,25 @@ class PolicyNetwork(nn.Module):
         # Normalize input features
         obs = (obs - self.feat_mean) / self.feat_std
 
-        # Project all tokens: (B, K*T, d_model)
-        hidden = self.input_norm(self.input_proj(obs.reshape(B, K * T, F)))
+        # Stage 1: per-stock temporal transformer (shared, no cross-stock)
+        flat = obs.reshape(B * K, T, F)
+        hidden = self.input_norm(self.input_proj(flat)) + self.pos_emb
+        hidden = self.transformer(hidden)           # (B*K, T, d_model)
+        hidden = hidden.view(B, K, T, -1)
 
-        # Positional embedding (tiled over stocks)
-        hidden = hidden + self.pos_emb.repeat(1, K, 1)
+        # Add similarity embedding after temporal encoding
+        sim_emb = self.sim_proj(sim_scores.unsqueeze(-1))  # (B, K, d_model)
+        hidden = hidden + sim_emb.unsqueeze(2)
 
-        # Similarity embedding (broadcast over T per stock)
-        sim_expanded = sim_scores.unsqueeze(2).expand(B, K, T).reshape(B, K * T, 1)
-        hidden = hidden + self.sim_proj(sim_expanded)
+        # Split self and peers
+        self_tokens = hidden[:, 0, :, :]            # (B, T, d_model)
+        peer_tokens = hidden[:, 1:, :, :].reshape(B, (K - 1) * T, -1)
 
-        # Joint self-attention over all K*T tokens
-        hidden = self.transformer(hidden)
-
-        # Pool self-stock tokens only (first T tokens = slot 0)
-        self_repr = hidden[:, :T, :].mean(dim=1)  # (B, d_model)
+        # Stage 2: cross-attention (self queries peers), no residual
+        cross_out, _ = self.cross_attn(
+            self_tokens, peer_tokens, peer_tokens,
+        )
+        self_repr = self.cross_norm(cross_out).mean(dim=1)  # (B, d_model)
 
         # Position embedding + heads
         pos_emb = self.position_proj(positions.unsqueeze(-1))
@@ -816,10 +824,9 @@ def _generate_symbol_episodes(symbol, symbol_data, peer_info, cfg, anchor,
     """Generate non-overlapping episodes for a single symbol.
 
     Self is always at observation index 0 (sim=1.0).
-    Peers are drawn from either K peers or (self + K peers) pool depending
-    on cfg.pool_self.
+    Peers are drawn from K peers.
 
-    rng is not None → training: random peer subsampling + self_dropout.
+    rng is not None → training: random peer subsampling.
     rng is None     → eval: top peers by similarity.
     """
     chunk_size = cfg.lookback + cfg.episode_length
@@ -877,23 +884,10 @@ def _generate_symbol_episodes(symbol, symbol_data, peer_info, cfg, anchor,
             & (peer_last >= obs_cols[:, None])
         )
 
-        if cfg.pool_self:
-            # Pool approach: peers drawn from (self + K peers)
-            pool_size = K + 1
-            pool_idx = np.empty((ep_len, pool_size), dtype=peer_idx.dtype)
-            pool_idx[:, 0] = sym_idx
-            pool_idx[:, 1:] = peer_idx
-            pool_sim = np.empty((ep_len, pool_size), dtype=np.float32)
-            pool_sim[:, 0] = 1.0
-            pool_sim[:, 1:] = peer_sim
-            pool_valid = np.ones((ep_len, pool_size), dtype=bool)
-            pool_valid[:, 1:] = peer_valid
-        else:
-            # 0313 approach: peers drawn from K peers only
-            pool_idx = peer_idx
-            pool_sim = peer_sim
-            pool_valid = peer_valid
-            pool_size = K
+        pool_idx = peer_idx
+        pool_sim = peer_sim
+        pool_valid = peer_valid
+        pool_size = K
 
         # Subsample peers
         K_sub = cfg.train_peers
@@ -922,15 +916,7 @@ def _generate_symbol_episodes(symbol, symbol_data, peer_info, cfg, anchor,
         step_sim_scores[:, 0] = 1.0
         step_sim_scores[:, 1:] = np.where(pool_valid, pool_sim, 0.0)
 
-        # Self-stock features (possibly zeroed)
         stock_feats = symbol_data["stock_features"][start : start + chunk_size]
-        if cfg.pool_self:
-            # Pool approach: slot 0 always zeroed
-            stock_feats = np.zeros_like(stock_feats)
-        elif rng is not None and cfg.self_dropout > 0:
-            # Self-feature dropout during training
-            if rng.random() < cfg.self_dropout:
-                stock_feats = np.zeros_like(stock_feats)
 
         episodes.append({
             "symbol": symbol,
@@ -981,10 +967,10 @@ def generate_episodes(stock_data, peer_info, cfg, epoch_rng, is_train=True):
 
 _EVAL_METRICS = {
     # result_key: (history_suffix, log_label)
-    "model_return":  ("return", "Return"),
-    "beat_rate":     ("beat_rate", "Beat rate"),
-    "max_drawdown":  ("max_drawdown", "Max dd"),
-    "turnover":      ("turnover", "Turnover"),
+    "model_return":       ("return", "Return"),
+    "model_beat_rate":    ("beat_rate", "Beat rate"),
+    "model_max_drawdown": ("max_drawdown", "Max dd"),
+    "model_turnover":     ("turnover", "Turnover"),
 }
 
 
@@ -1026,8 +1012,8 @@ def compute_max_drawdown(rewards):
     return float(drawdowns.max(axis=1).mean())
 
 
-def compute_baseline_rewards(episodes, cfg):
-    """Buy-and-hold baseline."""
+def compute_base_rewards(episodes, cfg):
+    """Buy-and-hold base."""
     log_returns = np.stack([ep["log_returns"] for ep in episodes])
     trading_returns = log_returns[:, cfg.lookback :]
     rewards = np.empty_like(trading_returns)
@@ -1066,11 +1052,10 @@ def collect_rollout(model, episodes, cfg, distributed, global_features):
     )
     rollout.final_values[:] = terminal_values
 
-    baseline_rewards = compute_baseline_rewards(episodes, cfg)
-    model_return = float(compute_episode_returns(rollout.rewards).mean())
-    baseline_return = float(compute_episode_returns(baseline_rewards).mean())
+    base_rewards = compute_base_rewards(episodes, cfg)
+    train_result = _compute_eval_result(rollout.rewards, rollout.positions, base_rewards)
 
-    return rollout, model_return, baseline_return
+    return rollout, train_result
 
 
 # Evaluation ===================================================================
@@ -1097,13 +1082,40 @@ def evaluate_deterministic(model, episodes, cfg, global_features,
 
 def _empty_eval_result(cfg):
     return {
-        "model_return": 0.0, "baseline_return": 0.0, "beat_rate": 0.0,
-        "max_drawdown": 0.0, "turnover": 0.0,
+        "model_return": 0.0, "base_return": 0.0,
+        "model_beat_rate": 0.0, "model_max_drawdown": 0.0, "model_turnover": 0.0,
+        "base_max_drawdown": 0.0, "base_turnover": 0.0,
         "position_histogram": np.zeros(50, dtype=np.float64),
         "pos_sum": 0.0, "pos_sum_sq": 0.0, "n_actions": 0,
         "model_rewards": np.empty((0, cfg.episode_length)),
-        "baseline_rewards": np.empty((0, cfg.episode_length)),
+        "base_rewards": np.empty((0, cfg.episode_length)),
         "model_positions": np.empty((0, cfg.episode_length), dtype=np.float32),
+    }
+
+
+def _compute_eval_result(model_rewards, model_positions, base_rewards):
+    """Compute eval metrics from rewards and positions arrays."""
+    model_returns = compute_episode_returns(model_rewards)
+    base_returns = compute_episode_returns(base_rewards)
+
+    pos_flat = model_positions.ravel().astype(np.float64)
+    pos_hist, _ = np.histogram(pos_flat, bins=50, range=(-1.0, 1.0))
+
+    return {
+        "model_return": float(model_returns.mean()),
+        "base_return": float(base_returns.mean()),
+        "model_beat_rate": float(np.mean(model_returns > base_returns)),
+        "model_max_drawdown": compute_max_drawdown(model_rewards),
+        "model_turnover": float(np.abs(np.diff(model_positions, axis=1)).sum(axis=1).mean()),
+        "base_max_drawdown": compute_max_drawdown(base_rewards),
+        "base_turnover": 1.0,
+        "position_histogram": pos_hist.astype(np.float64),
+        "pos_sum": float(pos_flat.sum()),
+        "pos_sum_sq": float((pos_flat ** 2).sum()),
+        "n_actions": int(model_positions.size),
+        "model_rewards": model_rewards,
+        "base_rewards": base_rewards,
+        "model_positions": model_positions,
     }
 
 
@@ -1115,31 +1127,8 @@ def evaluate_episodes(model, episodes, cfg, global_features, zero_peers=False):
     model_rewards, model_positions = evaluate_deterministic(
         model, episodes, cfg, global_features, zero_peers=zero_peers,
     )
-    baseline_rewards = compute_baseline_rewards(episodes, cfg)
-    model_returns = compute_episode_returns(model_rewards)
-    baseline_returns = compute_episode_returns(baseline_rewards)
-
-    pos_flat = model_positions.ravel().astype(np.float64)
-    pos_hist, _ = np.histogram(
-        pos_flat, bins=50, range=(-1.0, 1.0),
-    )
-
-    turnover = float(np.abs(np.diff(model_positions, axis=1)).sum(axis=1).mean())
-
-    return {
-        "model_return": float(model_returns.mean()),
-        "baseline_return": float(baseline_returns.mean()),
-        "beat_rate": float(np.mean(model_returns > baseline_returns)),
-        "max_drawdown": compute_max_drawdown(model_rewards),
-        "turnover": turnover,
-        "position_histogram": pos_hist.astype(np.float64),
-        "pos_sum": float(pos_flat.sum()),
-        "pos_sum_sq": float((pos_flat ** 2).sum()),
-        "n_actions": int(model_positions.size),
-        "model_rewards": model_rewards,
-        "baseline_rewards": baseline_rewards,
-        "model_positions": model_positions,
-    }
+    base_rewards = compute_base_rewards(episodes, cfg)
+    return _compute_eval_result(model_rewards, model_positions, base_rewards)
 
 
 def evaluate_ablated(model, episodes, cfg, global_features):
@@ -1334,7 +1323,7 @@ def build_test_results(episodes, eval_result, cfg):
                 "price": prices[step],
                 "position": float(eval_result["model_positions"][episode_idx, step]),
                 "model_reward": float(eval_result["model_rewards"][episode_idx, step]),
-                "baseline_reward": float(eval_result["baseline_rewards"][episode_idx, step]),
+                "base_reward": float(eval_result["base_rewards"][episode_idx, step]),
             })
     return rows
 
@@ -1356,14 +1345,16 @@ def _allreduce_means(*means, local_count, device):
 def _allreduce_eval(result, local_count, device):
     scalar_fields = [
         result["model_return"] * local_count,
-        result["baseline_return"] * local_count,
-        result["beat_rate"] * local_count,
-        result["max_drawdown"] * local_count,
-        result["turnover"] * local_count,
+        result["base_return"] * local_count,
+        result["model_beat_rate"] * local_count,
+        result["model_max_drawdown"] * local_count,
+        result["model_turnover"] * local_count,
         float(local_count),
         result["pos_sum"],
         result["pos_sum_sq"],
         float(result["n_actions"]),
+        result["base_max_drawdown"] * local_count,
+        result["base_turnover"] * local_count,
     ]
     tensor = torch.tensor(scalar_fields, device=device, dtype=torch.float64)
     dist.all_reduce(tensor)
@@ -1378,14 +1369,16 @@ def _allreduce_eval(result, local_count, device):
 
     return {
         "model_return": float(tensor[0].item() / total),
-        "baseline_return": float(tensor[1].item() / total),
-        "beat_rate": float(tensor[2].item() / total),
-        "max_drawdown": float(tensor[3].item() / total),
-        "turnover": float(tensor[4].item() / total),
+        "base_return": float(tensor[1].item() / total),
+        "model_beat_rate": float(tensor[2].item() / total),
+        "model_max_drawdown": float(tensor[3].item() / total),
+        "model_turnover": float(tensor[4].item() / total),
         "position_histogram": hist_tensor.cpu().numpy(),
         "pos_sum": tensor[6].item(),
         "pos_sum_sq": tensor[7].item(),
         "n_actions": int(tensor[8].item()),
+        "base_max_drawdown": float(tensor[9].item() / total),
+        "base_turnover": float(tensor[10].item() / total),
     }
 
 
@@ -1399,7 +1392,7 @@ def _allreduce_max_int(value, device):
 def _gather_test_arrays(test_result, n_local, n_total, episode_length, device):
     local = torch.zeros(n_local, episode_length, 3, device=device)
     local[..., 0] = torch.from_numpy(test_result["model_rewards"]).to(device)
-    local[..., 1] = torch.from_numpy(test_result["baseline_rewards"]).to(device)
+    local[..., 1] = torch.from_numpy(test_result["base_rewards"]).to(device)
     local[..., 2] = torch.from_numpy(test_result["model_positions"]).to(device)
 
     max_local = (n_total + _world - 1) // _world
@@ -1420,7 +1413,7 @@ def _gather_test_arrays(test_result, n_local, n_total, episode_length, device):
     result_np = result.cpu().numpy()
     return {
         "model_rewards": result_np[..., 0],
-        "baseline_rewards": result_np[..., 1],
+        "base_rewards": result_np[..., 1],
         "model_positions": result_np[..., 2],
     }
 
@@ -1545,7 +1538,7 @@ def plot_training(history, path, cfg):
 
     epochs = range(1, len(history["policy_loss"]) + 1)
     ablation_epochs = history.get("ablation_epochs", [])
-    fig, axes = plt.subplots(3, 4, figsize=(24, 15))
+    fig, axes = plt.subplots(4, 4, figsize=(24, 20))
 
     # Row 0: performance metrics
     # Legend order matches log: Train base, Train, Val base, Val, No-peers, No-stock
@@ -1555,15 +1548,33 @@ def plot_training(history, path, cfg):
         ("max_drawdown", "Max Drawdown", {}),
         ("turnover", "Turnover", {}),
     ]
+    _C_TRAIN = "tab:blue"
+    _C_VAL = "tab:red"
+    _C_NO_PEERS = "tab:green"
+    _C_NO_STOCK = "tab:purple"
     ablation_styles = [
-        ("no_peers", "C2", "No peers"),
-        ("no_stock", "C3", "No stock"),
+        ("no_peers", _C_NO_PEERS, "No peers"),
+        ("no_stock", _C_NO_STOCK, "No stock"),
     ]
     for col, (metric, title, opts) in enumerate(metric_plots):
         ax = axes[0, col]
+        # Train
+        train_base_key = f"train_base_{metric}" if metric != "return" else "train_base"
+        if train_base_key in history and history[train_base_key]:
+            ax.plot(epochs, history[train_base_key], color=_C_TRAIN,
+                    linestyle="--", alpha=0.7, label="Train base")
+        train_key = f"train_{metric}"
+        if train_key in history and history[train_key]:
+            ax.plot(epochs, history[train_key], color=_C_TRAIN, label="Train")
+        # Val
+        val_base_key = f"val_base_{metric}" if metric != "return" else "val_base"
+        if val_base_key in history and history[val_base_key]:
+            ax.plot(epochs, history[val_base_key], color=_C_VAL,
+                    linestyle="--", alpha=0.7, label="Val base")
         val_key = f"val_{metric}"
         if val_key in history and history[val_key]:
-            ax.plot(epochs, history[val_key], color="C1", label="Val")
+            ax.plot(epochs, history[val_key], color=_C_VAL, label="Val")
+        # Ablation
         if ablation_epochs:
             for ctx, color, label in ablation_styles:
                 ctx_key = f"{ctx}_{metric}"
@@ -1576,78 +1587,75 @@ def plot_training(history, path, cfg):
         if "ylim" in opts:
             ax.set_ylim(*opts["ylim"])
 
-    # Episode Return: prepend train/baseline lines so legend matches log order
-    ax_ret = axes[0, 0]
-    ax_ret.get_legend().remove()
-    handles, labels = ax_ret.get_legend_handles_labels()
-    extra = []
-    extra.append(ax_ret.plot(epochs, history["train_baseline"], color="C0",
-                             linestyle="--", alpha=0.5, label="Train base")[0])
-    extra.append(ax_ret.plot(epochs, history["train_return"], color="C0",
-                             label="Train")[0])
-    if "val_baseline" in history and history["val_baseline"]:
-        extra.append(ax_ret.plot(epochs, history["val_baseline"], color="C1",
-                                 linestyle="--", alpha=0.5, label="Val base")[0])
-    ax_ret.legend(handles=extra + handles, fontsize=7)
+    # Row 1: position heatmaps + log std
+    position_panels = [
+        ("train_position_histogram", "Train Position", epochs),
+        ("val_position_histogram", "Val Position", epochs),
+        ("no_peers_position_histogram", "No-peers Position", ablation_epochs),
+        ("no_stock_position_histogram", "No-stock Position", ablation_epochs),
+    ]
+    for col, (hist_key, title, x_epochs) in enumerate(position_panels):
+        pos_hists = history.get(hist_key, [])
+        if pos_hists and x_epochs:
+            heatmap_data = np.array(pos_hists).T
+            col_sums = heatmap_data.sum(axis=0, keepdims=True)
+            col_sums = np.where(col_sums > 0, col_sums, 1.0)
+            heatmap_data = heatmap_data / col_sums
+            im = axes[1, col].imshow(
+                heatmap_data, aspect="auto", origin="lower",
+                extent=[x_epochs[0], x_epochs[-1], -1, 1],
+                interpolation="nearest",
+            )
+            fig.colorbar(im, ax=axes[1, col], label="Frequency")
+        axes[1, col].set_title(title)
 
-    # Row 1: position, log std, policy loss, value loss
-    # (1,0) Position heatmap
-    pos_hists = history.get("val_position_histogram", [])
-    if pos_hists:
-        heatmap_data = np.array(pos_hists).T
-        col_sums = heatmap_data.sum(axis=0, keepdims=True)
-        col_sums = np.where(col_sums > 0, col_sums, 1.0)
-        heatmap_data = heatmap_data / col_sums
-        im = axes[1, 0].imshow(
-            heatmap_data, aspect="auto", origin="lower",
-            extent=[1, len(pos_hists), -1, 1], interpolation="nearest",
-        )
-        fig.colorbar(im, ax=axes[1, 0], label="Frequency")
-    axes[1, 0].set_title("Val Position")
+    # Row 2: log std, policy loss, value loss, clip/KL
+    axes[2, 0].plot(epochs, history["log_std"])
+    axes[2, 0].set_title("Log Std")
+    axes[2, 0].grid(True, alpha=0.3)
 
-    # (1,1) Log std
-    axes[1, 1].plot(epochs, history["log_std"])
-    axes[1, 1].set_title("Log Std")
-    axes[1, 1].grid(True, alpha=0.3)
+    axes[2, 1].plot(epochs, history["policy_loss"])
+    axes[2, 1].set_title("Policy Loss")
+    axes[2, 1].grid(True, alpha=0.3)
 
-    # (1,2) Policy loss
-    axes[1, 2].plot(epochs, history["policy_loss"])
-    axes[1, 2].set_title("Policy Loss")
-    axes[1, 2].grid(True, alpha=0.3)
+    axes[2, 2].plot(epochs, history["value_loss"])
+    axes[2, 2].set_title("Value Loss")
+    axes[2, 2].grid(True, alpha=0.3)
 
-    # (1,3) Value loss
-    axes[1, 3].plot(epochs, history["value_loss"])
-    axes[1, 3].set_title("Value Loss")
-    axes[1, 3].grid(True, alpha=0.3)
-
-    # Row 2: clip/KL, grad norm, grad cosine sim, skip rate
-    # (2,0) Clip fraction / Approx KL (dual axis)
-    ax_clip = axes[2, 0]
-    ax_clip.plot(epochs, history["clip_fraction"], color="C0")
-    ax_clip.set_ylabel("Clip Fraction")
+    # (2,3) Clip fraction / Approx KL (dual axis)
+    ax_clip = axes[2, 3]
+    ax_clip.plot(epochs, history["clip_fraction"], color="tab:blue")
+    ax_clip.set_ylabel("Clip Fraction", color="tab:blue")
+    ax_clip.tick_params(axis="y", labelcolor="tab:blue")
     ax_kl = ax_clip.twinx()
-    ax_kl.plot(epochs, history["approx_kl"], color="C1")
-    ax_kl.set_ylabel("Approx KL")
+    ax_kl.plot(epochs, history["approx_kl"], color="tab:cyan")
+    ax_kl.set_ylabel("Approx KL", color="tab:cyan")
+    ax_kl.tick_params(axis="y", labelcolor="tab:cyan")
     ax_clip.set_title("Clip Fraction / Approx KL")
     ax_clip.grid(True, alpha=0.3)
 
-    # (2,1) Grad norm
-    axes[2, 1].plot(epochs, history["grad_norm"])
-    axes[2, 1].set_title("Grad Norm")
-    axes[2, 1].grid(True, alpha=0.3)
+    # Row 3: grad norm, grad cosine sim, skip rate
+    axes[3, 0].plot(epochs, history["grad_norm"])
+    axes[3, 0].set_title("Grad Norm")
+    axes[3, 0].grid(True, alpha=0.3)
 
-    # (2,2) Grad cosine similarity
     if "grad_cosine_sim" in history and history["grad_cosine_sim"]:
-        axes[2, 2].plot(epochs, history["grad_cosine_sim"])
-        axes[2, 2].axhline(0, color="k", linewidth=0.5, alpha=0.5)
-    axes[2, 2].set_title("Grad Cosine Sim")
-    axes[2, 2].grid(True, alpha=0.3)
+        axes[3, 1].plot(epochs, history["grad_cosine_sim"],
+                        label="Per epoch")
+        axes[3, 1].axhline(0, color="k", linewidth=0.5, alpha=0.5)
+        axes[3, 1].axhline(float(np.mean(history["grad_cosine_sim"])),
+                            color="tab:blue", linestyle="--", alpha=0.7,
+                            label="Mean")
+        axes[3, 1].legend(fontsize=7)
+    axes[3, 1].set_title("Grad Cosine Sim")
+    axes[3, 1].grid(True, alpha=0.3)
 
-    # (2,3) Skip rate
     if "skip_rate" in history:
-        axes[2, 3].plot(epochs, history["skip_rate"])
-    axes[2, 3].set_title("Skip Rate")
-    axes[2, 3].grid(True, alpha=0.3)
+        axes[3, 2].plot(epochs, history["skip_rate"])
+    axes[3, 2].set_title("Skip Rate")
+    axes[3, 2].grid(True, alpha=0.3)
+
+    axes[3, 3].set_visible(False)
 
     for ax in axes.flat:
         if ax.get_visible():
@@ -1656,6 +1664,35 @@ def plot_training(history, path, cfg):
     plt.tight_layout()
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
+
+
+# Validation Logging ===========================================================
+
+
+def _log_val(result, ablation_results, n_episodes, cfg,
+             history=None, epoch=None):
+    """Log and optionally record validation metrics.
+
+    Used for both per-epoch validation and final test evaluation.
+    history: defaultdict(list) to append to, or None for log-only.
+    epoch: current epoch number, required when history is not None.
+    """
+    _log(f"    {'Val episodes':<20s}: {n_episodes}")
+    _log(f"    {'Val base return':<20s}: {result['base_return']:.4f}")
+    _log(f"    {'Val base max dd':<20s}: {result['base_max_drawdown']:.4f}")
+    _log(f"    {'Val base turnover':<20s}: {result['base_turnover']:.4f}")
+    if history is not None:
+        history["val_base"].append(result["base_return"])
+        history["val_base_max_drawdown"].append(result["base_max_drawdown"])
+        history["val_base_turnover"].append(result["base_turnover"])
+    _record_eval(history, result, "val", log_label="Val", track_position=True)
+    if cfg.ablation and ablation_results is not None:
+        if history is not None:
+            history["ablation_epochs"].append(epoch)
+        _record_eval(history, ablation_results["no_peers"], "no_peers",
+                     log_label="No-peers", track_position=True)
+        _record_eval(history, ablation_results["no_stock"], "no_stock",
+                     log_label="No-stock", track_position=True)
 
 
 # Training Loop ================================================================
@@ -1841,8 +1878,17 @@ def train(cfg, preprocess_path=None, epoch_callback=None):
         val_returns = history.get("val_return", [])
         if val_returns:
             window = cfg.patience_smoothing
+            all_return_keys = ["val_return"]
+            for prefix in ("no_peers", "no_stock"):
+                key = f"{prefix}_return"
+                if key in history and history[key]:
+                    all_return_keys.append(key)
             best_score = max(
-                float(np.mean(val_returns[max(0, i + 1 - window) : i + 1]))
+                max(
+                    float(np.mean(history[key][max(0, i + 1 - window) : i + 1]))
+                    for key in all_return_keys
+                    if i < len(history[key])
+                )
                 for i in range(len(val_returns))
             )
         else:
@@ -1889,14 +1935,13 @@ def train(cfg, preprocess_path=None, epoch_callback=None):
                                          is_train=False)
         rank_val_episodes = val_episodes[_rank::_world]
 
-        rollout, model_return, baseline_return = collect_rollout(
+        rollout, train_result = collect_rollout(
             model, rank_train_episodes, cfg, distributed, global_features,
         )
 
         if distributed:
-            model_return, baseline_return = _allreduce_means(
-                model_return, baseline_return,
-                local_count=len(rank_train_episodes), device=cfg.device,
+            train_result = _allreduce_eval(
+                train_result, len(rank_train_episodes), cfg.device,
             )
 
         n_local_transitions = rollout.compute_gae(
@@ -1945,15 +1990,21 @@ def train(cfg, preprocess_path=None, epoch_callback=None):
                         ablation_results[abl_key], len(rank_val_episodes), cfg.device,
                     )
 
-        # Record history
-        history["train_return"].append(model_return)
-        history["train_baseline"].append(baseline_return)
-        history["val_baseline"].append(val_result["baseline_return"])
-        _record_eval(history, val_result, "val", track_position=True)
-        if cfg.ablation:
-            history["ablation_epochs"].append(epoch)
-            _record_eval(history, ablation_results["no_peers"], "no_peers")
-            _record_eval(history, ablation_results["no_stock"], "no_stock")
+        # Record and log
+        history["train_base"].append(train_result["base_return"])
+        history["train_base_max_drawdown"].append(train_result["base_max_drawdown"])
+        history["train_base_turnover"].append(train_result["base_turnover"])
+        _record_eval(history, train_result, "train", track_position=True)
+        abl = ablation_results if cfg.ablation else None
+
+        _log(f"    {'Train episodes':<20s}: {len(train_episodes)}")
+        _log(f"    {'Train base return':<20s}: {train_result['base_return']:.4f}")
+        _log(f"    {'Train base max dd':<20s}: {train_result['base_max_drawdown']:.4f}")
+        _log(f"    {'Train base turnover':<20s}: {train_result['base_turnover']:.4f}")
+        _record_eval(history=None, result=train_result, prefix="train",
+                     log_label="Train", track_position=True)
+        _log_val(val_result, abl, len(val_episodes), cfg,
+                 history=history, epoch=epoch)
 
         for key, value in [
             ("policy_loss", epoch_losses["policy_loss"]),
@@ -1968,8 +2019,11 @@ def train(cfg, preprocess_path=None, epoch_callback=None):
             history[key].append(value)
 
         window = cfg.patience_smoothing
-        recent_returns = history["val_return"][-window:]
-        current_score = float(np.mean(recent_returns))
+        scores = [float(np.mean(history["val_return"][-window:]))]
+        if cfg.ablation:
+            for prefix in ("no_peers", "no_stock"):
+                scores.append(float(np.mean(history[f"{prefix}_return"][-window:])))
+        current_score = max(scores)
 
         improved = current_score > best_score
         if improved:
@@ -1978,15 +2032,6 @@ def train(cfg, preprocess_path=None, epoch_callback=None):
         elif epoch > cfg.warmup_epochs:
             patience_counter += 1
 
-        _log(f"    {'Train episodes':<20s}: {len(train_episodes)}")
-        _log(f"    {'Val episodes':<20s}: {len(val_episodes)}")
-        _log(f"    {'Train baseline':<20s}: {baseline_return:.4f}")
-        _log(f"    {'Train return':<20s}: {model_return:.4f}")
-        _log(f"    {'Val baseline':<20s}: {val_result['baseline_return']:.4f}")
-        _record_eval(history=None, result=val_result, prefix="val", log_label="Val", track_position=True)
-        if cfg.ablation:
-            _record_eval(history=None, result=ablation_results["no_peers"], prefix="no_peers", log_label="No-peers")
-            _record_eval(history=None, result=ablation_results["no_stock"], prefix="no_stock", log_label="No-stock")
         _log(f"    {'Log std':<20s}: {current_log_std:.4f}")
         _log(f"    {'Policy loss':<20s}: {epoch_losses['policy_loss']:.4f}")
         _log(f"    {'Value loss':<20s}: {epoch_losses['value_loss']:.4f}")
@@ -2034,26 +2079,33 @@ def train(cfg, preprocess_path=None, epoch_callback=None):
     rank_test_episodes = test_episodes[_rank::_world]
 
     _log()
-    _log("[Test]")
-    test_result = evaluate_episodes(model, rank_test_episodes, cfg, global_features)
+    _log("[Final Validation]")
+    test_local = evaluate_episodes(model, rank_test_episodes, cfg, global_features)
+    test_result = test_local
     if distributed:
-        test_aggregated = _allreduce_eval(
-            test_result, len(rank_test_episodes), cfg.device,
+        test_result = _allreduce_eval(
+            test_local, len(rank_test_episodes), cfg.device,
         )
-    else:
-        test_aggregated = test_result
 
-    _log(f"    {'Test episodes':<20s}: {len(test_episodes)}")
-    _log(f"    {'Test baseline':<20s}: {test_aggregated['baseline_return']:.4f}")
-    _record_eval(history=None, result=test_aggregated, prefix="test", log_label="Test")
+    test_abl = None
+    if cfg.ablation:
+        ablation_results = evaluate_ablated(model, rank_test_episodes, cfg, global_features)
+        if distributed:
+            for abl_key in ablation_results:
+                ablation_results[abl_key] = _allreduce_eval(
+                    ablation_results[abl_key], len(rank_test_episodes), cfg.device,
+                )
+        test_abl = ablation_results
+
+    _log_val(test_result, test_abl, len(test_episodes), cfg)
 
     if distributed:
         full_result = _gather_test_arrays(
-            test_result, len(rank_test_episodes), len(test_episodes),
+            test_local, len(rank_test_episodes), len(test_episodes),
             cfg.episode_length, cfg.device,
         )
     else:
-        full_result = test_result
+        full_result = test_local
     if is_main:
         all_rows = build_test_results(test_episodes, full_result, cfg)
         results_path = os.path.join(cfg.save_dir, "test_results.csv")
